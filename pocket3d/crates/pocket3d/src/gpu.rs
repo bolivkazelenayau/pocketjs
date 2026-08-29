@@ -230,10 +230,15 @@ pub struct DepthTarget {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
     pub size: (u32, u32),
+    pub sample_count: u32,
 }
 
 impl DepthTarget {
     pub fn new(gpu: &Gpu, width: u32, height: u32) -> Self {
+        Self::new_with_sample_count(gpu, width, height, 1)
+    }
+
+    pub fn new_with_sample_count(gpu: &Gpu, width: u32, height: u32, sample_count: u32) -> Self {
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("depth"),
             size: wgpu::Extent3d {
@@ -242,7 +247,7 @@ impl DepthTarget {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -253,6 +258,7 @@ impl DepthTarget {
             texture,
             view,
             size: (width, height),
+            sample_count,
         }
     }
 }
