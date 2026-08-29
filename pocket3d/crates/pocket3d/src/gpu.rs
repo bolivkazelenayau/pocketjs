@@ -67,6 +67,15 @@ impl Gpu {
         wgpu::Instance::new(&wgpu::InstanceDescriptor::default())
     }
 
+    /// Create an instance restricted to the requested presentation backends.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn new_instance_with_backends(backends: wgpu::Backends) -> wgpu::Instance {
+        wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends,
+            ..Default::default()
+        })
+    }
+
     /// Finish initialization from an existing instance + surface.
     pub fn from_instance_for_surface(
         instance: wgpu::Instance,
