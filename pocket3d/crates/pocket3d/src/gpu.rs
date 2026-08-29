@@ -21,6 +21,27 @@ pub struct Gpu {
     pub queue: wgpu::Queue,
 }
 
+fn device_features_for_adapter(adapter: &wgpu::Adapter) -> wgpu::Features {
+    let optional = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+    wgpu::Features::empty() | (adapter.features() & optional)
+}
+
+async fn request_device(adapter: &wgpu::Adapter) -> Result<(wgpu::Device, wgpu::Queue)> {
+    let required_features = device_features_for_adapter(adapter);
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            label: Some("pocket3d"),
+            required_features,
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::default(),
+            trace: wgpu::Trace::Off,
+        })
+        .await
+        .context("failed to create wgpu device")?;
+    log::info!("device features enabled: {:?}", device.features());
+    Ok((device, queue))
+}
+
 impl Gpu {
     /// Create a device with no surface (offscreen rendering only).
     pub fn new_headless() -> Result<Self> {
@@ -43,16 +64,7 @@ impl Gpu {
             .await
             .context("no compatible GPU adapter")?;
         log::info!("adapter: {:?}", adapter.get_info().name);
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("pocket3d"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::default(),
-                trace: wgpu::Trace::Off,
-            })
-            .await
-            .context("failed to create wgpu device")?;
+        let (device, queue) = request_device(&adapter).await?;
         Ok(Self {
             instance,
             adapter,
@@ -91,16 +103,7 @@ impl Gpu {
                 .await
                 .context("no compatible GPU adapter")?;
             log::info!("adapter: {:?}", adapter.get_info().name);
-            let (device, queue) = adapter
-                .request_device(&wgpu::DeviceDescriptor {
-                    label: Some("pocket3d"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
-                    memory_hints: wgpu::MemoryHints::default(),
-                    trace: wgpu::Trace::Off,
-                })
-                .await
-                .context("failed to create wgpu device")?;
+            let (device, queue) = request_device(&adapter).await?;
             Ok(Self {
                 instance,
                 adapter,
