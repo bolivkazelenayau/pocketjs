@@ -49,6 +49,7 @@ pub struct Renderer {
     pub model_material_layout: wgpu::BindGroupLayout,
     depth: Option<DepthTarget>,
     msaa_color: Option<MsaaColorTarget>,
+    smaa: Option<crate::smaa::SmaaPass>,
     requested_sample_count: u32,
     effective_sample_count: u32,
     supported_sample_counts: Vec<u32>,
@@ -307,13 +308,34 @@ fn create_world_pipelines(
 
 impl Renderer {
     pub fn new(gpu: &Gpu, color_format: wgpu::TextureFormat) -> Result<Self> {
-        Self::new_with_config(gpu, color_format, RendererConfig::default())
+        Self::new_with_internal_config(gpu, color_format, RendererConfig::default(), false)
     }
 
     pub fn new_with_config(
         gpu: &Gpu,
         color_format: wgpu::TextureFormat,
         config: RendererConfig,
+    ) -> Result<Self> {
+        Self::new_with_internal_config(gpu, color_format, config, false)
+    }
+
+    /// Initializes the renderer with the internal SMAA proof-of-concept path.
+    ///
+    /// This is intentionally crate-private: SMAA is a renderer experiment and
+    /// is not part of the public RendererConfig API yet.
+    #[allow(dead_code)]
+    pub(crate) fn new_with_smaa_for_poc(
+        gpu: &Gpu,
+        color_format: wgpu::TextureFormat,
+    ) -> Result<Self> {
+        Self::new_with_internal_config(gpu, color_format, RendererConfig::default(), true)
+    }
+
+    fn new_with_internal_config(
+        gpu: &Gpu,
+        color_format: wgpu::TextureFormat,
+        config: RendererConfig,
+        smaa_enabled: bool,
     ) -> Result<Self> {
         let device = &gpu.device;
         let supported_sample_counts = supported_sample_counts(gpu, color_format);
@@ -385,6 +407,10 @@ impl Renderer {
         let models = ModelPass::new(gpu, color_format, &globals_bgl, effective_sample_count);
         let model_material_layout = models.material_layout.clone();
         let sprites = SpritePass::new(gpu, color_format, &globals_bgl, effective_sample_count);
+        let smaa = smaa_enabled.then(|| crate::smaa::SmaaPass::new(gpu, color_format));
+        if smaa.is_some() {
+            log::info!("post-process AA: SMAA 1x");
+        }
 
         Ok(Self {
             color_format,
@@ -393,6 +419,7 @@ impl Renderer {
             model_material_layout,
             depth: None,
             msaa_color: None,
+            smaa,
             requested_sample_count,
             effective_sample_count,
             supported_sample_counts,
@@ -437,6 +464,10 @@ impl Renderer {
             }
         } else {
             self.msaa_color = None;
+        }
+
+        if let Some(smaa) = self.smaa.as_mut() {
+            smaa.ensure_targets(gpu, size);
         }
     }
 
@@ -527,6 +558,9 @@ impl Renderer {
         hud: &Hud,
     ) {
         self.ensure_targets(gpu, size);
+        if let Some(smaa) = self.smaa.as_mut() {
+            smaa.update_metrics(gpu, size, scene.transparent_clear);
+        }
         let aspect = size.0 as f32 / size.1 as f32;
 
         let view_proj = camera.view_proj(aspect);
@@ -596,11 +630,13 @@ impl Renderer {
         {
             let h = scene.sky.horizon;
             let depth_view = &self.depth.as_ref().unwrap().view;
-            let scene_color_view = self
-                .msaa_color
-                .as_ref()
-                .map(|target| &target.view)
-                .unwrap_or(color_view);
+            let scene_color_view = if let Some(msaa_color) = self.msaa_color.as_ref() {
+                &msaa_color.view
+            } else if let Some(smaa) = self.smaa.as_ref() {
+                smaa.scene_view()
+            } else {
+                color_view
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -675,11 +711,13 @@ impl Renderer {
         // --- viewmodel pass (own depth range so the gun never clips) -------
         if let Some(vm) = &viewmodel_draw {
             let depth_view = &self.depth.as_ref().unwrap().view;
-            let scene_color_view = self
-                .msaa_color
-                .as_ref()
-                .map(|target| &target.view)
-                .unwrap_or(color_view);
+            let scene_color_view = if let Some(msaa_color) = self.msaa_color.as_ref() {
+                &msaa_color.view
+            } else if let Some(smaa) = self.smaa.as_ref() {
+                smaa.scene_view()
+            } else {
+                color_view
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewmodel"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -709,11 +747,16 @@ impl Renderer {
         // target remains single-sampled so HUD and application overlays keep
         // their existing 1x path.
         if let Some(msaa_color) = &self.msaa_color {
+            let resolve_target = self
+                .smaa
+                .as_ref()
+                .map(|smaa| smaa.scene_view())
+                .unwrap_or(color_view);
             let _resolve_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("msaa resolve"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &msaa_color.view,
-                    resolve_target: Some(color_view),
+                    resolve_target: Some(resolve_target),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Discard,
@@ -723,6 +766,10 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+        }
+
+        if let Some(smaa) = self.smaa.as_ref() {
+            smaa.render(&mut encoder, color_view);
         }
 
         // --- HUD overlay pass ----------------------------------------------
@@ -1647,9 +1694,14 @@ mod tests {
     };
 
     use super::{
-        GlobalsRaw, InstanceRaw, model_normal_matrix, sample_count_transition,
+        GlobalsRaw, InstanceRaw, RendererConfig, model_normal_matrix, sample_count_transition,
         select_effective_sample_count,
     };
+
+    #[test]
+    fn default_config_preserves_public_api_defaults() {
+        assert_eq!(RendererConfig::default().requested_sample_count, 1);
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
@@ -1692,6 +1744,85 @@ mod tests {
             );
             gpu.device.poll(wgpu::PollType::Wait).unwrap();
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn gpu_smaa_survives_msaa_transitions_and_keeps_hud_after_post_process() {
+        let Ok(gpu) = Gpu::new_headless() else {
+            return;
+        };
+        let supported = super::supported_sample_counts(&gpu, OFFSCREEN_FORMAT);
+        if !supported.contains(&4) {
+            eprintln!("GPU SMAA smoke skipped: 4x MSAA is unsupported ({supported:?})");
+            return;
+        }
+
+        let device_identity = std::ptr::addr_of!(gpu.device);
+        let adapter_identity = std::ptr::addr_of!(gpu.adapter);
+        let mut renderer = super::Renderer::new_with_smaa_for_poc(&gpu, OFFSCREEN_FORMAT).unwrap();
+        let smaa_identity = renderer.smaa.as_ref().map(|smaa| smaa as *const _);
+        let target = OffscreenTarget::new(&gpu, 32, 32);
+        let mut scene = Scene::default();
+        scene.draw_sky = true;
+        let mut hud = Hud::default();
+        hud.rect(0.0, 0.0, 4.0, 4.0, [1.0, 0.0, 1.0, 1.0]);
+
+        let mut saw_one_x = false;
+        let mut saw_msaa = false;
+        for requested in [1, 4, 8, 2, 1] {
+            assert!(
+                supported.contains(&requested),
+                "expected MX250 support for {requested}x"
+            );
+            assert_eq!(
+                renderer.set_requested_sample_count(&gpu, requested),
+                requested
+            );
+            assert_eq!(renderer.effective_sample_count(), requested);
+            assert!(
+                renderer.smaa.is_some(),
+                "SMAA must remain enabled at {requested}x"
+            );
+            assert_eq!(
+                renderer.smaa.as_ref().map(|smaa| smaa as *const _),
+                smaa_identity
+            );
+            assert_eq!(std::ptr::addr_of!(gpu.device), device_identity);
+            assert_eq!(std::ptr::addr_of!(gpu.adapter), adapter_identity);
+
+            renderer.render(
+                &gpu,
+                &target.view,
+                target.size,
+                &scene,
+                &Camera::default(),
+                &hud,
+            );
+            gpu.device.poll(wgpu::PollType::Wait).unwrap();
+            let rgba = target.read_rgba(&gpu).unwrap();
+            let hud_pixel = &rgba[..4];
+            assert_eq!(
+                hud_pixel,
+                &[255, 0, 255, 255],
+                "HUD must be drawn after SMAA at {requested}x"
+            );
+
+            let hash = rgba.iter().fold(0xcbf29ce484222325u64, |hash, &byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+            });
+            eprintln!(
+                "GPU SMAA smoke: adapter {:?}, {}x, output FNV-1a {:016x}, HUD {:?}",
+                gpu.adapter.get_info().name,
+                requested,
+                hash,
+                hud_pixel
+            );
+            saw_one_x |= requested == 1;
+            saw_msaa |= requested > 1;
+        }
+        assert!(saw_one_x);
+        assert!(saw_msaa);
     }
 
     #[test]
@@ -1743,6 +1874,24 @@ mod tests {
             ("hud.wgsl", include_str!("shaders/hud.wgsl")),
         ] {
             let module = parse_str(source).unwrap_or_else(|error| panic!("{label}: {error}"));
+            Validator::new(ValidationFlags::all(), Capabilities::empty())
+                .validate(&module)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+        }
+
+        for (label, fragment) in [
+            ("smaa_edge.wgsl", include_str!("shaders/smaa_edge.wgsl")),
+            (
+                "smaa_weights.wgsl",
+                include_str!("shaders/smaa_weights.wgsl"),
+            ),
+            (
+                "smaa_neighborhood.wgsl",
+                include_str!("shaders/smaa_neighborhood.wgsl"),
+            ),
+        ] {
+            let source = format!("{}\n{fragment}", include_str!("shaders/smaa_common.wgsl"));
+            let module = parse_str(&source).unwrap_or_else(|error| panic!("{label}: {error}"));
             Validator::new(ValidationFlags::all(), Capabilities::empty())
                 .validate(&module)
                 .unwrap_or_else(|error| panic!("{label}: {error}"));
