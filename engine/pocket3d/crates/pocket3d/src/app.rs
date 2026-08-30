@@ -34,7 +34,7 @@ use crate::camera::Camera;
 use crate::gpu::Gpu;
 use crate::hud::Hud;
 use crate::input::Input;
-use crate::renderer::Renderer;
+use crate::renderer::{Renderer, RendererConfig};
 use crate::scene::Scene;
 use crate::time::FixedTimestep;
 
@@ -60,6 +60,9 @@ pub struct AppConfig {
     /// Left-mouse press starts an OS window drag (widget-style move;
     /// the press still reaches [`Input`] first, so clicks keep working).
     pub drag_window: bool,
+    /// Generic requested MSAA sample count. Renderer capability negotiation
+    /// determines the effective count at startup.
+    pub requested_sample_count: u32,
 }
 
 impl Default for AppConfig {
@@ -75,6 +78,7 @@ impl Default for AppConfig {
             resizable: true,
             max_fps: None,
             drag_window: false,
+            requested_sample_count: 1,
         }
     }
 }
@@ -295,7 +299,13 @@ impl<G: Game> WinitApp<G> {
             direct_composition.commit()?;
         }
 
-        let mut renderer = Renderer::new(&gpu, surface_config.format)?;
+        let mut renderer = Renderer::new_with_config(
+            &gpu,
+            surface_config.format,
+            RendererConfig {
+                requested_sample_count: self.config.requested_sample_count,
+            },
+        )?;
         self.game.init(&gpu, &mut renderer)?;
 
         let mut state = WindowState {

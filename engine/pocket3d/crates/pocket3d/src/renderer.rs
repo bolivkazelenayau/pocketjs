@@ -49,9 +49,14 @@ pub struct Renderer {
     pub model_material_layout: wgpu::BindGroupLayout,
     depth: Option<DepthTarget>,
     msaa_color: Option<MsaaColorTarget>,
+    requested_sample_count: u32,
     effective_sample_count: u32,
+    supported_sample_counts: Vec<u32>,
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
+    world_shader: wgpu::ShaderModule,
+    world_layout: wgpu::PipelineLayout,
+    background_sky_layout: wgpu::PipelineLayout,
     world_opaque: wgpu::RenderPipeline,
     world_alphatest: wgpu::RenderPipeline,
     world_sky: wgpu::RenderPipeline,
@@ -78,14 +83,18 @@ impl Default for RendererConfig {
 
 const CANDIDATE_SAMPLE_COUNTS: [u32; 4] = [1, 2, 4, 8];
 
+fn sanitize_requested_sample_count(requested: u32) -> u32 {
+    match requested {
+        1 | 2 | 4 | 8 => requested,
+        _ => 1,
+    }
+}
+
 /// Select the highest supported candidate that does not exceed the request.
 /// The caller supplies the already-intersected hardware capabilities so this
 /// pure policy is testable without manufacturing a GPU adapter.
 pub fn select_effective_sample_count(requested: u32, supported: &[u32]) -> u32 {
-    let requested = match requested {
-        1 | 2 | 4 | 8 => requested,
-        _ => 1,
-    };
+    let requested = sanitize_requested_sample_count(requested);
 
     CANDIDATE_SAMPLE_COUNTS
         .iter()
@@ -93,6 +102,27 @@ pub fn select_effective_sample_count(requested: u32, supported: &[u32]) -> u32 {
         .copied()
         .find(|&count| count <= requested && supported.contains(&count))
         .unwrap_or(1)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SampleCountTransition {
+    requested_sample_count: u32,
+    effective_sample_count: u32,
+    rebuild_pipelines: bool,
+}
+
+fn sample_count_transition(
+    requested: u32,
+    current_effective: u32,
+    supported: &[u32],
+) -> SampleCountTransition {
+    let requested_sample_count = sanitize_requested_sample_count(requested);
+    let effective_sample_count = select_effective_sample_count(requested_sample_count, supported);
+    SampleCountTransition {
+        requested_sample_count,
+        effective_sample_count,
+        rebuild_pipelines: effective_sample_count != current_effective,
+    }
 }
 
 struct MsaaColorTarget {
@@ -184,6 +214,97 @@ fn supported_sample_counts(gpu: &Gpu, color_format: wgpu::TextureFormat) -> Vec<
     supported
 }
 
+fn create_world_pipelines(
+    device: &wgpu::Device,
+    color_format: wgpu::TextureFormat,
+    world_shader: &wgpu::ShaderModule,
+    world_layout: &wgpu::PipelineLayout,
+    background_sky_layout: &wgpu::PipelineLayout,
+    sample_count: u32,
+) -> (
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+) {
+    let make_world_pipeline = |label: &str, fs_entry: &str| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(world_layout),
+            vertex: wgpu::VertexState {
+                module: world_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[WorldVertex::LAYOUT],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: world_shader,
+                entry_point: Some(fs_entry),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: multisample_state(sample_count),
+            multiview: None,
+            cache: None,
+        })
+    };
+
+    let world_background_sky = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("world background sky"),
+        layout: Some(background_sky_layout),
+        vertex: wgpu::VertexState {
+            module: world_shader,
+            entry_point: Some("vs_background_sky"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: world_shader,
+            entry_point: Some("fs_background_sky"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: color_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: DEPTH_FORMAT,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: multisample_state(sample_count),
+        multiview: None,
+        cache: None,
+    });
+
+    (
+        make_world_pipeline("world opaque", "fs_opaque"),
+        make_world_pipeline("world alphatest", "fs_alphatest"),
+        make_world_pipeline("world sky", "fs_sky"),
+        world_background_sky,
+    )
+}
+
 impl Renderer {
     pub fn new(gpu: &Gpu, color_format: wgpu::TextureFormat) -> Result<Self> {
         Self::new_with_config(gpu, color_format, RendererConfig::default())
@@ -195,12 +316,13 @@ impl Renderer {
         config: RendererConfig,
     ) -> Result<Self> {
         let device = &gpu.device;
-        let supported = supported_sample_counts(gpu, color_format);
+        let supported_sample_counts = supported_sample_counts(gpu, color_format);
+        let requested_sample_count = sanitize_requested_sample_count(config.requested_sample_count);
         let effective_sample_count =
-            select_effective_sample_count(config.requested_sample_count, &supported);
+            select_effective_sample_count(requested_sample_count, &supported_sample_counts);
         log::info!(
             "requested AA: {}x, effective MSAA: {}x",
-            config.requested_sample_count,
+            requested_sample_count,
             effective_sample_count
         );
         let samplers = Samplers::new(gpu);
@@ -250,77 +372,15 @@ impl Renderer {
                 bind_group_layouts: &[&globals_bgl],
                 push_constant_ranges: &[],
             });
-        let make_world_pipeline = |label: &str, fs_entry: &str| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&world_layout),
-                vertex: wgpu::VertexState {
-                    module: &world_shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[WorldVertex::LAYOUT],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &world_shader,
-                    entry_point: Some(fs_entry),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: color_format,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: DEPTH_FORMAT,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
-                    stencil: Default::default(),
-                    bias: Default::default(),
-                }),
-                multisample: multisample_state(effective_sample_count),
-                multiview: None,
-                cache: None,
-            })
-        };
-        let world_opaque = make_world_pipeline("world opaque", "fs_opaque");
-        let world_alphatest = make_world_pipeline("world alphatest", "fs_alphatest");
-        let world_sky = make_world_pipeline("world sky", "fs_sky");
-        let world_background_sky = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("world background sky"),
-            layout: Some(&background_sky_layout),
-            vertex: wgpu::VertexState {
-                module: &world_shader,
-                entry_point: Some("vs_background_sky"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &world_shader,
-                entry_point: Some("fs_background_sky"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: multisample_state(effective_sample_count),
-            multiview: None,
-            cache: None,
-        });
+        let (world_opaque, world_alphatest, world_sky, world_background_sky) =
+            create_world_pipelines(
+                device,
+                color_format,
+                &world_shader,
+                &world_layout,
+                &background_sky_layout,
+                effective_sample_count,
+            );
 
         let models = ModelPass::new(gpu, color_format, &globals_bgl, effective_sample_count);
         let model_material_layout = models.material_layout.clone();
@@ -333,9 +393,14 @@ impl Renderer {
             model_material_layout,
             depth: None,
             msaa_color: None,
+            requested_sample_count,
             effective_sample_count,
+            supported_sample_counts,
             globals_buf,
             globals_bg,
+            world_shader,
+            world_layout,
+            background_sky_layout,
             world_opaque,
             world_alphatest,
             world_sky,
@@ -346,8 +411,7 @@ impl Renderer {
         })
     }
 
-    /// The sample count is fixed at construction; only target dimensions can
-    /// change while the renderer lives.
+    /// Ensure the internal targets match the current effective sample count.
     fn ensure_targets(&mut self, gpu: &Gpu, size: (u32, u32)) {
         let depth_needs_recreate = self.depth.as_ref().is_none_or(|depth| depth.size != size);
         if depth_needs_recreate {
@@ -374,6 +438,79 @@ impl Renderer {
         } else {
             self.msaa_color = None;
         }
+    }
+
+    /// Request a new generic MSAA sample count between frames.
+    ///
+    /// The request is sanitized and resolved against the color/depth
+    /// capabilities discovered at construction. If the effective count
+    /// changes, only the sample-count-dependent pipelines and internal
+    /// attachments are replaced. Callers must invoke this outside any active
+    /// render pass, before the next call to [`Self::render`].
+    pub fn set_requested_sample_count(&mut self, gpu: &Gpu, requested: u32) -> u32 {
+        let transition = sample_count_transition(
+            requested,
+            self.effective_sample_count,
+            &self.supported_sample_counts,
+        );
+        let requested_changed = transition.requested_sample_count != self.requested_sample_count;
+        if requested_changed {
+            log::info!(
+                "requested AA changed: {}x -> {}x",
+                self.requested_sample_count,
+                transition.requested_sample_count
+            );
+            self.requested_sample_count = transition.requested_sample_count;
+        }
+
+        if !transition.rebuild_pipelines {
+            if requested_changed {
+                log::info!("effective MSAA remains {}x", self.effective_sample_count);
+            }
+            return self.effective_sample_count;
+        }
+
+        let previous_effective_sample_count = self.effective_sample_count;
+        let (world_opaque, world_alphatest, world_sky, world_background_sky) =
+            create_world_pipelines(
+                &gpu.device,
+                self.color_format,
+                &self.world_shader,
+                &self.world_layout,
+                &self.background_sky_layout,
+                transition.effective_sample_count,
+            );
+        self.models.rebuild_pipelines(
+            &gpu.device,
+            self.color_format,
+            transition.effective_sample_count,
+        );
+        self.sprites.rebuild_pipeline(
+            &gpu.device,
+            self.color_format,
+            transition.effective_sample_count,
+        );
+        self.world_opaque = world_opaque;
+        self.world_alphatest = world_alphatest;
+        self.world_sky = world_sky;
+        self.world_background_sky = world_background_sky;
+        self.effective_sample_count = transition.effective_sample_count;
+
+        // The next render lazily creates targets at the current size. This
+        // handles 1x <-> Nx transitions and avoids allocating targets that
+        // may never be used.
+        self.depth = None;
+        self.msaa_color = None;
+        log::info!(
+            "effective MSAA changed: {}x -> {}x",
+            previous_effective_sample_count,
+            self.effective_sample_count
+        );
+        self.effective_sample_count
+    }
+
+    pub fn requested_sample_count(&self) -> u32 {
+        self.requested_sample_count
     }
 
     pub fn effective_sample_count(&self) -> u32 {
@@ -658,6 +795,8 @@ struct ModelPass {
     blend_double_sided: wgpu::RenderPipeline,
     material_layout: wgpu::BindGroupLayout,
     object_layout: wgpu::BindGroupLayout,
+    shader: wgpu::ShaderModule,
+    pipeline_layout: wgpu::PipelineLayout,
     object_bg: wgpu::BindGroup,
     instance_buf: wgpu::Buffer,
     joints_buf: wgpu::Buffer,
@@ -709,21 +848,59 @@ impl ModelPass {
             bind_group_layouts: &[globals_bgl, &material_layout, &object_layout],
             push_constant_ranges: &[],
         });
+        let (opaque, opaque_double_sided, blend, blend_double_sided) =
+            Self::create_pipelines(device, color_format, &shader, &layout, sample_count);
+
+        let instance_capacity = 64 * INSTANCE_STRIDE;
+        let joints_capacity = 256 * 1024;
+        let instance_buf = Self::make_instance_buf(device, instance_capacity);
+        let joints_buf = Self::make_joints_buf(device, joints_capacity);
+        let object_bg = Self::make_object_bg(device, &object_layout, &instance_buf, &joints_buf);
+
+        Self {
+            opaque,
+            opaque_double_sided,
+            blend,
+            blend_double_sided,
+            material_layout,
+            object_layout,
+            shader,
+            pipeline_layout: layout,
+            object_bg,
+            instance_buf,
+            joints_buf,
+            instance_capacity,
+            joints_capacity,
+        }
+    }
+
+    fn create_pipelines(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        shader: &wgpu::ShaderModule,
+        pipeline_layout: &wgpu::PipelineLayout,
+        sample_count: u32,
+    ) -> (
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+    ) {
         let make_pipeline = |label: &str,
                              blend: Option<wgpu::BlendState>,
                              depth_write_enabled: bool,
                              cull_mode: Option<wgpu::Face>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
-                layout: Some(&layout),
+                layout: Some(pipeline_layout),
                 vertex: wgpu::VertexState {
-                    module: &shader,
+                    module: shader,
                     entry_point: Some("vs_main"),
                     compilation_options: Default::default(),
                     buffers: &[ModelVertex::LAYOUT],
                 },
                 fragment: Some(wgpu::FragmentState {
-                    module: &shader,
+                    module: shader,
                     entry_point: Some("fs_main"),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
@@ -749,40 +926,41 @@ impl ModelPass {
                 cache: None,
             })
         };
-        let opaque = make_pipeline("model opaque", None, true, Some(wgpu::Face::Back));
-        let opaque_double_sided = make_pipeline("model opaque double-sided", None, true, None);
-        let blend = make_pipeline(
-            "model blend",
-            Some(wgpu::BlendState::ALPHA_BLENDING),
-            false,
-            Some(wgpu::Face::Back),
-        );
-        let blend_double_sided = make_pipeline(
-            "model blend double-sided",
-            Some(wgpu::BlendState::ALPHA_BLENDING),
-            false,
-            None,
-        );
+        (
+            make_pipeline("model opaque", None, true, Some(wgpu::Face::Back)),
+            make_pipeline("model opaque double-sided", None, true, None),
+            make_pipeline(
+                "model blend",
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+                false,
+                Some(wgpu::Face::Back),
+            ),
+            make_pipeline(
+                "model blend double-sided",
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+                false,
+                None,
+            ),
+        )
+    }
 
-        let instance_capacity = 64 * INSTANCE_STRIDE;
-        let joints_capacity = 256 * 1024;
-        let instance_buf = Self::make_instance_buf(device, instance_capacity);
-        let joints_buf = Self::make_joints_buf(device, joints_capacity);
-        let object_bg = Self::make_object_bg(device, &object_layout, &instance_buf, &joints_buf);
-
-        Self {
-            opaque,
-            opaque_double_sided,
-            blend,
-            blend_double_sided,
-            material_layout,
-            object_layout,
-            object_bg,
-            instance_buf,
-            joints_buf,
-            instance_capacity,
-            joints_capacity,
-        }
+    fn rebuild_pipelines(
+        &mut self,
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        sample_count: u32,
+    ) {
+        let (opaque, opaque_double_sided, blend, blend_double_sided) = Self::create_pipelines(
+            device,
+            color_format,
+            &self.shader,
+            &self.pipeline_layout,
+            sample_count,
+        );
+        self.opaque = opaque;
+        self.opaque_double_sided = opaque_double_sided;
+        self.blend = blend;
+        self.blend_double_sided = blend_double_sided;
     }
 
     fn make_instance_buf(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
@@ -1011,6 +1189,8 @@ struct SpriteVertex {
 
 struct SpritePass {
     pipeline: wgpu::RenderPipeline,
+    shader: wgpu::ShaderModule,
+    pipeline_layout: wgpu::PipelineLayout,
     bind_group: wgpu::BindGroup,
     vbuf: wgpu::Buffer,
     vbuf_capacity: u64,
@@ -1096,21 +1276,53 @@ impl SpritePass {
             bind_group_layouts: &[globals_bgl, &bgl],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let pipeline = Self::create_pipeline(device, color_format, &shader, &layout, sample_count);
+
+        let vbuf_capacity = 64 * 1024;
+        let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sprite vbuf"),
+            size: vbuf_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            pipeline,
+            shader,
+            pipeline_layout: layout,
+            bind_group,
+            vbuf,
+            vbuf_capacity,
+            texture,
+        }
+    }
+
+    fn create_pipeline(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        shader: &wgpu::ShaderModule,
+        pipeline_layout: &wgpu::PipelineLayout,
+        sample_count: u32,
+    ) -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("sprite pipeline"),
-            layout: Some(&layout),
+            layout: Some(pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
                 buffers: &[wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<SpriteVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x4],
+                    attributes: &wgpu::vertex_attr_array![
+                        0 => Float32x3,
+                        1 => Float32x2,
+                        2 => Float32x4
+                    ],
                 }],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &shader,
+                module: shader,
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
@@ -1141,23 +1353,22 @@ impl SpritePass {
             multisample: multisample_state(sample_count),
             multiview: None,
             cache: None,
-        });
+        })
+    }
 
-        let vbuf_capacity = 64 * 1024;
-        let vbuf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sprite vbuf"),
-            size: vbuf_capacity,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        Self {
-            pipeline,
-            bind_group,
-            vbuf,
-            vbuf_capacity,
-            texture,
-        }
+    fn rebuild_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        sample_count: u32,
+    ) {
+        self.pipeline = Self::create_pipeline(
+            device,
+            color_format,
+            &self.shader,
+            &self.pipeline_layout,
+            sample_count,
+        );
     }
 
     fn prepare(&mut self, gpu: &Gpu, scene: &Scene, camera: &Camera) -> u32 {
@@ -1435,7 +1646,10 @@ mod tests {
         valid::{Capabilities, ValidationFlags, Validator},
     };
 
-    use super::{GlobalsRaw, InstanceRaw, model_normal_matrix, select_effective_sample_count};
+    use super::{
+        GlobalsRaw, InstanceRaw, model_normal_matrix, sample_count_transition,
+        select_effective_sample_count,
+    };
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
@@ -1453,24 +1667,21 @@ mod tests {
             supported
         );
 
-        for sample_count in [8, 4] {
-            if !supported.contains(&sample_count) {
+        let mut renderer = super::Renderer::new(&gpu, OFFSCREEN_FORMAT).unwrap();
+        let target = OffscreenTarget::new(&gpu, 4, 4);
+        let mut scene = Scene::default();
+        scene.draw_sky = true;
+
+        for requested in [1, 2, 4, 8, 4, 1] {
+            if !supported.contains(&requested) {
                 continue;
             }
 
-            let mut renderer = super::Renderer::new_with_config(
-                &gpu,
-                OFFSCREEN_FORMAT,
-                super::RendererConfig {
-                    requested_sample_count: sample_count,
-                },
-            )
-            .unwrap();
-            assert_eq!(renderer.effective_sample_count(), sample_count);
-
-            let target = OffscreenTarget::new(&gpu, 4, 4);
-            let mut scene = Scene::default();
-            scene.draw_sky = true;
+            assert_eq!(
+                renderer.set_requested_sample_count(&gpu, requested),
+                requested
+            );
+            assert_eq!(renderer.requested_sample_count(), requested);
             renderer.render(
                 &gpu,
                 &target.view,
@@ -1498,6 +1709,28 @@ mod tests {
     #[test]
     fn one_x_request_stays_one_x() {
         assert_eq!(select_effective_sample_count(1, &[1, 2, 4, 8]), 1);
+    }
+
+    #[test]
+    fn invalid_request_sanitizes_to_one_x() {
+        assert_eq!(select_effective_sample_count(0, &[1, 2, 4, 8]), 1);
+        assert_eq!(select_effective_sample_count(16, &[1, 2, 4, 8]), 1);
+    }
+
+    #[test]
+    fn request_can_change_without_rebuilding_for_same_effective_count() {
+        let transition = sample_count_transition(8, 4, &[1, 2, 4]);
+        assert_eq!(transition.requested_sample_count, 8);
+        assert_eq!(transition.effective_sample_count, 4);
+        assert!(!transition.rebuild_pipelines);
+    }
+
+    #[test]
+    fn effective_transition_requires_pipeline_rebuild() {
+        let transition = sample_count_transition(4, 1, &[1, 2, 4]);
+        assert_eq!(transition.requested_sample_count, 4);
+        assert_eq!(transition.effective_sample_count, 4);
+        assert!(transition.rebuild_pipelines);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
