@@ -323,6 +323,9 @@ impl<G: Game> WinitApp<G> {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        if self.error.is_some() {
+            return;
+        }
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -350,6 +353,17 @@ impl<G: Game> WinitApp<G> {
                     self.error = Some(error);
                     event_loop.exit();
                 }
+                return;
+            }
+            Err(wgpu::SurfaceError::Timeout) => {
+                log::warn!("surface timeout; skipping frame");
+                return;
+            }
+            Err(e @ wgpu::SurfaceError::OutOfMemory) => {
+                let error = anyhow::anyhow!("surface error: {e}");
+                log::error!("{error}");
+                self.error = Some(error);
+                event_loop.exit();
                 return;
             }
             Err(e) => {
@@ -541,6 +555,9 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.error.is_some() {
+            return;
+        }
         let Some(state) = &self.state else { return };
         let Some(max_fps) = self.config.max_fps else {
             state.window.request_redraw();

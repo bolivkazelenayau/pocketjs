@@ -269,7 +269,7 @@ fn fs_weights(in: VsOut) -> @location(0) vec4f {
         let top_y = search_y_up(top_start, top_end);
         let bottom_y = search_y_down(bottom_start, bottom_end);
         let distances = abs(round(vec2f(top_y, bottom_y) / t.y - vec2f(pix.y)));
-        let crossing_x = in.uv.x - 0.125 * t.x;
+        let crossing_x = in.uv.x - 0.25 * t.x;
         let crossing_top = sample_edges(vec2f(crossing_x, top_y)).y;
         let crossing_bottom = sample_edges(vec2f(crossing_x, bottom_y + t.y)).y;
         let a = area_ortho_weights(sqrt(distances), crossing_top, crossing_bottom);

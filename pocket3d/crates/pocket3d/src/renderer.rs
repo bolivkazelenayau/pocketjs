@@ -1543,4 +1543,12 @@ mod tests {
         let transition = sample_count_transition(4, 4, &[1, 2, 4]);
         assert!(!transition.rebuild_pipelines);
     }
+
+    #[test]
+    fn model_shader_keeps_surviving_cutout_fragments_opaque() {
+        let shader = include_str!("shaders/model.wgsl");
+        assert!(shader.contains("discard;"));
+        assert!(shader.contains("return vec4f(albedo.rgb * lighting, 1.0);"));
+        assert!(!shader.contains("return vec4f(albedo.rgb * lighting, albedo.a);"));
+    }
 }

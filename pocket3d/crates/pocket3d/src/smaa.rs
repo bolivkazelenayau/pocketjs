@@ -1164,4 +1164,13 @@ mod tests {
             wgpu::TextureFormat::Bgra8Unorm
         );
     }
+
+    #[test]
+    fn vertical_crossing_sampling_uses_quarter_texel_offset() {
+        let shader = include_str!("shaders/smaa_weights.wgsl");
+        assert!(shader.contains("let top_start = in.uv + t * vec2f(-0.125, -0.25);"));
+        assert!(shader.contains("let bottom_start = in.uv + t * vec2f(-0.125, 1.25);"));
+        assert!(shader.contains("let crossing_x = in.uv.x - 0.25 * t.x;"));
+        assert!(!shader.contains("let crossing_x = in.uv.x - 0.125 * t.x;"));
+    }
 }

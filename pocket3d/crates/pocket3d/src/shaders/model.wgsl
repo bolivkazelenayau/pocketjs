@@ -84,5 +84,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4f {
         hemi + globals.sun_color.rgb * sun * 0.9,
         instance.params.x,
     );
-    return vec4f(albedo.rgb * lighting, albedo.a);
+    // This pipeline is a hard alpha-cutout path. Surviving fragments must
+    // never carry sampled or tint alpha into the premultiplied surface.
+    return vec4f(albedo.rgb * lighting, 1.0);
 }
