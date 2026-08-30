@@ -1,3 +1,5 @@
+// Adapted from SMAA / iryoku/smaa (MIT). See ../../../../../../THIRD_PARTY_NOTICES.md.
+
 @group(0) @binding(0) var neighborhood_scene: texture_2d<f32>;
 @group(0) @binding(1) var neighborhood_scene_sampler: sampler;
 @group(0) @binding(2) var weights_tex: texture_2d<f32>;

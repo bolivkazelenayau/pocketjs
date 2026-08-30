@@ -1,3 +1,5 @@
+// Adapted from SMAA / iryoku/smaa (MIT). See ../../../../../../THIRD_PARTY_NOTICES.md.
+
 struct Metrics {
     texel_size: vec2f,
     alpha_edge: f32,
