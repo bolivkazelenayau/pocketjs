@@ -6,12 +6,29 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "windows")]
+use anyhow::Context;
 use anyhow::Result;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::KeyCode;
+#[cfg(target_os = "windows")]
+use winit::platform::windows::WindowAttributesExtWindows;
+#[cfg(target_os = "windows")]
+use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorGrabMode, Window, WindowId, WindowLevel};
+
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{BOOL, HWND};
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::DirectComposition::{
+    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+#[cfg(target_os = "windows")]
+use windows::core::Interface;
 
 use crate::camera::Camera;
 use crate::gpu::Gpu;
@@ -107,16 +124,85 @@ pub fn run(config: AppConfig, game: impl Game) -> Result<()> {
 }
 
 struct WindowState {
-    window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
+    #[cfg(target_os = "windows")]
+    direct_composition: Option<DirectCompositionState>,
     gpu: Gpu,
     renderer: Renderer,
+    // Keep the HWND alive until after the surface and any composition target.
+    window: Arc<Window>,
     input: Input,
     timestep: FixedTimestep,
     start: Instant,
     last_frame: Instant,
     mouse_captured: bool,
+}
+
+impl WindowState {
+    fn configure_surface(&self) -> Result<()> {
+        self.surface
+            .configure(&self.gpu.device, &self.surface_config);
+
+        #[cfg(target_os = "windows")]
+        if let Some(direct_composition) = &self.direct_composition {
+            // wgpu creates or replaces the DirectComposition swapchain and
+            // associates it with the visual during surface configuration.
+            direct_composition.commit()?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+struct DirectCompositionState {
+    device: IDCompositionDevice,
+    // Retain the target and visual for the full lifetime of the surface.
+    _target: IDCompositionTarget,
+    visual: IDCompositionVisual,
+}
+
+#[cfg(target_os = "windows")]
+impl DirectCompositionState {
+    fn new(window: &Window) -> Result<Self> {
+        let window_handle = window.window_handle().context("obtain HWND")?;
+        let hwnd = match window_handle.as_raw() {
+            RawWindowHandle::Win32(handle) => HWND(handle.hwnd.get() as *mut _),
+            _ => anyhow::bail!("obtain HWND: winit returned a non-Win32 window handle"),
+        };
+
+        // A null DXGI device asks DirectComposition to create its own device.
+        let device: IDCompositionDevice = unsafe { DCompositionCreateDevice(None::<&IDXGIDevice>) }
+            .context("create DirectComposition device")?;
+        let target = unsafe { device.CreateTargetForHwnd(hwnd, BOOL(1)) }
+            .context("create DirectComposition target for HWND")?;
+        let visual = unsafe { device.CreateVisual() }.context("create DirectComposition visual")?;
+        unsafe { target.SetRoot(&visual) }
+            .context("set DirectComposition visual as target root")?;
+
+        Ok(Self {
+            device,
+            _target: target,
+            visual,
+        })
+    }
+
+    fn create_surface(&self, instance: &wgpu::Instance) -> Result<wgpu::Surface<'static>> {
+        // SAFETY: `visual` is a valid IDCompositionVisual. wgpu increments its
+        // COM refcount, and WindowState retains this state until after the
+        // surface is dropped.
+        unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CompositionVisual(
+                self.visual.as_raw(),
+            ))
+        }
+        .context("create wgpu DirectComposition surface")
+    }
+
+    fn commit(&self) -> Result<()> {
+        unsafe { self.device.Commit() }.context("commit DirectComposition device")
+    }
 }
 
 struct WinitApp<G: Game> {
@@ -142,30 +228,84 @@ impl<G: Game> WinitApp<G> {
             } else {
                 WindowLevel::Normal
             });
+
+        #[cfg(target_os = "windows")]
+        let attrs = if self.config.transparent {
+            attrs.with_no_redirection_bitmap(true)
+        } else {
+            attrs
+        };
+
         let window = Arc::new(event_loop.create_window(attrs)?);
+
+        #[cfg(target_os = "windows")]
+        let instance = if self.config.transparent {
+            Gpu::new_instance_with_backends(wgpu::Backends::DX12)
+        } else {
+            Gpu::new_instance()
+        };
+        #[cfg(not(target_os = "windows"))]
         let instance = Gpu::new_instance();
+
+        #[cfg(target_os = "windows")]
+        let (surface, direct_composition) = if self.config.transparent {
+            let direct_composition = DirectCompositionState::new(&window)?;
+            let surface = direct_composition.create_surface(&instance)?;
+            (surface, Some(direct_composition))
+        } else {
+            (
+                instance
+                    .create_surface(window.clone())
+                    .context("create wgpu window surface")?,
+                None,
+            )
+        };
+        #[cfg(not(target_os = "windows"))]
         let surface = instance.create_surface(window.clone())?;
+
         let gpu = Gpu::from_instance_for_surface(instance, &surface)?;
+
+        #[cfg(target_os = "windows")]
+        if self.config.transparent {
+            let backend = gpu.adapter.get_info().backend;
+            anyhow::ensure!(
+                backend == wgpu::Backend::Dx12,
+                "transparent Windows DirectComposition surface requires DX12, selected {backend:?}"
+            );
+        }
 
         let px = window.inner_size();
         let mut surface_config = surface
             .get_default_config(&gpu.adapter, px.width.max(1), px.height.max(1))
             .ok_or_else(|| anyhow::anyhow!("surface not supported by adapter"))?;
         surface_config.present_mode = wgpu::PresentMode::AutoVsync;
+
+        #[cfg(target_os = "windows")]
+        if self.config.transparent {
+            configure_windows_transparent_surface(&surface, &gpu.adapter, &mut surface_config)?;
+        }
+        #[cfg(not(target_os = "windows"))]
         if self.config.transparent {
             surface_config.alpha_mode = pick_alpha_mode(&surface, &gpu.adapter)?;
         }
+
         surface.configure(&gpu.device, &surface_config);
+        #[cfg(target_os = "windows")]
+        if let Some(direct_composition) = &direct_composition {
+            direct_composition.commit()?;
+        }
 
         let mut renderer = Renderer::new(&gpu, surface_config.format)?;
         self.game.init(&gpu, &mut renderer)?;
 
         let mut state = WindowState {
-            window,
             surface,
             surface_config,
+            #[cfg(target_os = "windows")]
+            direct_composition,
             gpu,
             renderer,
+            window,
             input: Input::default(),
             timestep: FixedTimestep::new(self.config.tick_hz),
             start: Instant::now(),
@@ -202,9 +342,10 @@ impl<G: Game> WinitApp<G> {
         let frame = match state.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                state
-                    .surface
-                    .configure(&state.gpu.device, &state.surface_config);
+                if let Err(error) = state.configure_surface() {
+                    self.error = Some(error);
+                    event_loop.exit();
+                }
                 return;
             }
             Err(e) => {
@@ -233,6 +374,42 @@ impl<G: Game> WinitApp<G> {
         state.window.pre_present_notify();
         frame.present();
     }
+}
+
+#[cfg(target_os = "windows")]
+fn configure_windows_transparent_surface(
+    surface: &wgpu::Surface<'_>,
+    adapter: &wgpu::Adapter,
+    config: &mut wgpu::SurfaceConfiguration,
+) -> Result<()> {
+    let caps = surface.get_capabilities(adapter);
+    let format = wgpu::TextureFormat::Bgra8UnormSrgb;
+    let present_mode = wgpu::PresentMode::Fifo;
+    let alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
+
+    anyhow::ensure!(
+        caps.formats.contains(&format),
+        "select DirectComposition surface format: required {format:?}, supported {:?}",
+        caps.formats
+    );
+    anyhow::ensure!(
+        caps.present_modes.contains(&present_mode),
+        "select DirectComposition present mode: required {present_mode:?}, supported {:?}",
+        caps.present_modes
+    );
+    anyhow::ensure!(
+        caps.alpha_modes.contains(&alpha_mode),
+        "select DirectComposition alpha mode: required {alpha_mode:?}, supported {:?}",
+        caps.alpha_modes
+    );
+
+    config.format = format;
+    config.present_mode = present_mode;
+    config.alpha_mode = alpha_mode;
+    log::info!(
+        "transparent Windows presentation: DirectComposition + DX12, format {format:?}, present mode {present_mode:?}, alpha mode {alpha_mode:?}"
+    );
+    Ok(())
 }
 
 /// The scene pass writes premultiplied-style output (opaque pixels carry
@@ -305,9 +482,10 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
             WindowEvent::Resized(size) => {
                 state.surface_config.width = size.width.max(1);
                 state.surface_config.height = size.height.max(1);
-                state
-                    .surface
-                    .configure(&state.gpu.device, &state.surface_config);
+                if let Err(error) = state.configure_surface() {
+                    self.error = Some(error);
+                    event_loop.exit();
+                }
             }
             WindowEvent::KeyboardInput { .. } => {
                 if self.config.capture_mouse && state.input.key_pressed(KeyCode::Escape) {

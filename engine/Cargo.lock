@@ -1870,6 +1870,7 @@ dependencies = [
  "pollster",
  "serde_json",
  "wgpu",
+ "windows",
  "winit",
 ]
 
