@@ -48,6 +48,8 @@ pub struct Renderer {
     pub world_material_layout: wgpu::BindGroupLayout,
     pub model_material_layout: wgpu::BindGroupLayout,
     depth: Option<DepthTarget>,
+    msaa_color: Option<MsaaColorTarget>,
+    effective_sample_count: u32,
     globals_buf: wgpu::Buffer,
     globals_bg: wgpu::BindGroup,
     world_opaque: wgpu::RenderPipeline,
@@ -59,9 +61,148 @@ pub struct Renderer {
     hud: HudPass,
 }
 
+/// Generic renderer initialization settings. Product-specific preferences
+/// should be translated to this representation at the application boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RendererConfig {
+    pub requested_sample_count: u32,
+}
+
+impl Default for RendererConfig {
+    fn default() -> Self {
+        Self {
+            requested_sample_count: 1,
+        }
+    }
+}
+
+const CANDIDATE_SAMPLE_COUNTS: [u32; 4] = [1, 2, 4, 8];
+
+/// Select the highest supported candidate that does not exceed the request.
+/// The caller supplies the already-intersected hardware capabilities so this
+/// pure policy is testable without manufacturing a GPU adapter.
+pub fn select_effective_sample_count(requested: u32, supported: &[u32]) -> u32 {
+    let requested = match requested {
+        1 | 2 | 4 | 8 => requested,
+        _ => 1,
+    };
+
+    CANDIDATE_SAMPLE_COUNTS
+        .iter()
+        .rev()
+        .copied()
+        .find(|&count| count <= requested && supported.contains(&count))
+        .unwrap_or(1)
+}
+
+struct MsaaColorTarget {
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    size: (u32, u32),
+    sample_count: u32,
+}
+
+impl MsaaColorTarget {
+    fn new(gpu: &Gpu, format: wgpu::TextureFormat, size: (u32, u32), sample_count: u32) -> Self {
+        let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("msaa color"),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        Self {
+            _texture: texture,
+            view,
+            size,
+            sample_count,
+        }
+    }
+}
+
+fn multisample_state(sample_count: u32) -> wgpu::MultisampleState {
+    wgpu::MultisampleState {
+        count: sample_count,
+        mask: !0,
+        alpha_to_coverage_enabled: false,
+    }
+}
+
+fn supported_sample_counts(gpu: &Gpu, color_format: wgpu::TextureFormat) -> Vec<u32> {
+    let device_features = gpu.device.features();
+    let use_adapter_format_features = device_features
+        .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+        || !gpu
+            .adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::WEBGPU_TEXTURE_FORMAT_SUPPORT);
+    let format_features = |format: wgpu::TextureFormat| {
+        if use_adapter_format_features {
+            gpu.adapter.get_texture_format_features(format)
+        } else {
+            format.guaranteed_format_features(device_features)
+        }
+    };
+    let color_features = format_features(color_format);
+    let depth_features = format_features(DEPTH_FORMAT);
+    let color_renderable = color_features
+        .allowed_usages
+        .contains(wgpu::TextureUsages::RENDER_ATTACHMENT);
+    let depth_renderable = depth_features
+        .allowed_usages
+        .contains(wgpu::TextureUsages::RENDER_ATTACHMENT);
+    let can_resolve_color = color_features
+        .flags
+        .contains(wgpu::TextureFormatFeatureFlags::MULTISAMPLE_RESOLVE);
+
+    let supported: Vec<u32> = CANDIDATE_SAMPLE_COUNTS
+        .into_iter()
+        .filter(|&count| {
+            color_renderable
+                && depth_renderable
+                && color_features.flags.sample_count_supported(count)
+                && depth_features.flags.sample_count_supported(count)
+                && (count == 1 || can_resolve_color)
+        })
+        .collect();
+
+    log::debug!(
+        "MSAA capabilities: color {color_format:?} {:?}, depth {DEPTH_FORMAT:?} {:?}, supported {:?}",
+        color_features.flags,
+        depth_features.flags,
+        supported
+    );
+    supported
+}
+
 impl Renderer {
     pub fn new(gpu: &Gpu, color_format: wgpu::TextureFormat) -> Result<Self> {
+        Self::new_with_config(gpu, color_format, RendererConfig::default())
+    }
+
+    pub fn new_with_config(
+        gpu: &Gpu,
+        color_format: wgpu::TextureFormat,
+        config: RendererConfig,
+    ) -> Result<Self> {
         let device = &gpu.device;
+        let supported = supported_sample_counts(gpu, color_format);
+        let effective_sample_count =
+            select_effective_sample_count(config.requested_sample_count, &supported);
+        log::info!(
+            "requested AA: {}x, effective MSAA: {}x",
+            config.requested_sample_count,
+            effective_sample_count
+        );
         let samplers = Samplers::new(gpu);
 
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -141,7 +282,7 @@ impl Renderer {
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: multisample_state(effective_sample_count),
                 multiview: None,
                 cache: None,
             })
@@ -176,14 +317,14 @@ impl Renderer {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: multisample_state(effective_sample_count),
             multiview: None,
             cache: None,
         });
 
-        let models = ModelPass::new(gpu, color_format, &globals_bgl);
+        let models = ModelPass::new(gpu, color_format, &globals_bgl, effective_sample_count);
         let model_material_layout = models.material_layout.clone();
-        let sprites = SpritePass::new(gpu, color_format, &globals_bgl);
+        let sprites = SpritePass::new(gpu, color_format, &globals_bgl, effective_sample_count);
 
         Ok(Self {
             color_format,
@@ -191,6 +332,8 @@ impl Renderer {
             world_material_layout,
             model_material_layout,
             depth: None,
+            msaa_color: None,
+            effective_sample_count,
             globals_buf,
             globals_bg,
             world_opaque,
@@ -203,10 +346,38 @@ impl Renderer {
         })
     }
 
-    fn ensure_depth(&mut self, gpu: &Gpu, size: (u32, u32)) {
-        if self.depth.as_ref().map(|d| d.size) != Some(size) {
-            self.depth = Some(DepthTarget::new(gpu, size.0, size.1));
+    /// The sample count is fixed at construction; only target dimensions can
+    /// change while the renderer lives.
+    fn ensure_targets(&mut self, gpu: &Gpu, size: (u32, u32)) {
+        let depth_needs_recreate = self.depth.as_ref().is_none_or(|depth| depth.size != size);
+        if depth_needs_recreate {
+            self.depth = Some(DepthTarget::new_with_sample_count(
+                gpu,
+                size.0,
+                size.1,
+                self.effective_sample_count,
+            ));
         }
+
+        if self.effective_sample_count > 1 {
+            let msaa_needs_recreate = self.msaa_color.as_ref().is_none_or(|target| {
+                target.size != size || target.sample_count != self.effective_sample_count
+            });
+            if msaa_needs_recreate {
+                self.msaa_color = Some(MsaaColorTarget::new(
+                    gpu,
+                    self.color_format,
+                    size,
+                    self.effective_sample_count,
+                ));
+            }
+        } else {
+            self.msaa_color = None;
+        }
+    }
+
+    pub fn effective_sample_count(&self) -> u32 {
+        self.effective_sample_count
     }
 
     pub fn render(
@@ -218,7 +389,7 @@ impl Renderer {
         camera: &Camera,
         hud: &Hud,
     ) {
-        self.ensure_depth(gpu, size);
+        self.ensure_targets(gpu, size);
         let aspect = size.0 as f32 / size.1 as f32;
 
         let view_proj = camera.view_proj(aspect);
@@ -288,10 +459,15 @@ impl Renderer {
         {
             let h = scene.sky.horizon;
             let depth_view = &self.depth.as_ref().unwrap().view;
+            let scene_color_view = self
+                .msaa_color
+                .as_ref()
+                .map(|target| &target.view)
+                .unwrap_or(color_view);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: color_view,
+                    view: scene_color_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(if scene.transparent_clear {
@@ -362,10 +538,15 @@ impl Renderer {
         // --- viewmodel pass (own depth range so the gun never clips) -------
         if let Some(vm) = &viewmodel_draw {
             let depth_view = &self.depth.as_ref().unwrap().view;
+            let scene_color_view = self
+                .msaa_color
+                .as_ref()
+                .map(|target| &target.view)
+                .unwrap_or(color_view);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewmodel"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: color_view,
+                    view: scene_color_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
@@ -385,6 +566,26 @@ impl Renderer {
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
             self.models.draw(&mut pass, std::slice::from_ref(vm));
+        }
+
+        // Resolve the complete 3D image only after both 3D passes. The final
+        // target remains single-sampled so HUD and application overlays keep
+        // their existing 1x path.
+        if let Some(msaa_color) = &self.msaa_color {
+            let _resolve_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("msaa resolve"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &msaa_color.view,
+                    resolve_target: Some(color_view),
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Discard,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
         }
 
         // --- HUD overlay pass ----------------------------------------------
@@ -469,6 +670,7 @@ impl ModelPass {
         gpu: &Gpu,
         color_format: wgpu::TextureFormat,
         globals_bgl: &wgpu::BindGroupLayout,
+        sample_count: u32,
     ) -> Self {
         let device = &gpu.device;
         let material_layout = ModelAsset::material_layout(gpu);
@@ -542,7 +744,7 @@ impl ModelPass {
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: multisample_state(sample_count),
                 multiview: None,
                 cache: None,
             })
@@ -821,6 +1023,7 @@ impl SpritePass {
         gpu: &Gpu,
         color_format: wgpu::TextureFormat,
         globals_bgl: &wgpu::BindGroupLayout,
+        sample_count: u32,
     ) -> Self {
         let device = &gpu.device;
 
@@ -935,7 +1138,7 @@ impl SpritePass {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: multisample_state(sample_count),
             multiview: None,
             cache: None,
         });
@@ -1221,6 +1424,10 @@ impl HudPass {
 
 #[cfg(test)]
 mod tests {
+    use crate::camera::Camera;
+    use crate::gpu::{Gpu, OFFSCREEN_FORMAT, OffscreenTarget};
+    use crate::hud::Hud;
+    use crate::scene::Scene;
     use glam::{Quat, Vec3};
     #[cfg(not(target_arch = "wasm32"))]
     use wgpu::naga::{
@@ -1228,7 +1435,70 @@ mod tests {
         valid::{Capabilities, ValidationFlags, Validator},
     };
 
-    use super::{GlobalsRaw, InstanceRaw, model_normal_matrix};
+    use super::{GlobalsRaw, InstanceRaw, model_normal_matrix, select_effective_sample_count};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn gpu_multisample_paths_create_and_resolve_when_supported() {
+        let Ok(gpu) = Gpu::new_headless() else {
+            return;
+        };
+        let supported = super::supported_sample_counts(&gpu, OFFSCREEN_FORMAT);
+        eprintln!(
+            "GPU MSAA smoke: adapter {:?}, device adapter-specific format features {}, supported {:?}",
+            gpu.adapter.get_info().name,
+            gpu.device
+                .features()
+                .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES),
+            supported
+        );
+
+        for sample_count in [8, 4] {
+            if !supported.contains(&sample_count) {
+                continue;
+            }
+
+            let mut renderer = super::Renderer::new_with_config(
+                &gpu,
+                OFFSCREEN_FORMAT,
+                super::RendererConfig {
+                    requested_sample_count: sample_count,
+                },
+            )
+            .unwrap();
+            assert_eq!(renderer.effective_sample_count(), sample_count);
+
+            let target = OffscreenTarget::new(&gpu, 4, 4);
+            let mut scene = Scene::default();
+            scene.draw_sky = true;
+            renderer.render(
+                &gpu,
+                &target.view,
+                target.size,
+                &scene,
+                &Camera::default(),
+                &Hud::default(),
+            );
+            gpu.device.poll(wgpu::PollType::Wait).unwrap();
+        }
+    }
+
+    #[test]
+    fn selects_requested_count_when_supported() {
+        assert_eq!(select_effective_sample_count(8, &[1, 2, 4, 8]), 8);
+    }
+
+    #[test]
+    fn falls_down_to_the_highest_supported_count() {
+        assert_eq!(select_effective_sample_count(8, &[1, 2, 4]), 4);
+        assert_eq!(select_effective_sample_count(4, &[1, 2]), 2);
+        assert_eq!(select_effective_sample_count(2, &[1, 4]), 1);
+    }
+
+    #[test]
+    fn one_x_request_stays_one_x() {
+        assert_eq!(select_effective_sample_count(1, &[1, 2, 4, 8]), 1);
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

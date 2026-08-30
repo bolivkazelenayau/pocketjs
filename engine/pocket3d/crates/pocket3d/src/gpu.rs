@@ -113,10 +113,18 @@ impl Gpu {
             info.device_type,
             power_preference
         );
+        let adapter_features = adapter.features();
+        let required_features = if adapter_features
+            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+        {
+            wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+        } else {
+            wgpu::Features::empty()
+        };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("pocket3d"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,
@@ -255,6 +263,10 @@ pub struct DepthTarget {
 
 impl DepthTarget {
     pub fn new(gpu: &Gpu, width: u32, height: u32) -> Self {
+        Self::new_with_sample_count(gpu, width, height, 1)
+    }
+
+    pub fn new_with_sample_count(gpu: &Gpu, width: u32, height: u32, sample_count: u32) -> Self {
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("depth"),
             size: wgpu::Extent3d {
@@ -263,7 +275,7 @@ impl DepthTarget {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count,
             dimension: wgpu::TextureDimension::D2,
             format: DEPTH_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
