@@ -321,8 +321,8 @@ impl Renderer {
 
     /// Initializes the renderer with the internal SMAA proof-of-concept path.
     ///
-    /// This is intentionally crate-private: SMAA is a renderer experiment and
-    /// is not part of the public RendererConfig API yet.
+    /// This is intentionally crate-private: applications should use
+    /// [`Self::set_smaa_enabled`] to change the post-process state at runtime.
     #[allow(dead_code)]
     pub(crate) fn new_with_smaa_for_poc(
         gpu: &Gpu,
@@ -546,6 +546,32 @@ impl Renderer {
 
     pub fn effective_sample_count(&self) -> u32 {
         self.effective_sample_count
+    }
+
+    /// Returns whether the SMAA post-process pass is currently enabled.
+    pub fn smaa_enabled(&self) -> bool {
+        self.smaa.is_some()
+    }
+
+    /// Enable or disable the SMAA post-process pass between frames.
+    ///
+    /// Enabling creates only SMAA's pipelines, lookup textures, and lazy
+    /// size-dependent targets. Disabling drops only that pass. The GPU device,
+    /// surface-dependent MSAA state, and all scene resources are preserved.
+    /// Callers must invoke this outside any active render pass, before the next
+    /// call to [`Self::render`].
+    pub fn set_smaa_enabled(&mut self, gpu: &Gpu, enabled: bool) {
+        if enabled == self.smaa_enabled() {
+            return;
+        }
+
+        if enabled {
+            self.smaa = Some(crate::smaa::SmaaPass::new(gpu, self.color_format));
+            log::info!("post-process AA: SMAA 1x enabled");
+        } else {
+            self.smaa = None;
+            log::info!("post-process AA: SMAA disabled");
+        }
     }
 
     pub fn render(
@@ -1760,8 +1786,15 @@ mod tests {
 
         let device_identity = std::ptr::addr_of!(gpu.device);
         let adapter_identity = std::ptr::addr_of!(gpu.adapter);
-        let mut renderer = super::Renderer::new_with_smaa_for_poc(&gpu, OFFSCREEN_FORMAT).unwrap();
+        let mut renderer = super::Renderer::new(&gpu, OFFSCREEN_FORMAT).unwrap();
+        assert!(!renderer.smaa_enabled());
+        renderer.set_smaa_enabled(&gpu, true);
         let smaa_identity = renderer.smaa.as_ref().map(|smaa| smaa as *const _);
+        renderer.set_smaa_enabled(&gpu, true);
+        assert_eq!(
+            renderer.smaa.as_ref().map(|smaa| smaa as *const _),
+            smaa_identity
+        );
         let target = OffscreenTarget::new(&gpu, 32, 32);
         let mut scene = Scene::default();
         scene.draw_sky = true;
@@ -1770,7 +1803,7 @@ mod tests {
 
         let mut saw_one_x = false;
         let mut saw_msaa = false;
-        for requested in [1, 4, 8, 2, 1] {
+        for requested in [1, 2, 4, 8, 4, 1] {
             assert!(
                 supported.contains(&requested),
                 "expected MX250 support for {requested}x"
@@ -1780,46 +1813,48 @@ mod tests {
                 requested
             );
             assert_eq!(renderer.effective_sample_count(), requested);
-            assert!(
-                renderer.smaa.is_some(),
-                "SMAA must remain enabled at {requested}x"
-            );
-            assert_eq!(
-                renderer.smaa.as_ref().map(|smaa| smaa as *const _),
-                smaa_identity
-            );
             assert_eq!(std::ptr::addr_of!(gpu.device), device_identity);
             assert_eq!(std::ptr::addr_of!(gpu.adapter), adapter_identity);
 
-            renderer.render(
-                &gpu,
-                &target.view,
-                target.size,
-                &scene,
-                &Camera::default(),
-                &hud,
-            );
-            gpu.device.poll(wgpu::PollType::Wait).unwrap();
-            let rgba = target.read_rgba(&gpu).unwrap();
-            let hud_pixel = &rgba[..4];
-            assert_eq!(
-                hud_pixel,
-                &[255, 0, 255, 255],
-                "HUD must be drawn after SMAA at {requested}x"
-            );
+            for enabled in [false, true] {
+                renderer.set_smaa_enabled(&gpu, enabled);
+                assert_eq!(renderer.smaa_enabled(), enabled);
+                assert_eq!(renderer.effective_sample_count(), requested);
+                assert_eq!(renderer.requested_sample_count(), requested);
+                assert_eq!(std::ptr::addr_of!(gpu.device), device_identity);
+                assert_eq!(std::ptr::addr_of!(gpu.adapter), adapter_identity);
 
-            let hash = rgba.iter().fold(0xcbf29ce484222325u64, |hash, &byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-            });
-            eprintln!(
-                "GPU SMAA smoke: adapter {:?}, {}x, output FNV-1a {:016x}, HUD {:?}",
-                gpu.adapter.get_info().name,
-                requested,
-                hash,
-                hud_pixel
-            );
-            saw_one_x |= requested == 1;
-            saw_msaa |= requested > 1;
+                renderer.render(
+                    &gpu,
+                    &target.view,
+                    target.size,
+                    &scene,
+                    &Camera::default(),
+                    &hud,
+                );
+                gpu.device.poll(wgpu::PollType::Wait).unwrap();
+                let rgba = target.read_rgba(&gpu).unwrap();
+                let hud_pixel = &rgba[..4];
+                assert_eq!(
+                    hud_pixel,
+                    &[255, 0, 255, 255],
+                    "HUD must be drawn after SMAA={enabled} at {requested}x"
+                );
+
+                let hash = rgba.iter().fold(0xcbf29ce484222325u64, |hash, &byte| {
+                    (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+                });
+                eprintln!(
+                    "GPU AA smoke: adapter {:?}, {}x / SMAA {}, output FNV-1a {:016x}, HUD {:?}",
+                    gpu.adapter.get_info().name,
+                    requested,
+                    enabled,
+                    hash,
+                    hud_pixel
+                );
+                saw_one_x |= requested == 1;
+                saw_msaa |= requested > 1;
+            }
         }
         assert!(saw_one_x);
         assert!(saw_msaa);
