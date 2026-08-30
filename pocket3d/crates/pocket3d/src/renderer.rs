@@ -32,6 +32,7 @@ pub struct Renderer {
     globals_layout: wgpu::BindGroupLayout,
     depth: Option<DepthTarget>,
     msaa_color: Option<MsaaColorTarget>,
+    smaa: Option<crate::smaa::SmaaPass>,
     requested_sample_count: u32,
     effective_sample_count: u32,
     supported_sample_counts: Vec<u32>,
@@ -256,13 +257,34 @@ fn create_world_pipelines(
 
 impl Renderer {
     pub fn new(gpu: &Gpu, color_format: wgpu::TextureFormat) -> Result<Self> {
-        Self::new_with_config(gpu, color_format, RendererConfig::default())
+        Self::new_with_internal_config(gpu, color_format, RendererConfig::default(), false)
     }
 
     pub fn new_with_config(
         gpu: &Gpu,
         color_format: wgpu::TextureFormat,
         config: RendererConfig,
+    ) -> Result<Self> {
+        Self::new_with_internal_config(gpu, color_format, config, false)
+    }
+
+    /// Initializes the renderer with the internal SMAA proof-of-concept path.
+    ///
+    /// This is intentionally crate-private: SMAA is a renderer experiment and
+    /// is not part of the public RendererConfig API yet.
+    #[allow(dead_code)]
+    pub(crate) fn new_with_smaa_for_poc(
+        gpu: &Gpu,
+        color_format: wgpu::TextureFormat,
+    ) -> Result<Self> {
+        Self::new_with_internal_config(gpu, color_format, RendererConfig::default(), true)
+    }
+
+    fn new_with_internal_config(
+        gpu: &Gpu,
+        color_format: wgpu::TextureFormat,
+        config: RendererConfig,
+        smaa_enabled: bool,
     ) -> Result<Self> {
         let device = &gpu.device;
         let supported_sample_counts = supported_sample_counts(gpu, color_format);
@@ -317,6 +339,10 @@ impl Renderer {
         let models = ModelPass::new(gpu, color_format, &globals_bgl, effective_sample_count);
         let model_material_layout = models.material_layout.clone();
         let sprites = SpritePass::new(gpu, color_format, &globals_bgl, effective_sample_count);
+        let smaa = smaa_enabled.then(|| crate::smaa::SmaaPass::new(gpu, color_format));
+        if smaa.is_some() {
+            log::info!("post-process AA: SMAA 1x");
+        }
 
         Ok(Self {
             color_format,
@@ -326,6 +352,7 @@ impl Renderer {
             globals_layout: globals_bgl,
             depth: None,
             msaa_color: None,
+            smaa,
             requested_sample_count,
             effective_sample_count,
             supported_sample_counts,
@@ -368,6 +395,10 @@ impl Renderer {
             }
         } else {
             self.msaa_color = None;
+        }
+
+        if let Some(smaa) = self.smaa.as_mut() {
+            smaa.ensure_targets(gpu, size);
         }
     }
 
@@ -457,6 +488,9 @@ impl Renderer {
         hud: &Hud,
     ) {
         self.ensure_targets(gpu, size);
+        if let Some(smaa) = self.smaa.as_mut() {
+            smaa.update_metrics(gpu, size, scene.transparent_clear);
+        }
         let aspect = size.0 as f32 / size.1 as f32;
 
         let globals = GlobalsRaw {
@@ -484,11 +518,13 @@ impl Renderer {
         {
             let h = scene.sky.horizon;
             let depth_view = &self.depth.as_ref().unwrap().view;
-            let scene_color_view = self
-                .msaa_color
-                .as_ref()
-                .map(|target| &target.view)
-                .unwrap_or(color_view);
+            let scene_color_view = if let Some(msaa_color) = self.msaa_color.as_ref() {
+                &msaa_color.view
+            } else if let Some(smaa) = self.smaa.as_ref() {
+                smaa.scene_view()
+            } else {
+                color_view
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -558,11 +594,13 @@ impl Renderer {
         // --- viewmodel pass (own depth range so the gun never clips) -------
         if let Some(vm) = &viewmodel_draw {
             let depth_view = &self.depth.as_ref().unwrap().view;
-            let scene_color_view = self
-                .msaa_color
-                .as_ref()
-                .map(|target| &target.view)
-                .unwrap_or(color_view);
+            let scene_color_view = if let Some(msaa_color) = self.msaa_color.as_ref() {
+                &msaa_color.view
+            } else if let Some(smaa) = self.smaa.as_ref() {
+                smaa.scene_view()
+            } else {
+                color_view
+            };
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("viewmodel"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -592,11 +630,16 @@ impl Renderer {
         // target remains single-sampled so HUD and application overlays keep
         // their existing 1x path.
         if let Some(msaa_color) = &self.msaa_color {
+            let resolve_target = self
+                .smaa
+                .as_ref()
+                .map(|smaa| smaa.scene_view())
+                .unwrap_or(color_view);
             let _resolve_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("msaa resolve"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &msaa_color.view,
-                    resolve_target: Some(color_view),
+                    resolve_target: Some(resolve_target),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Discard,
@@ -606,6 +649,10 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+        }
+
+        if let Some(smaa) = self.smaa.as_ref() {
+            smaa.render(&mut encoder, color_view);
         }
 
         // --- HUD overlay pass ----------------------------------------------
@@ -1444,7 +1491,12 @@ impl HudPass {
 
 #[cfg(test)]
 mod tests {
-    use super::{sample_count_transition, select_effective_sample_count};
+    use super::{RendererConfig, sample_count_transition, select_effective_sample_count};
+
+    #[test]
+    fn default_config_preserves_public_api_defaults() {
+        assert_eq!(RendererConfig::default().requested_sample_count, 1);
+    }
 
     #[test]
     fn selects_requested_count_when_supported() {

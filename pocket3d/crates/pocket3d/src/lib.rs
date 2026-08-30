@@ -18,6 +18,7 @@ pub mod input;
 pub mod model;
 pub mod renderer;
 pub mod scene;
+mod smaa;
 pub mod texture;
 pub mod time;
 pub mod world;
