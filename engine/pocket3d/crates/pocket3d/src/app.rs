@@ -91,6 +91,11 @@ pub trait Game {
     fn frame(&mut self, dt: f32, input: &Input);
     /// Fixed-step simulation.
     fn tick(&mut self, dt: f32, input: &Input);
+    /// Prepare renderer state for the next frame, outside any render pass.
+    /// Default: nothing.
+    fn prepare_render(&mut self, gpu: &Gpu, renderer: &mut Renderer) {
+        let (_, _) = (gpu, renderer);
+    }
     /// Provide the frame to draw. `time` is seconds since launch.
     fn compose(&mut self, alpha: f32, time: f32, size: (u32, u32)) -> (&Scene, &Camera, &Hud);
     /// Record extra passes over the finished frame (UI overlays, composite
@@ -351,6 +356,8 @@ impl<G: Game> WinitApp<G> {
             event_loop.exit();
             return;
         }
+
+        self.game.prepare_render(&state.gpu, &mut state.renderer);
 
         let frame = match state.surface.get_current_texture() {
             Ok(f) => f,
