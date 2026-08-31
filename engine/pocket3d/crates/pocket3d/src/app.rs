@@ -10,14 +10,14 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use anyhow::Result;
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::KeyCode;
 #[cfg(target_os = "windows")]
 use winit::platform::windows::WindowAttributesExtWindows;
 #[cfg(target_os = "windows")]
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use winit::window::{CursorGrabMode, Window, WindowId, WindowLevel};
+use winit::window::{CursorGrabMode, CursorIcon, ResizeDirection, Window, WindowId, WindowLevel};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{BOOL, HWND};
@@ -117,6 +117,115 @@ pub trait Game {
     }
 }
 
+/// Width of the borderless resize affordance in logical pixels.
+const BORDERLESS_RESIZE_HIT_ZONE_LOGICAL: f64 = 7.0;
+
+fn manual_borderless_resize_enabled(resizable: bool, decorations: bool) -> bool {
+    resizable && !decorations
+}
+
+/// Classify a pointer position against the physical client bounds of a
+/// borderless window. Winit reports cursor positions and window sizes in
+/// physical pixels, so the logical hit zone is scaled before comparison.
+/// Corners are checked first because their hit regions overlap the edges.
+fn classify_resize_direction(
+    position: (f64, f64),
+    size: (u32, u32),
+    scale_factor: f64,
+    resizable: bool,
+) -> Option<ResizeDirection> {
+    if !resizable
+        || size.0 == 0
+        || size.1 == 0
+        || !scale_factor.is_finite()
+        || scale_factor <= 0.0
+        || !position.0.is_finite()
+        || !position.1.is_finite()
+    {
+        return None;
+    }
+
+    let width = f64::from(size.0);
+    let height = f64::from(size.1);
+    let (x, y) = position;
+    if x < 0.0 || x > width || y < 0.0 || y > height {
+        return None;
+    }
+
+    let hit_zone = BORDERLESS_RESIZE_HIT_ZONE_LOGICAL * scale_factor;
+    let near_left = x <= hit_zone;
+    let near_right = x >= width - hit_zone;
+    let near_top = y <= hit_zone;
+    let near_bottom = y >= height - hit_zone;
+
+    match (near_left, near_right, near_top, near_bottom) {
+        (true, _, true, _) => Some(ResizeDirection::NorthWest),
+        (_, true, true, _) => Some(ResizeDirection::NorthEast),
+        (true, _, _, true) => Some(ResizeDirection::SouthWest),
+        (_, true, _, true) => Some(ResizeDirection::SouthEast),
+        (true, _, _, _) => Some(ResizeDirection::West),
+        (_, true, _, _) => Some(ResizeDirection::East),
+        (_, _, true, _) => Some(ResizeDirection::North),
+        (_, _, _, true) => Some(ResizeDirection::South),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResizeAction {
+    Noop,
+    Suspend,
+    Reconfigure { size: (u32, u32) },
+    Restore { size: (u32, u32) },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResizeState {
+    viewport_size: Option<(u32, u32)>,
+}
+
+impl ResizeState {
+    fn new(size: (u32, u32)) -> Self {
+        Self {
+            viewport_size: Self::is_non_zero(size).then_some(size),
+        }
+    }
+
+    fn apply(&mut self, size: (u32, u32)) -> ResizeAction {
+        if !Self::is_non_zero(size) {
+            return self
+                .viewport_size
+                .take()
+                .map(|_| ResizeAction::Suspend)
+                .unwrap_or(ResizeAction::Noop);
+        }
+
+        if self.viewport_size == Some(size) {
+            return ResizeAction::Noop;
+        }
+
+        let action = if self.viewport_size.is_none() {
+            ResizeAction::Restore { size }
+        } else {
+            ResizeAction::Reconfigure { size }
+        };
+        self.viewport_size = Some(size);
+        action
+    }
+
+    fn viewport_size(self) -> Option<(u32, u32)> {
+        self.viewport_size
+    }
+
+    fn is_suspended(self) -> bool {
+        self.viewport_size.is_none()
+    }
+
+    fn is_non_zero(size: (u32, u32)) -> bool {
+        size.0 != 0 && size.1 != 0
+    }
+}
+
 pub fn run(config: AppConfig, game: impl Game) -> Result<()> {
     let event_loop = EventLoop::new()?;
     let mut app = WinitApp {
@@ -146,6 +255,7 @@ struct WindowState {
     start: Instant,
     last_frame: Instant,
     mouse_captured: bool,
+    resize_state: ResizeState,
 }
 
 impl WindowState {
@@ -161,6 +271,30 @@ impl WindowState {
         }
 
         Ok(())
+    }
+
+    fn handle_resize(&mut self, size: (u32, u32)) -> Result<ResizeAction> {
+        let action = self.resize_state.apply(size);
+        match action {
+            ResizeAction::Noop => {}
+            ResizeAction::Suspend => {
+                // Keep the surface at its last valid size. In particular, do
+                // not configure a 0x0 swapchain or allocate zero-sized views.
+                self.renderer.suspend();
+            }
+            ResizeAction::Reconfigure { size } | ResizeAction::Restore { size } => {
+                self.surface_config.width = size.0;
+                self.surface_config.height = size.1;
+                self.configure_surface()?;
+                // Surface configuration owns the existing DComp visual; this
+                // only replaces attachments whose dimensions changed.
+                self.renderer.resize(&self.gpu, size);
+                if matches!(action, ResizeAction::Restore { .. }) {
+                    self.last_frame = Instant::now();
+                }
+            }
+        }
+        Ok(action)
     }
 }
 
@@ -326,6 +460,7 @@ impl<G: Game> WinitApp<G> {
             start: Instant::now(),
             last_frame: Instant::now(),
             mouse_captured: false,
+            resize_state: ResizeState::new((px.width, px.height)),
         };
         if self.config.capture_mouse {
             set_mouse_capture(&mut state, true);
@@ -340,6 +475,9 @@ impl<G: Game> WinitApp<G> {
         let Some(state) = self.state.as_mut() else {
             return;
         };
+        if state.resize_state.is_suspended() {
+            return;
+        }
 
         let now = Instant::now();
         let dt = (now - state.last_frame).as_secs_f32();
@@ -387,7 +525,10 @@ impl<G: Game> WinitApp<G> {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let size = (state.surface_config.width, state.surface_config.height);
+        let size = state
+            .resize_state
+            .viewport_size()
+            .expect("active window must have a non-zero viewport");
         let (scene, camera, hud) = self.game.compose(
             state.timestep.alpha(),
             state.start.elapsed().as_secs_f32(),
@@ -511,9 +652,7 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                state.surface_config.width = size.width.max(1);
-                state.surface_config.height = size.height.max(1);
-                if let Err(error) = state.configure_surface() {
+                if let Err(error) = state.handle_resize((size.width, size.height)) {
                     self.error = Some(error);
                     event_loop.exit();
                 }
@@ -522,6 +661,30 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
                 if self.config.capture_mouse && state.input.key_pressed(KeyCode::Escape) {
                     let captured = !state.mouse_captured;
                     set_mouse_capture(state, captured);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let manual_resize =
+                    manual_borderless_resize_enabled(self.config.resizable, self.config.decorations);
+                if manual_resize {
+                    let size = state.window.inner_size();
+                    let resize_direction = classify_resize_direction(
+                        (position.x, position.y),
+                        (size.width, size.height),
+                        state.window.scale_factor(),
+                        manual_resize,
+                    );
+                    state.window.set_cursor(
+                        resize_direction
+                            .map(CursorIcon::from)
+                            .unwrap_or(CursorIcon::Default),
+                    );
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if manual_borderless_resize_enabled(self.config.resizable, self.config.decorations)
+                {
+                    state.window.set_cursor(CursorIcon::Default);
                 }
             }
             WindowEvent::MouseInput {
@@ -533,11 +696,32 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
                 if self.config.capture_mouse && !state.mouse_captured {
                     set_mouse_capture(state, true);
                 }
-                if self.config.drag_window
-                    && button == winit::event::MouseButton::Left
-                    && elem_state.is_pressed()
-                {
-                    let _ = state.window.drag_window();
+                if button == MouseButton::Left && elem_state == ElementState::Pressed {
+                    let manual_resize = manual_borderless_resize_enabled(
+                        self.config.resizable,
+                        self.config.decorations,
+                    );
+                    let resize_direction = if manual_resize {
+                        state.input.cursor().and_then(|position| {
+                            let size = state.window.inner_size();
+                            classify_resize_direction(
+                                (f64::from(position.x), f64::from(position.y)),
+                                (size.width, size.height),
+                                state.window.scale_factor(),
+                                manual_resize,
+                            )
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(direction) = resize_direction {
+                        // Resize hit zones take precedence over the normal
+                        // interior drag gesture. Native resizing owns the
+                        // pointer loop until the button is released.
+                        let _ = state.window.drag_resize_window(direction);
+                    } else if self.config.drag_window {
+                        let _ = state.window.drag_window();
+                    }
                 }
             }
             WindowEvent::Focused(false) => set_mouse_capture(state, false),
@@ -564,6 +748,9 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
             return;
         }
         let Some(state) = &self.state else { return };
+        if state.resize_state.is_suspended() {
+            return;
+        }
         let Some(max_fps) = self.config.max_fps else {
             state.window.request_redraw();
             return;
@@ -577,5 +764,125 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
         } else {
             event_loop.set_control_flow(ControlFlow::WaitUntil(due));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ResizeAction, ResizeDirection, ResizeState, classify_resize_direction,
+        manual_borderless_resize_enabled,
+    };
+
+    const WINDOW: (u32, u32) = (450, 600);
+
+    #[test]
+    fn manual_borderless_resize_requires_resizable_undecorated_window() {
+        assert!(manual_borderless_resize_enabled(true, false));
+        assert!(!manual_borderless_resize_enabled(false, false));
+        assert!(!manual_borderless_resize_enabled(true, true));
+    }
+
+    #[test]
+    fn resize_hit_testing_classifies_each_edge() {
+        assert_eq!(
+            classify_resize_direction((3.0, 300.0), WINDOW, 1.0, true),
+            Some(ResizeDirection::West)
+        );
+        assert_eq!(
+            classify_resize_direction((447.0, 300.0), WINDOW, 1.0, true),
+            Some(ResizeDirection::East)
+        );
+        assert_eq!(
+            classify_resize_direction((225.0, 3.0), WINDOW, 1.0, true),
+            Some(ResizeDirection::North)
+        );
+        assert_eq!(
+            classify_resize_direction((225.0, 597.0), WINDOW, 1.0, true),
+            Some(ResizeDirection::South)
+        );
+    }
+
+    #[test]
+    fn resize_hit_testing_gives_corners_precedence_over_edges() {
+        assert_eq!(
+            classify_resize_direction((3.0, 3.0), WINDOW, 1.0, true),
+            Some(ResizeDirection::NorthWest)
+        );
+        assert_eq!(
+            classify_resize_direction((447.0, 3.0), WINDOW, 1.0, true),
+            Some(ResizeDirection::NorthEast)
+        );
+        assert_eq!(
+            classify_resize_direction((3.0, 597.0), WINDOW, 1.0, true),
+            Some(ResizeDirection::SouthWest)
+        );
+        assert_eq!(
+            classify_resize_direction((447.0, 597.0), WINDOW, 1.0, true),
+            Some(ResizeDirection::SouthEast)
+        );
+    }
+
+    #[test]
+    fn resize_hit_testing_uses_logical_hit_zone_and_ignores_interior() {
+        assert_eq!(
+            classify_resize_direction((14.0, 300.0), WINDOW, 2.0, true),
+            Some(ResizeDirection::West)
+        );
+        assert_eq!(
+            classify_resize_direction((14.1, 300.0), WINDOW, 2.0, true),
+            None
+        );
+        assert_eq!(
+            classify_resize_direction((225.0, 300.0), WINDOW, 1.0, true),
+            None
+        );
+        assert_eq!(
+            classify_resize_direction((-1.0, 300.0), WINDOW, 1.0, true),
+            None
+        );
+    }
+
+    #[test]
+    fn resize_hit_testing_is_disabled_when_window_is_not_resizable() {
+        for position in [(3.0, 3.0), (3.0, 300.0), (225.0, 3.0), (225.0, 300.0)] {
+            assert_eq!(
+                classify_resize_direction(position, WINDOW, 1.0, false),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn zero_size_resize_suspends_without_changing_surface_viewport() {
+        let mut state = ResizeState::new((450, 600));
+
+        assert_eq!(state.apply((0, 0)), ResizeAction::Suspend);
+        assert!(state.is_suspended());
+        assert_eq!(state.apply((0, 0)), ResizeAction::Noop);
+    }
+
+    #[test]
+    fn non_zero_resize_updates_viewport_and_same_size_is_a_noop() {
+        let mut state = ResizeState::new((450, 600));
+
+        assert_eq!(
+            state.apply((900, 600)),
+            ResizeAction::Reconfigure { size: (900, 600) }
+        );
+        assert_eq!(state.viewport_size(), Some((900, 600)));
+        assert_eq!(state.apply((900, 600)), ResizeAction::Noop);
+    }
+
+    #[test]
+    fn restore_after_minimize_requires_one_non_zero_reconfigure() {
+        let mut state = ResizeState::new((450, 600));
+
+        assert_eq!(state.apply((0, 600)), ResizeAction::Suspend);
+        assert_eq!(
+            state.apply((700, 500)),
+            ResizeAction::Restore { size: (700, 500) }
+        );
+        assert_eq!(state.apply((700, 500)), ResizeAction::Noop);
     }
 }

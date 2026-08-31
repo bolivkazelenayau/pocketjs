@@ -392,6 +392,14 @@ impl SmaaPass {
         });
     }
 
+    pub(crate) fn targets_size(&self) -> Option<(u32, u32)> {
+        self.targets.as_ref().map(|targets| targets.size)
+    }
+
+    pub(crate) fn suspend(&mut self) {
+        self.targets = None;
+    }
+
     pub(crate) fn scene_view(&self) -> &wgpu::TextureView {
         &self
             .targets

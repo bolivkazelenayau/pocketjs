@@ -28,6 +28,14 @@ impl Default for Camera {
 }
 
 impl Camera {
+    /// Return the projection aspect for a physical viewport.
+    ///
+    /// A zero-sized viewport is possible while a window is minimized, but it
+    /// is not a valid projection or render-target size.
+    pub fn aspect_for_viewport(viewport: (u32, u32)) -> Option<f32> {
+        (viewport.0 != 0 && viewport.1 != 0).then(|| viewport.0 as f32 / viewport.1 as f32)
+    }
+
     pub fn forward(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
@@ -80,5 +88,31 @@ impl Camera {
         let near = inv.project_point3(Vec3::new(ndc.x, ndc.y, 0.0));
         let far = inv.project_point3(Vec3::new(ndc.x, ndc.y, 1.0));
         (near, (far - near).normalize_or_zero())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Camera;
+
+    #[test]
+    fn viewport_aspect_ignores_zero_dimensions() {
+        assert_eq!(Camera::aspect_for_viewport((0, 600)), None);
+        assert_eq!(Camera::aspect_for_viewport((450, 0)), None);
+        assert_eq!(Camera::aspect_for_viewport((0, 0)), None);
+    }
+
+    #[test]
+    fn viewport_aspect_changes_projection_without_changing_camera_framing() {
+        let camera = Camera::default();
+        let narrow = Camera::aspect_for_viewport((450, 600)).unwrap();
+        let wide = Camera::aspect_for_viewport((900, 600)).unwrap();
+
+        assert_eq!(narrow, 0.75);
+        assert_eq!(wide, 1.5);
+        assert_ne!(
+            camera.proj(narrow).to_cols_array(),
+            camera.proj(wide).to_cols_array()
+        );
     }
 }

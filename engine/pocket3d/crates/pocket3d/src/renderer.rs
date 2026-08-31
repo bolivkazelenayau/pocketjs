@@ -133,6 +133,19 @@ struct MsaaColorTarget {
     sample_count: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TargetResizePlan {
+    recreate_depth: bool,
+    recreate_msaa: bool,
+    recreate_smaa: bool,
+}
+
+impl TargetResizePlan {
+    fn is_empty(self) -> bool {
+        !self.recreate_depth && !self.recreate_msaa && !self.recreate_smaa
+    }
+}
+
 impl MsaaColorTarget {
     fn new(gpu: &Gpu, format: wgpu::TextureFormat, size: (u32, u32), sample_count: u32) -> Self {
         let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -440,8 +453,8 @@ impl Renderer {
 
     /// Ensure the internal targets match the current effective sample count.
     fn ensure_targets(&mut self, gpu: &Gpu, size: (u32, u32)) {
-        let depth_needs_recreate = self.depth.as_ref().is_none_or(|depth| depth.size != size);
-        if depth_needs_recreate {
+        let plan = self.target_resize_plan(size);
+        if plan.recreate_depth {
             self.depth = Some(DepthTarget::new_with_sample_count(
                 gpu,
                 size.0,
@@ -450,24 +463,65 @@ impl Renderer {
             ));
         }
 
-        if self.effective_sample_count > 1 {
-            let msaa_needs_recreate = self.msaa_color.as_ref().is_none_or(|target| {
-                target.size != size || target.sample_count != self.effective_sample_count
-            });
-            if msaa_needs_recreate {
-                self.msaa_color = Some(MsaaColorTarget::new(
-                    gpu,
-                    self.color_format,
-                    size,
-                    self.effective_sample_count,
-                ));
-            }
-        } else {
-            self.msaa_color = None;
+        if plan.recreate_msaa {
+            self.msaa_color = Some(MsaaColorTarget::new(
+                gpu,
+                self.color_format,
+                size,
+                self.effective_sample_count,
+            ));
         }
 
-        if let Some(smaa) = self.smaa.as_mut() {
+        if plan.recreate_smaa
+            && let Some(smaa) = self.smaa.as_mut()
+        {
             smaa.ensure_targets(gpu, size);
+        }
+    }
+
+    fn target_resize_plan(&self, size: (u32, u32)) -> TargetResizePlan {
+        TargetResizePlan {
+            recreate_depth: self.depth.as_ref().is_none_or(|depth| depth.size != size),
+            recreate_msaa: self.effective_sample_count > 1
+                && self.msaa_color.as_ref().is_none_or(|target| {
+                    target.size != size || target.sample_count != self.effective_sample_count
+                }),
+            recreate_smaa: self
+                .smaa
+                .as_ref()
+                .is_some_and(|smaa| smaa.targets_size() != Some(size)),
+        }
+    }
+
+    /// Recreate only targets whose dimensions depend on the live viewport.
+    ///
+    /// The surface is owned by the application loop and must be configured
+    /// before this is called. A false result means all existing targets already
+    /// match the requested size. Sample-count negotiation and SMAA enablement
+    /// are deliberately not touched here.
+    pub fn resize(&mut self, gpu: &Gpu, size: (u32, u32)) -> bool {
+        if size.0 == 0 || size.1 == 0 {
+            return false;
+        }
+
+        let plan = self.target_resize_plan(size);
+        if plan.is_empty() {
+            return false;
+        }
+        self.ensure_targets(gpu, size);
+        true
+    }
+
+    /// Release size-dependent targets while a window is minimized.
+    ///
+    /// Pipelines, model resources, the GPU device, and the enabled AA modes are
+    /// retained so restoring the window only allocates targets for its new
+    /// non-zero viewport.
+    pub fn suspend(&mut self) {
+        self.depth = None;
+        self.msaa_color = None;
+        if let Some(smaa) = self.smaa.as_mut() {
+            smaa.suspend();
         }
     }
 
@@ -583,11 +637,13 @@ impl Renderer {
         camera: &Camera,
         hud: &Hud,
     ) {
+        let Some(aspect) = Camera::aspect_for_viewport(size) else {
+            return;
+        };
         self.ensure_targets(gpu, size);
         if let Some(smaa) = self.smaa.as_mut() {
             smaa.update_metrics(gpu, size, scene.transparent_clear);
         }
-        let aspect = size.0 as f32 / size.1 as f32;
 
         let view_proj = camera.view_proj(aspect);
         let toon = match scene.lighting.toon {
@@ -1720,8 +1776,8 @@ mod tests {
     };
 
     use super::{
-        GlobalsRaw, InstanceRaw, RendererConfig, model_normal_matrix, sample_count_transition,
-        select_effective_sample_count,
+        GlobalsRaw, InstanceRaw, RendererConfig, TargetResizePlan, model_normal_matrix,
+        sample_count_transition, select_effective_sample_count,
     };
 
     #[test]
@@ -1897,6 +1953,61 @@ mod tests {
         assert_eq!(transition.requested_sample_count, 4);
         assert_eq!(transition.effective_sample_count, 4);
         assert!(transition.rebuild_pipelines);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn resize_recreates_size_targets_once_and_preserves_aa_state() {
+        let Ok(gpu) = Gpu::new_headless() else {
+            return;
+        };
+        let mut renderer = super::Renderer::new_with_config(
+            &gpu,
+            OFFSCREEN_FORMAT,
+            RendererConfig {
+                requested_sample_count: 8,
+            },
+        )
+        .unwrap();
+        renderer.set_smaa_enabled(&gpu, true);
+
+        let device_identity = std::ptr::addr_of!(gpu.device);
+        let adapter_identity = std::ptr::addr_of!(gpu.adapter);
+        let requested = renderer.requested_sample_count();
+        let effective = renderer.effective_sample_count();
+
+        assert!(!renderer.resize(&gpu, (0, 0)));
+        let first_plan = renderer.target_resize_plan((32, 24));
+        assert!(first_plan.recreate_depth);
+        assert_eq!(first_plan.recreate_msaa, effective > 1);
+        assert!(first_plan.recreate_smaa);
+        assert!(renderer.resize(&gpu, (32, 24)));
+        assert_eq!(
+            renderer.target_resize_plan((32, 24)),
+            TargetResizePlan::default()
+        );
+        assert!(!renderer.resize(&gpu, (32, 24)));
+
+        assert!(renderer.resize(&gpu, (64, 24)));
+        assert_eq!(
+            renderer.target_resize_plan((64, 24)),
+            TargetResizePlan::default()
+        );
+        assert_eq!(renderer.requested_sample_count(), requested);
+        assert_eq!(renderer.effective_sample_count(), effective);
+        assert!(renderer.smaa_enabled());
+        assert_eq!(std::ptr::addr_of!(gpu.device), device_identity);
+        assert_eq!(std::ptr::addr_of!(gpu.adapter), adapter_identity);
+
+        renderer.suspend();
+        let restore_plan = renderer.target_resize_plan((64, 24));
+        assert!(restore_plan.recreate_depth);
+        assert_eq!(restore_plan.recreate_msaa, effective > 1);
+        assert!(restore_plan.recreate_smaa);
+        assert!(renderer.resize(&gpu, (64, 24)));
+        assert_eq!(renderer.requested_sample_count(), requested);
+        assert_eq!(renderer.effective_sample_count(), effective);
+        assert!(renderer.smaa_enabled());
     }
 
     #[cfg(not(target_arch = "wasm32"))]
