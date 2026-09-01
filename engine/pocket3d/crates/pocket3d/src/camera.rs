@@ -9,6 +9,9 @@ pub struct Camera {
     pub yaw: f32,
     /// Radians. Positive looks up. Clamped by callers to about +-89 deg.
     pub pitch: f32,
+    /// Radians around the current view direction. Positive rolls the camera
+    /// clockwise in screen space.
+    pub roll: f32,
     pub fov_y: f32,
     pub znear: f32,
     pub zfar: f32,
@@ -20,6 +23,7 @@ impl Default for Camera {
             pos: Vec3::ZERO,
             yaw: 0.0,
             pitch: 0.0,
+            roll: 0.0,
             fov_y: 70f32.to_radians(),
             znear: 1.0,
             zfar: 16384.0,
@@ -53,8 +57,30 @@ impl Camera {
         Vec3::new(cy, 0.0, -sy)
     }
 
+    /// Camera up before roll is applied.
+    pub fn up(&self) -> Vec3 {
+        self.right().cross(self.forward())
+    }
+
+    /// Camera right after rotating the image around the view direction.
+    pub fn screen_right(&self) -> Vec3 {
+        let (sr, cr) = self.roll.sin_cos();
+        self.right() * cr - self.up() * sr
+    }
+
+    /// Camera up after rotating the image around the view direction.
+    pub fn screen_up(&self) -> Vec3 {
+        let (sr, cr) = self.roll.sin_cos();
+        self.up() * cr + self.right() * sr
+    }
+
     pub fn view(&self) -> Mat4 {
-        glam::camera::rh::view::look_to_mat4(self.pos, self.forward(), Vec3::Y)
+        let up = if self.roll == 0.0 {
+            Vec3::Y
+        } else {
+            self.screen_up()
+        };
+        glam::camera::rh::view::look_to_mat4(self.pos, self.forward(), up)
     }
 
     pub fn proj(&self, aspect: f32) -> Mat4 {
