@@ -34,6 +34,10 @@ use crate::camera::Camera;
 use crate::gpu::Gpu;
 use crate::hud::Hud;
 use crate::input::Input;
+#[cfg(target_os = "windows")]
+use crate::presentation::{
+    LOGICAL_OUTPUT_FORMAT, PHYSICAL_SURFACE_FORMAT, TransparentPresentation,
+};
 use crate::renderer::{Renderer, RendererConfig};
 use crate::scene::Scene;
 use crate::time::FixedTimestep;
@@ -246,6 +250,8 @@ struct WindowState {
     surface_config: wgpu::SurfaceConfiguration,
     #[cfg(target_os = "windows")]
     direct_composition: Option<DirectCompositionState>,
+    #[cfg(target_os = "windows")]
+    transparent_presentation: Option<TransparentPresentation>,
     gpu: Gpu,
     renderer: Renderer,
     // Keep the HWND alive until after the surface and any composition target.
@@ -281,6 +287,10 @@ impl WindowState {
                 // Keep the surface at its last valid size. In particular, do
                 // not configure a 0x0 swapchain or allocate zero-sized views.
                 self.renderer.suspend();
+                #[cfg(target_os = "windows")]
+                if self.direct_composition.is_some() {
+                    self.transparent_presentation = None;
+                }
             }
             ResizeAction::Reconfigure { size } | ResizeAction::Restore { size } => {
                 self.surface_config.width = size.0;
@@ -289,6 +299,15 @@ impl WindowState {
                 // Surface configuration owns the existing DComp visual; this
                 // only replaces attachments whose dimensions changed.
                 self.renderer.resize(&self.gpu, size);
+                #[cfg(target_os = "windows")]
+                if self.direct_composition.is_some() {
+                    if let Some(presentation) = self.transparent_presentation.as_mut() {
+                        presentation.resize(&self.gpu, size);
+                    } else {
+                        self.transparent_presentation =
+                            Some(TransparentPresentation::new(&self.gpu, size));
+                    }
+                }
                 if matches!(action, ResizeAction::Restore { .. }) {
                     self.last_frame = Instant::now();
                 }
@@ -447,11 +466,21 @@ impl<G: Game> WinitApp<G> {
         )?;
         self.game.init(&gpu, &mut renderer)?;
 
+        #[cfg(target_os = "windows")]
+        let transparent_presentation = if self.config.transparent && px.width != 0 && px.height != 0
+        {
+            Some(TransparentPresentation::new(&gpu, (px.width, px.height)))
+        } else {
+            None
+        };
+
         let mut state = WindowState {
             surface,
             surface_config,
             #[cfg(target_os = "windows")]
             direct_composition,
+            #[cfg(target_os = "windows")]
+            transparent_presentation,
             gpu,
             renderer,
             window,
@@ -522,9 +551,35 @@ impl<G: Game> WinitApp<G> {
                 return;
             }
         };
-        let view = frame
+        #[cfg(target_os = "windows")]
+        let surface_view = if self.config.transparent {
+            frame.texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some("transparent physical surface unorm view"),
+                format: Some(PHYSICAL_SURFACE_FORMAT),
+                ..Default::default()
+            })
+        } else {
+            frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        #[cfg(not(target_os = "windows"))]
+        let surface_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+        #[cfg(target_os = "windows")]
+        let logical_view = if self.config.transparent {
+            state
+                .transparent_presentation
+                .as_ref()
+                .expect("active transparent window must have a logical output")
+                .view()
+        } else {
+            &surface_view
+        };
+        #[cfg(not(target_os = "windows"))]
+        let logical_view = &surface_view;
         let size = state
             .resize_state
             .viewport_size()
@@ -536,12 +591,32 @@ impl<G: Game> WinitApp<G> {
         );
         state
             .renderer
-            .render(&state.gpu, &view, size, scene, camera, hud);
-        let mut encoder = state
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("overlay") });
-        self.game.overlay(&state.gpu, &mut encoder, &view, state.surface_config.format, size);
+            .render(&state.gpu, logical_view, size, scene, camera, hud);
+        let mut encoder =
+            state
+                .gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("overlay"),
+                });
+        #[cfg(target_os = "windows")]
+        let logical_format = if self.config.transparent {
+            LOGICAL_OUTPUT_FORMAT
+        } else {
+            state.surface_config.format
+        };
+        #[cfg(not(target_os = "windows"))]
+        let logical_format = state.surface_config.format;
+        self.game
+            .overlay(&state.gpu, &mut encoder, logical_view, logical_format, size);
+        #[cfg(target_os = "windows")]
+        if self.config.transparent {
+            state
+                .transparent_presentation
+                .as_ref()
+                .expect("active transparent window must have a logical output")
+                .pack(&mut encoder, &surface_view);
+        }
         state.gpu.queue.submit([encoder.finish()]);
         state.window.pre_present_notify();
         frame.present();
@@ -578,10 +653,18 @@ fn configure_windows_transparent_surface(
     config.format = format;
     config.present_mode = present_mode;
     config.alpha_mode = alpha_mode;
+    add_transparent_surface_view_format(&mut config.view_formats);
     log::info!(
         "transparent Windows presentation: DirectComposition + DX12, format {format:?}, present mode {present_mode:?}, alpha mode {alpha_mode:?}"
     );
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn add_transparent_surface_view_format(view_formats: &mut Vec<wgpu::TextureFormat>) {
+    if !view_formats.contains(&PHYSICAL_SURFACE_FORMAT) {
+        view_formats.push(PHYSICAL_SURFACE_FORMAT);
+    }
 }
 
 /// The scene pass writes premultiplied-style output (opaque pixels carry
@@ -662,10 +745,26 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
                     let captured = !state.mouse_captured;
                     set_mouse_capture(state, captured);
                 }
+                #[cfg(target_os = "windows")]
+                if self.config.transparent
+                    && state.direct_composition.is_some()
+                    && state.input.key_pressed(KeyCode::F9)
+                {
+                    if let Some(presentation) = state.transparent_presentation.as_mut() {
+                        let use_exact_load = presentation.toggle();
+                        log::info!(
+                            "presentation pack: {}",
+                            if use_exact_load { "exact" } else { "filtered" }
+                        );
+                        state.window.request_redraw();
+                    }
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let manual_resize =
-                    manual_borderless_resize_enabled(self.config.resizable, self.config.decorations);
+                let manual_resize = manual_borderless_resize_enabled(
+                    self.config.resizable,
+                    self.config.decorations,
+                );
                 if manual_resize {
                     let size = state.window.inner_size();
                     let resize_direction = classify_resize_direction(
@@ -769,6 +868,8 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    use super::{PHYSICAL_SURFACE_FORMAT, add_transparent_surface_view_format};
     use super::{
         ResizeAction, ResizeDirection, ResizeState, classify_resize_direction,
         manual_borderless_resize_enabled,
@@ -884,5 +985,18 @@ mod tests {
             ResizeAction::Restore { size: (700, 500) }
         );
         assert_eq!(state.apply((700, 500)), ResizeAction::Noop);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn transparent_surface_view_format_policy_is_additive_and_idempotent() {
+        let mut view_formats = vec![wgpu::TextureFormat::Rgba8Unorm];
+        add_transparent_surface_view_format(&mut view_formats);
+        add_transparent_surface_view_format(&mut view_formats);
+
+        assert_eq!(
+            view_formats,
+            vec![wgpu::TextureFormat::Rgba8Unorm, PHYSICAL_SURFACE_FORMAT]
+        );
     }
 }
