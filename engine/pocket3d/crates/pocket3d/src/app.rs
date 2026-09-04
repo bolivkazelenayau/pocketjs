@@ -94,6 +94,11 @@ impl Default for AppConfig {
 pub trait Game {
     /// Called once after the GPU exists — load assets here.
     fn init(&mut self, gpu: &Gpu, renderer: &mut Renderer) -> Result<()>;
+    /// Called before [`Game::init`] and before each rendered frame with the
+    /// window's physical surface size and OS logical-to-physical scale factor.
+    /// Existing games can ignore desktop metrics; UI hosts can use them to
+    /// keep logical layout/input coordinates separate from the render target.
+    fn window_metrics(&mut self, _physical_size: (u32, u32), _scale_factor: f64) {}
     /// Called once per rendered frame before fixed ticks (mouse look etc.).
     fn frame(&mut self, dt: f32, input: &Input);
     /// Fixed-step simulation.
@@ -103,10 +108,12 @@ pub trait Game {
     fn prepare_render(&mut self, gpu: &Gpu, renderer: &mut Renderer) {
         let (_, _) = (gpu, renderer);
     }
-    /// Provide the frame to draw. `time` is seconds since launch.
+    /// Provide the frame to draw. `time` is seconds since launch. `size` is
+    /// the physical surface size in pixels, matching [`Input::cursor`].
     fn compose(&mut self, alpha: f32, time: f32, size: (u32, u32)) -> (&Scene, &Camera, &Hud);
     /// Record extra passes over the finished frame (UI overlays, composite
-    /// effects) before present. `format` is the target's texture format.
+    /// effects) before present. `format` is the target's texture format and
+    /// `size` is the physical surface size in pixels.
     /// Default: nothing.
     fn overlay(
         &mut self,
@@ -487,6 +494,8 @@ impl<G: Game> WinitApp<G> {
                 requested_sample_count: self.config.requested_sample_count,
             },
         )?;
+        self.game
+            .window_metrics((px.width, px.height), window.scale_factor());
         self.game.init(&gpu, &mut renderer)?;
 
         #[cfg(target_os = "windows")]
@@ -535,6 +544,12 @@ impl<G: Game> WinitApp<G> {
         let dt = (now - state.last_frame).as_secs_f32();
         state.last_frame = now;
 
+        let physical_size = state
+            .resize_state
+            .viewport_size()
+            .expect("active window must have a non-zero viewport");
+        self.game
+            .window_metrics(physical_size, state.window.scale_factor());
         self.game.frame(dt, &state.input);
         let ticks = state.timestep.advance(dt);
         for _ in 0..ticks {
