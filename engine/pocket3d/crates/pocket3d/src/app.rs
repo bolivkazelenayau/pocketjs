@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 use anyhow::Context;
 use anyhow::Result;
+use glam::Vec2;
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -63,6 +64,8 @@ pub struct AppConfig {
     pub max_fps: Option<f32>,
     /// Left-mouse press starts an OS window drag (widget-style move;
     /// the press still reaches [`Input`] first, so clicks keep working).
+    /// The game can veto a press via [`Game::drag_at`] (interactive
+    /// overlays); the default hook always allows.
     pub drag_window: bool,
     /// Generic requested MSAA sample count. Renderer capability negotiation
     /// determines the effective count at startup.
@@ -115,6 +118,17 @@ pub trait Game {
     ) {
         let (_, _, _, _, _) = (gpu, encoder, view, format, size);
     }
+    /// Left-press drag policy: whether this press starts the OS window
+    /// drag. Consulted only when [`AppConfig::drag_window`] is on and the
+    /// press missed every borderless resize zone; `cursor` is the pointer
+    /// position in the space [`Input::cursor`] reports (physical pixels).
+    /// Return false to keep the press with the game (interactive overlays)
+    /// instead of moving the window. Default: always allow — today's
+    /// behavior.
+    fn drag_at(&mut self, cursor: Vec2) -> bool {
+        let _ = cursor;
+        true
+    }
     /// Return true to quit.
     fn wants_exit(&self) -> bool {
         false
@@ -126,6 +140,15 @@ const BORDERLESS_RESIZE_HIT_ZONE_LOGICAL: f64 = 7.0;
 
 fn manual_borderless_resize_enabled(resizable: bool, decorations: bool) -> bool {
     resizable && !decorations
+}
+
+/// Whether a left press that missed every resize zone starts the OS window
+/// drag. The [`Game::drag_at`] veto is consulted only when dragging is on
+/// and a cursor position exists; a press before any `CursorMoved` (no
+/// position to hand the game) keeps the unconditional drag it had before
+/// the hook existed.
+fn native_drag_requested(drag_window: bool, cursor: Option<Vec2>, game: &mut impl Game) -> bool {
+    drag_window && cursor.is_none_or(|cursor| game.drag_at(cursor))
 }
 
 /// Classify a pointer position against the physical client bounds of a
@@ -818,7 +841,11 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
                         // interior drag gesture. Native resizing owns the
                         // pointer loop until the button is released.
                         let _ = state.window.drag_resize_window(direction);
-                    } else if self.config.drag_window {
+                    } else if native_drag_requested(
+                        self.config.drag_window,
+                        state.input.cursor(),
+                        &mut self.game,
+                    ) {
                         let _ = state.window.drag_window();
                     }
                 }
@@ -868,14 +895,88 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        Game, ResizeAction, ResizeDirection, ResizeState, classify_resize_direction,
+        manual_borderless_resize_enabled, native_drag_requested,
+    };
     #[cfg(target_os = "windows")]
     use super::{PHYSICAL_SURFACE_FORMAT, add_transparent_surface_view_format};
-    use super::{
-        ResizeAction, ResizeDirection, ResizeState, classify_resize_direction,
-        manual_borderless_resize_enabled,
-    };
+    use crate::camera::Camera;
+    use crate::gpu::Gpu;
+    use crate::hud::Hud;
+    use crate::input::Input;
+    use crate::renderer::Renderer;
+    use crate::scene::Scene;
+    use glam::Vec2;
 
     const WINDOW: (u32, u32) = (450, 600);
+
+    /// Games that exercise only the drag policy: the required trait
+    /// methods are never called by [`native_drag_requested`].
+    struct DefaultGame;
+    struct RejectingGame;
+
+    impl Game for DefaultGame {
+        fn init(&mut self, _: &Gpu, _: &mut Renderer) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn frame(&mut self, _: f32, _: &Input) {}
+        fn tick(&mut self, _: f32, _: &Input) {}
+        fn compose(&mut self, _: f32, _: f32, _: (u32, u32)) -> (&Scene, &Camera, &Hud) {
+            unreachable!("only drag_at is exercised")
+        }
+    }
+
+    impl Game for RejectingGame {
+        fn init(&mut self, _: &Gpu, _: &mut Renderer) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn frame(&mut self, _: f32, _: &Input) {}
+        fn tick(&mut self, _: f32, _: &Input) {}
+        fn compose(&mut self, _: f32, _: f32, _: (u32, u32)) -> (&Scene, &Camera, &Hud) {
+            unreachable!("only drag_at is exercised")
+        }
+        fn drag_at(&mut self, _cursor: Vec2) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn default_hook_preserves_native_drag_at_every_cursor() {
+        // No override → every press drags, with or without a cursor
+        // position, exactly as before the hook existed.
+        let mut game = DefaultGame;
+        assert!(game.drag_at(Vec2::new(120.0, 300.0)));
+        assert!(native_drag_requested(true, None, &mut game));
+        assert!(native_drag_requested(
+            true,
+            Some(Vec2::new(120.0, 300.0)),
+            &mut game
+        ));
+    }
+
+    #[test]
+    fn game_rejection_blocks_native_drag() {
+        let mut game = RejectingGame;
+        assert!(!native_drag_requested(
+            true,
+            Some(Vec2::new(120.0, 300.0)),
+            &mut game
+        ));
+        // No cursor position means there is nothing to reject against; the
+        // legacy unconditional drag stands (see `native_drag_requested`).
+        assert!(native_drag_requested(true, None, &mut game));
+    }
+
+    #[test]
+    fn drag_window_disabled_never_starts_native_drag() {
+        assert!(!native_drag_requested(
+            false,
+            Some(Vec2::new(120.0, 300.0)),
+            &mut DefaultGame
+        ));
+        assert!(!native_drag_requested(false, None, &mut RejectingGame));
+    }
 
     #[test]
     fn manual_borderless_resize_requires_resizable_undecorated_window() {
