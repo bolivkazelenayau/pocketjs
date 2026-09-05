@@ -34,7 +34,7 @@ pub use pocket3d_bsp as bsp;
 
 pub mod prelude {
     pub use crate::anim::AnimState;
-    pub use crate::app::{AppConfig, Game};
+    pub use crate::app::{AppConfig, Game, TextInputRequest};
     pub use crate::camera::Camera;
     pub use crate::collide::{
         CharacterState, HullKind, MoveInput, MoveParams, Trace, TraceWorld, step_character,

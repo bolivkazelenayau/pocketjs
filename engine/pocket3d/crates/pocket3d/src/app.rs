@@ -90,6 +90,20 @@ impl Default for AppConfig {
     }
 }
 
+/// The text-input state a game wants the native window to expose.
+///
+/// The cursor area is expressed in physical window pixels as `(x, y, width,
+/// height)`. It is used by the operating system to place candidate windows
+/// near the active caret or text field.
+///
+/// Coordinates and extents must be finite; they are passed directly to winit
+/// and compared using the tuple's exact `f32` equality for update deduplication.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TextInputRequest {
+    pub active: bool,
+    pub cursor_area_px: Option<(f32, f32, f32, f32)>,
+}
+
 /// What the app loop needs from a game.
 pub trait Game {
     /// Called once after the GPU exists — load assets here.
@@ -99,6 +113,12 @@ pub trait Game {
     /// Existing games can ignore desktop metrics; UI hosts can use them to
     /// keep logical layout/input coordinates separate from the render target.
     fn window_metrics(&mut self, _physical_size: (u32, u32), _scale_factor: f64) {}
+    /// Request native text input for the next window-loop update. The
+    /// default keeps IME disabled, preserving the existing behavior for games
+    /// that do not use text input.
+    fn text_input_request(&self) -> TextInputRequest {
+        TextInputRequest::default()
+    }
     /// Called once per rendered frame before fixed ticks (mouse look etc.).
     fn frame(&mut self, dt: f32, input: &Input);
     /// Fixed-step simulation.
@@ -287,11 +307,54 @@ struct WindowState {
     // Keep the HWND alive until after the surface and any composition target.
     window: Arc<Window>,
     input: Input,
+    text_input_state: TextInputState,
     timestep: FixedTimestep,
     start: Instant,
     last_frame: Instant,
     mouse_captured: bool,
     resize_state: ResizeState,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct TextInputUpdate {
+    ime_allowed: Option<bool>,
+    cursor_area_px: Option<(f32, f32, f32, f32)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct TextInputState {
+    request: TextInputRequest,
+    applied_cursor_area_px: Option<(f32, f32, f32, f32)>,
+}
+
+impl TextInputState {
+    fn apply(&mut self, request: TextInputRequest) -> TextInputUpdate {
+        let previous = self.request;
+        self.request = request;
+        let cursor_area_px =
+            if request.active && self.applied_cursor_area_px != request.cursor_area_px {
+                self.applied_cursor_area_px = request.cursor_area_px;
+                request.cursor_area_px
+            } else {
+                None
+            };
+        TextInputUpdate {
+            ime_allowed: (previous.active != request.active).then_some(request.active),
+            cursor_area_px,
+        }
+    }
+}
+
+fn apply_text_input_update(window: &Window, update: TextInputUpdate) {
+    if let Some(active) = update.ime_allowed {
+        window.set_ime_allowed(active);
+    }
+    if let Some((x, y, width, height)) = update.cursor_area_px {
+        window.set_ime_cursor_area(
+            winit::dpi::PhysicalPosition::new(x, y),
+            winit::dpi::PhysicalSize::new(width, height),
+        );
+    }
 }
 
 impl WindowState {
@@ -517,6 +580,7 @@ impl<G: Game> WinitApp<G> {
             renderer,
             window,
             input: Input::default(),
+            text_input_state: TextInputState::default(),
             timestep: FixedTimestep::new(self.config.tick_hz),
             start: Instant::now(),
             last_frame: Instant::now(),
@@ -526,6 +590,9 @@ impl<G: Game> WinitApp<G> {
         if self.config.capture_mouse {
             set_mouse_capture(&mut state, true);
         }
+        let request = self.game.text_input_request();
+        let update = state.text_input_state.apply(request);
+        apply_text_input_update(&state.window, update);
         Ok(state)
     }
 
@@ -561,6 +628,10 @@ impl<G: Game> WinitApp<G> {
             event_loop.exit();
             return;
         }
+
+        let request = self.game.text_input_request();
+        let update = state.text_input_state.apply(request);
+        apply_text_input_update(&state.window, update);
 
         self.game.prepare_render(&state.gpu, &mut state.renderer);
 
@@ -911,8 +982,9 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Game, ResizeAction, ResizeDirection, ResizeState, classify_resize_direction,
-        manual_borderless_resize_enabled, native_drag_requested,
+        Game, ResizeAction, ResizeDirection, ResizeState, TextInputRequest, TextInputState,
+        TextInputUpdate, classify_resize_direction, manual_borderless_resize_enabled,
+        native_drag_requested,
     };
     #[cfg(target_os = "windows")]
     use super::{PHYSICAL_SURFACE_FORMAT, add_transparent_surface_view_format};
@@ -930,6 +1002,9 @@ mod tests {
     /// methods are never called by [`native_drag_requested`].
     struct DefaultGame;
     struct RejectingGame;
+
+    const TEXT_INPUT_AREA: (f32, f32, f32, f32) = (12.0, 24.0, 2.0, 18.0);
+    const OTHER_TEXT_INPUT_AREA: (f32, f32, f32, f32) = (80.0, 96.0, 3.0, 20.0);
 
     impl Game for DefaultGame {
         fn init(&mut self, _: &Gpu, _: &mut Renderer) -> anyhow::Result<()> {
@@ -954,6 +1029,90 @@ mod tests {
         fn drag_at(&mut self, _cursor: Vec2) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn text_input_request_defaults_to_inactive_without_cursor_area() {
+        let game = DefaultGame;
+
+        assert_eq!(
+            TextInputRequest::default(),
+            TextInputRequest {
+                active: false,
+                cursor_area_px: None,
+            }
+        );
+        assert_eq!(game.text_input_request(), TextInputRequest::default());
+    }
+
+    #[test]
+    fn text_input_state_only_emits_changed_window_properties() {
+        let mut state = TextInputState::default();
+        let active = TextInputRequest {
+            active: true,
+            cursor_area_px: Some(TEXT_INPUT_AREA),
+        };
+
+        assert_eq!(
+            state.apply(TextInputRequest::default()),
+            TextInputUpdate::default()
+        );
+        assert_eq!(
+            state.apply(TextInputRequest {
+                active: false,
+                cursor_area_px: Some(TEXT_INPUT_AREA),
+            }),
+            TextInputUpdate::default()
+        );
+        assert_eq!(
+            state.apply(active),
+            TextInputUpdate {
+                ime_allowed: Some(true),
+                cursor_area_px: Some(TEXT_INPUT_AREA),
+            }
+        );
+        assert_eq!(state.apply(active), TextInputUpdate::default());
+        assert_eq!(
+            state.apply(TextInputRequest {
+                active: true,
+                cursor_area_px: Some(OTHER_TEXT_INPUT_AREA),
+            }),
+            TextInputUpdate {
+                ime_allowed: None,
+                cursor_area_px: Some(OTHER_TEXT_INPUT_AREA),
+            }
+        );
+        assert_eq!(
+            state.apply(TextInputRequest::default()),
+            TextInputUpdate {
+                ime_allowed: Some(false),
+                cursor_area_px: None,
+            }
+        );
+        assert_eq!(
+            state.apply(TextInputRequest {
+                active: false,
+                cursor_area_px: Some(TEXT_INPUT_AREA),
+            }),
+            TextInputUpdate::default()
+        );
+        assert_eq!(
+            state.apply(TextInputRequest {
+                active: true,
+                cursor_area_px: Some(TEXT_INPUT_AREA),
+            }),
+            TextInputUpdate {
+                ime_allowed: Some(true),
+                cursor_area_px: Some(TEXT_INPUT_AREA),
+            }
+        );
+        assert_eq!(
+            state.apply(TextInputRequest::default()),
+            TextInputUpdate {
+                ime_allowed: Some(false),
+                cursor_area_px: None,
+            }
+        );
     }
 
     #[test]
