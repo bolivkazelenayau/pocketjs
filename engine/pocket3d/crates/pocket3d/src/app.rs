@@ -104,6 +104,49 @@ pub struct TextInputRequest {
     pub cursor_area_px: Option<(f32, f32, f32, f32)>,
 }
 
+/// Declarative, process-local changes to the native window and frame pacing.
+///
+/// `None` leaves that property at its current runtime value. These requests
+/// are intentionally not persistence operations: a game may keep returning a
+/// desired value until its own state changes, while Pocket3D owns the native
+/// application of that value and deduplicates it.
+///
+/// `inner_size` uses the same logical client-area units as
+/// [`AppConfig::size`]. Pocket3D converts it through winit's
+/// [`winit::dpi::LogicalSize`] and observes the resulting physical size via
+/// the normal resize path. Requests are deduplicated against the last
+/// requested logical size, not the observed physical size; a later manual
+/// resize is therefore observed without repeatedly forcing the old request.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WindowRuntimeRequest {
+    pub inner_size: Option<(u32, u32)>,
+    pub resizable: Option<bool>,
+    pub always_on_top: Option<bool>,
+    /// `Some(None)` requests uncapped pacing; `Some(Some(fps))` requests a
+    /// cap. `None` means no runtime change to pacing.
+    pub max_fps: Option<Option<f32>>,
+}
+
+/// The current Pocket3D runtime window/pacing state exposed to a game.
+///
+/// `inner_size_px` and `scale_factor` are observed from the native window,
+/// matching `WindowEvent::Resized` and the existing [`Game::window_metrics`]
+/// contract. Use `scale_factor` to convert the physical size back to logical
+/// units. `max_fps` is the effective limit consumed by Pocket3D's frame
+/// pacing loop. `resizable` and `always_on_top` are the runtime values
+/// Pocket3D most recently applied/requested through winit; they are not
+/// platform-confirmed observations. In particular, winit documents window
+/// level as a hint, so the OS or window manager may not honor
+/// `always_on_top`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WindowRuntimeState {
+    pub inner_size_px: (u32, u32),
+    pub scale_factor: f64,
+    pub resizable: bool,
+    pub always_on_top: bool,
+    pub max_fps: Option<f32>,
+}
+
 /// What the app loop needs from a game.
 pub trait Game {
     /// Called once after the GPU exists — load assets here.
@@ -113,6 +156,19 @@ pub trait Game {
     /// Existing games can ignore desktop metrics; UI hosts can use them to
     /// keep logical layout/input coordinates separate from the render target.
     fn window_metrics(&mut self, _physical_size: (u32, u32), _scale_factor: f64) {}
+    /// Expose Pocket3D's current runtime window/pacing state before a frame.
+    /// Native size and scale are observed; resizable and always-on-top are
+    /// last-applied/requested values, while max FPS is the active pacing
+    /// value.
+    /// Runtime requests returned by [`Game::window_runtime_request`] are
+    /// applied at the Pocket3D ownership boundary after the game turn.
+    fn window_runtime_state(&mut self, _state: WindowRuntimeState) {}
+    /// Request process-local native window/pacing changes for the next loop
+    /// update. Returning the same request is cheap and does not repeat native
+    /// setter calls.
+    fn window_runtime_request(&self) -> WindowRuntimeRequest {
+        WindowRuntimeRequest::default()
+    }
     /// Request native text input for the next window-loop update. The
     /// default keeps IME disabled, preserving the existing behavior for games
     /// that do not use text input.
@@ -313,6 +369,7 @@ struct WindowState {
     last_frame: Instant,
     mouse_captured: bool,
     resize_state: ResizeState,
+    runtime: WindowRuntimeControl,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -345,6 +402,109 @@ impl TextInputState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct WindowRuntimeDiff {
+    inner_size: Option<(u32, u32)>,
+    resizable: Option<bool>,
+    always_on_top: Option<bool>,
+    max_fps: Option<Option<f32>>,
+}
+
+impl WindowRuntimeDiff {
+    fn is_empty(self) -> bool {
+        self.inner_size.is_none()
+            && self.resizable.is_none()
+            && self.always_on_top.is_none()
+            && self.max_fps.is_none()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AppliedWindowRuntime {
+    inner_size: (u32, u32),
+    resizable: bool,
+    always_on_top: bool,
+    max_fps: Option<f32>,
+}
+
+/// Tracks the last requested values separately from the platform's observed
+/// physical size. A size request can be asynchronous, and a platform may
+/// report a different size or no resize event at all; retaining the last
+/// request prevents a declarative value from becoming a per-frame native call.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WindowRuntimeControl {
+    state: WindowRuntimeState,
+    applied: AppliedWindowRuntime,
+}
+
+impl WindowRuntimeControl {
+    fn new(config: &AppConfig, inner_size_px: (u32, u32), scale_factor: f64) -> Self {
+        Self {
+            state: WindowRuntimeState {
+                inner_size_px,
+                scale_factor,
+                resizable: config.resizable,
+                always_on_top: config.always_on_top,
+                max_fps: config.max_fps,
+            },
+            applied: AppliedWindowRuntime {
+                inner_size: config.size,
+                resizable: config.resizable,
+                always_on_top: config.always_on_top,
+                max_fps: config.max_fps,
+            },
+        }
+    }
+
+    fn observe(&mut self, inner_size_px: (u32, u32), scale_factor: f64) {
+        self.state.inner_size_px = inner_size_px;
+        self.state.scale_factor = scale_factor;
+    }
+
+    fn diff(&self, request: WindowRuntimeRequest) -> WindowRuntimeDiff {
+        let max_fps = normalize_max_fps_request(request.max_fps);
+        WindowRuntimeDiff {
+            inner_size: request
+                .inner_size
+                .filter(|&size| size != self.applied.inner_size),
+            resizable: request
+                .resizable
+                .filter(|&resizable| resizable != self.applied.resizable),
+            always_on_top: request
+                .always_on_top
+                .filter(|&always_on_top| always_on_top != self.applied.always_on_top),
+            max_fps: max_fps.filter(|&max_fps| max_fps != self.applied.max_fps),
+        }
+    }
+
+    fn mark_applied(&mut self, diff: WindowRuntimeDiff) {
+        if let Some(inner_size) = diff.inner_size {
+            self.applied.inner_size = inner_size;
+        }
+        if let Some(resizable) = diff.resizable {
+            self.applied.resizable = resizable;
+            self.state.resizable = resizable;
+        }
+        if let Some(always_on_top) = diff.always_on_top {
+            self.applied.always_on_top = always_on_top;
+            self.state.always_on_top = always_on_top;
+        }
+        if let Some(max_fps) = diff.max_fps {
+            self.applied.max_fps = max_fps;
+            self.state.max_fps = max_fps;
+        }
+    }
+}
+
+fn normalize_max_fps_request(request: Option<Option<f32>>) -> Option<Option<f32>> {
+    match request {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(fps)) if fps.is_finite() => Some(Some(fps.max(1.0))),
+        Some(Some(_)) => None,
+    }
+}
+
 fn apply_text_input_update(window: &Window, update: TextInputUpdate) {
     if let Some(active) = update.ime_allowed {
         window.set_ime_allowed(active);
@@ -373,6 +533,7 @@ impl WindowState {
     }
 
     fn handle_resize(&mut self, size: (u32, u32)) -> Result<ResizeAction> {
+        self.runtime.observe(size, self.window.scale_factor());
         let action = self.resize_state.apply(size);
         match action {
             ResizeAction::Noop => {}
@@ -557,6 +718,12 @@ impl<G: Game> WinitApp<G> {
                 requested_sample_count: self.config.requested_sample_count,
             },
         )?;
+        let runtime = WindowRuntimeControl::new(
+            &self.config,
+            (px.width, px.height),
+            window.scale_factor(),
+        );
+        self.game.window_runtime_state(runtime.state);
         self.game
             .window_metrics((px.width, px.height), window.scale_factor());
         self.game.init(&gpu, &mut renderer)?;
@@ -586,6 +753,7 @@ impl<G: Game> WinitApp<G> {
             last_frame: Instant::now(),
             mouse_captured: false,
             resize_state: ResizeState::new((px.width, px.height)),
+            runtime,
         };
         if self.config.capture_mouse {
             set_mouse_capture(&mut state, true);
@@ -594,6 +762,40 @@ impl<G: Game> WinitApp<G> {
         let update = state.text_input_state.apply(request);
         apply_text_input_update(&state.window, update);
         Ok(state)
+    }
+
+    fn apply_runtime_request(
+        state: &mut WindowState,
+        request: WindowRuntimeRequest,
+    ) -> Result<()> {
+        let diff = state.runtime.diff(request);
+        if diff.is_empty() {
+            return Ok(());
+        }
+
+        if let Some((width, height)) = diff.inner_size {
+            // AppConfig::size is a logical client-area size, so keep runtime
+            // requests on the same DPI-aware path as startup creation.
+            if let Some(applied) = state
+                .window
+                .request_inner_size(winit::dpi::LogicalSize::new(width, height))
+            {
+                state.handle_resize((applied.width, applied.height))?;
+            }
+        }
+        if let Some(resizable) = diff.resizable {
+            state.window.set_resizable(resizable);
+        }
+        if let Some(always_on_top) = diff.always_on_top {
+            state.window.set_window_level(if always_on_top {
+                WindowLevel::AlwaysOnTop
+            } else {
+                WindowLevel::Normal
+            });
+        }
+
+        state.runtime.mark_applied(diff);
+        Ok(())
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
@@ -615,6 +817,10 @@ impl<G: Game> WinitApp<G> {
             .resize_state
             .viewport_size()
             .expect("active window must have a non-zero viewport");
+        state
+            .runtime
+            .observe(physical_size, state.window.scale_factor());
+        self.game.window_runtime_state(state.runtime.state);
         self.game
             .window_metrics(physical_size, state.window.scale_factor());
         self.game.frame(dt, &state.input);
@@ -623,6 +829,13 @@ impl<G: Game> WinitApp<G> {
             self.game.tick(state.timestep.step, &state.input);
         }
         state.input.end_frame();
+
+        let runtime_request = self.game.window_runtime_request();
+        if let Err(error) = Self::apply_runtime_request(state, runtime_request) {
+            self.error = Some(error);
+            event_loop.exit();
+            return;
+        }
 
         if self.game.wants_exit() {
             event_loop.exit();
@@ -871,7 +1084,7 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let manual_resize = manual_borderless_resize_enabled(
-                    self.config.resizable,
+                    state.runtime.state.resizable,
                     self.config.decorations,
                 );
                 if manual_resize {
@@ -890,7 +1103,10 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
                 }
             }
             WindowEvent::CursorLeft { .. } => {
-                if manual_borderless_resize_enabled(self.config.resizable, self.config.decorations)
+                if manual_borderless_resize_enabled(
+                    state.runtime.state.resizable,
+                    self.config.decorations,
+                )
                 {
                     state.window.set_cursor(CursorIcon::Default);
                 }
@@ -906,7 +1122,7 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
                 }
                 if button == MouseButton::Left && elem_state == ElementState::Pressed {
                     let manual_resize = manual_borderless_resize_enabled(
-                        self.config.resizable,
+                        state.runtime.state.resizable,
                         self.config.decorations,
                     );
                     let resize_direction = if manual_resize {
@@ -963,14 +1179,12 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
         if state.resize_state.is_suspended() {
             return;
         }
-        let Some(max_fps) = self.config.max_fps else {
+        let Some(due) = next_frame_deadline(state.last_frame, state.runtime.state.max_fps) else {
             state.window.request_redraw();
             return;
         };
         // Frame-paced mode: sleep until the next frame is due instead of
         // redrawing every time the loop wakes.
-        let interval = Duration::from_secs_f32(1.0 / max_fps.max(1.0));
-        let due = state.last_frame + interval;
         if Instant::now() >= due {
             state.window.request_redraw();
         } else {
@@ -979,12 +1193,17 @@ impl<G: Game> ApplicationHandler for WinitApp<G> {
     }
 }
 
+fn next_frame_deadline(last_frame: Instant, max_fps: Option<f32>) -> Option<Instant> {
+    max_fps.map(|max_fps| last_frame + Duration::from_secs_f32(1.0 / max_fps.max(1.0)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Game, ResizeAction, ResizeDirection, ResizeState, TextInputRequest, TextInputState,
-        TextInputUpdate, classify_resize_direction, manual_borderless_resize_enabled,
-        native_drag_requested,
+        AppConfig, Game, ResizeAction, ResizeDirection, ResizeState, TextInputRequest,
+        TextInputState, TextInputUpdate, WindowRuntimeControl, WindowRuntimeRequest,
+        classify_resize_direction, manual_borderless_resize_enabled, native_drag_requested,
+        next_frame_deadline,
     };
     #[cfg(target_os = "windows")]
     use super::{PHYSICAL_SURFACE_FORMAT, add_transparent_surface_view_format};
@@ -995,6 +1214,7 @@ mod tests {
     use crate::renderer::Renderer;
     use crate::scene::Scene;
     use glam::Vec2;
+    use std::time::{Duration, Instant};
 
     const WINDOW: (u32, u32) = (450, 600);
 
@@ -1113,6 +1333,123 @@ mod tests {
                 cursor_area_px: None,
             }
         );
+    }
+
+    fn runtime_config() -> AppConfig {
+        AppConfig {
+            size: WINDOW,
+            resizable: false,
+            always_on_top: true,
+            max_fps: Some(60.0),
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn runtime_control_starts_with_the_app_config_effective_state() {
+        let config = runtime_config();
+        let control = WindowRuntimeControl::new(&config, (675, 900), 1.5);
+
+        assert_eq!(control.state.inner_size_px, (675, 900));
+        assert_eq!(control.state.scale_factor, 1.5);
+        assert!(!control.state.resizable);
+        assert!(control.state.always_on_top);
+        assert_eq!(control.state.max_fps, Some(60.0));
+        assert!(control
+            .diff(WindowRuntimeRequest {
+                inner_size: Some(WINDOW),
+                resizable: Some(false),
+                always_on_top: Some(true),
+                max_fps: Some(Some(60.0)),
+            })
+            .is_empty());
+    }
+
+    #[test]
+    fn unchanged_runtime_requests_do_not_repeat_native_state_application() {
+        let config = runtime_config();
+        let mut control = WindowRuntimeControl::new(&config, WINDOW, 1.0);
+        let request = WindowRuntimeRequest {
+            inner_size: Some((700, 500)),
+            resizable: Some(true),
+            always_on_top: Some(false),
+            max_fps: Some(Some(120.0)),
+        };
+
+        let diff = control.diff(request);
+        assert_eq!(diff.inner_size, Some((700, 500)));
+        assert_eq!(diff.resizable, Some(true));
+        assert_eq!(diff.always_on_top, Some(false));
+        assert_eq!(diff.max_fps, Some(Some(120.0)));
+        control.mark_applied(diff);
+
+        assert!(control.diff(request).is_empty());
+        assert_eq!(control.state.resizable, true);
+        assert_eq!(control.state.always_on_top, false);
+        assert_eq!(control.state.max_fps, Some(120.0));
+    }
+
+    #[test]
+    fn changed_size_is_applied_once_and_resize_observation_continues() {
+        let config = runtime_config();
+        let mut control = WindowRuntimeControl::new(&config, WINDOW, 1.0);
+        let request = WindowRuntimeRequest {
+            inner_size: Some((700, 500)),
+            ..WindowRuntimeRequest::default()
+        };
+
+        let diff = control.diff(request);
+        assert_eq!(diff.inner_size, Some((700, 500)));
+        control.mark_applied(diff);
+        assert!(control.diff(request).is_empty());
+
+        control.observe((701, 501), 1.25);
+        assert_eq!(control.state.inner_size_px, (701, 501));
+        assert_eq!(control.state.scale_factor, 1.25);
+        assert!(control.diff(request).is_empty());
+    }
+
+    #[test]
+    fn max_fps_runtime_changes_update_the_pacing_deadline_without_restart() {
+        let config = runtime_config();
+        let mut control = WindowRuntimeControl::new(&config, WINDOW, 1.0);
+        let last_frame = Instant::now();
+
+        let request_120 = WindowRuntimeRequest {
+            max_fps: Some(Some(120.0)),
+            ..WindowRuntimeRequest::default()
+        };
+        let diff = control.diff(request_120);
+        assert_eq!(diff.max_fps, Some(Some(120.0)));
+        control.mark_applied(diff);
+        assert_eq!(control.state.max_fps, Some(120.0));
+        assert_eq!(
+            next_frame_deadline(last_frame, control.state.max_fps),
+            Some(last_frame + Duration::from_secs_f32(1.0 / 120.0))
+        );
+
+        let request_30 = WindowRuntimeRequest {
+            max_fps: Some(Some(30.0)),
+            ..WindowRuntimeRequest::default()
+        };
+        let diff = control.diff(request_30);
+        assert_eq!(diff.max_fps, Some(Some(30.0)));
+        control.mark_applied(diff);
+        assert_eq!(control.state.max_fps, Some(30.0));
+        assert_eq!(
+            next_frame_deadline(last_frame, control.state.max_fps),
+            Some(last_frame + Duration::from_secs_f32(1.0 / 30.0))
+        );
+
+        let uncapped = WindowRuntimeRequest {
+            max_fps: Some(None),
+            ..WindowRuntimeRequest::default()
+        };
+        let diff = control.diff(uncapped);
+        assert_eq!(diff.max_fps, Some(None));
+        control.mark_applied(diff);
+        assert_eq!(control.state.max_fps, None);
+        assert_eq!(next_frame_deadline(last_frame, control.state.max_fps), None);
     }
 
     #[test]
