@@ -1624,7 +1624,10 @@ impl Ui {
     }
 
     /// Rounded layout rect of a node, relative to its parent: (x, y, w, h).
-    pub fn layout_of(&self, id: i32) -> Option<(f32, f32, f32, f32)> {
+    pub fn layout_of(&mut self, id: i32) -> Option<(f32, f32, f32, f32)> {
+        if self.layout.needs() {
+            layout::relayout(&mut self.tree, &self.styles, &self.fonts, &mut self.layout);
+        }
         let n = self.tree.get(id)?;
         Some((n.layout.x, n.layout.y, n.layout.w, n.layout.h))
     }

@@ -425,6 +425,17 @@ impl UiSurface {
                 ui.borrow_mut().ui.hit_test(x as f32, y as f32)
             });
 
+            // Read-only layout bridge for widgets whose native geometry is
+            // owned by PocketUI. Coordinates are relative to the node's
+            // parent; callers can walk the mirror tree to form world bounds.
+            let ui = self.inner.clone();
+            op!("layoutOf", move |id: i32| -> Option<Vec<f64>> {
+                ui.borrow_mut()
+                    .ui
+                    .layout_of(id)
+                    .map(|(x, y, w, h)| vec![x as f64, y as f64, w as f64, h as f64])
+            });
+
             // Touch-path hit authority (spec op 42): the gesture layer
             // prefers the bounds hit over the ink-claiming hitTest above.
             let ui = self.inner.clone();

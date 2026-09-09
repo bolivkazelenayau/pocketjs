@@ -102,6 +102,8 @@ export interface HostOps {
   /** Topmost node id at a logical point (paint-order hit testing; pure
    *  layout containers pass through — see spec op 27). 0 = none. */
   hitTest?(x: number, y: number): number;
+  /** Return a node's layout box relative to its parent: [x, y, w, h]. */
+  layoutOf?(id: number): readonly [number, number, number, number] | null;
   /** Bounds-only twin of hitTest (spec op 42): pure layout containers CLAIM
    *  their box — the touch hit fact resolver's query form. The gesture layer
    *  only calls it when the host delivers no per-contact fact (frame() arg 4). */
