@@ -67,7 +67,8 @@ winit = "0.30"
 glam = { version = "0.33", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
-gltf = { version = "1.4", features = ["extras"] }
+gltf = { version = "1.4", features = ["extras", "KHR_materials_unlit"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 png = "0.18"
 anyhow = "1"
 log = "0.4"

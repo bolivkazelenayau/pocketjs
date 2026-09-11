@@ -1,12 +1,15 @@
 //! Skinned/static model assets (glTF) and scene instances.
 
+use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 
@@ -283,8 +286,8 @@ pub struct MorphPrim {
     pub targets: Vec<MorphTargetData>,
 }
 
-/// All morph-bearing primitives of one glTF mesh. VRM blend-shape binds
-/// address targets as (glTF mesh index, target index), which maps here.
+/// All morph-bearing primitives of one glTF mesh. Morph bindings address
+/// targets as (glTF mesh index, target index), which maps here.
 pub struct MorphMesh {
     /// glTF mesh index.
     pub mesh: usize,
@@ -845,14 +848,72 @@ impl ModelAsset {
         bytes: &[u8],
         label: &str,
     ) -> Result<Arc<Self>> {
-        let imported = import_glb_slice(bytes, label)?;
+        Self::load_glb_bytes_opts(
+            gpu,
+            layout,
+            samplers,
+            bytes,
+            label,
+            &ModelLoadOptions::default(),
+        )
+    }
+
+    /// Load a self-contained binary glTF model from memory with the normal
+    /// model load options. The bytes are imported exactly once; no filesystem
+    /// lookup is performed by this entry point.
+    pub fn load_glb_bytes_opts(
+        gpu: &Gpu,
+        layout: &wgpu::BindGroupLayout,
+        samplers: &Samplers,
+        bytes: &[u8],
+        label: &str,
+        opts: &ModelLoadOptions,
+    ) -> Result<Arc<Self>> {
+        Self::load_glb_bytes_opts_with_allowed_required_extensions(
+            gpu,
+            layout,
+            samplers,
+            bytes,
+            label,
+            opts,
+            std::iter::empty::<&str>(),
+        )
+    }
+
+    /// `load_glb_bytes_opts` with an explicit allowlist of required
+    /// extensions already validated by the caller. This does not disable
+    /// normal glTF validation and does not affect path-based loading.
+    pub fn load_glb_bytes_opts_with_allowed_required_extensions<I, S>(
+        gpu: &Gpu,
+        layout: &wgpu::BindGroupLayout,
+        samplers: &Samplers,
+        bytes: &[u8],
+        label: &str,
+        opts: &ModelLoadOptions,
+        allowed_required_extensions: I,
+    ) -> Result<Arc<Self>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        validate_load_options(opts)?;
+        let allowed_required_extensions: Vec<String> = allowed_required_extensions
+            .into_iter()
+            .map(|extension| extension.as_ref().to_owned())
+            .collect();
+        let imported = import_glb_slice_with_options(
+            bytes,
+            label,
+            &allowed_required_extensions,
+            opts.max_texture_dim,
+        )?;
         let mut cache = ModelTextureCache::new();
         Self::load_glb_imported(
             gpu,
             layout,
             samplers,
             Path::new(label),
-            &ModelLoadOptions::default(),
+            opts,
             &[],
             &mut cache,
             imported,
@@ -968,6 +1029,7 @@ impl ModelAsset {
         overrides: &[MaterialTextureOverride<'_>],
         cache: &mut ModelTextureCache,
     ) -> Result<Arc<Self>> {
+        validate_load_options(opts)?;
         for material_override in overrides {
             if material_override.force_opaque && material_override.force_blend {
                 bail!(
@@ -996,9 +1058,10 @@ impl ModelAsset {
         imported: ImportedGltf,
     ) -> Result<Arc<Self>> {
         let (doc, buffers, images) = imported;
+        validate_model_input(&doc, &buffers, path)?;
 
         // --- textures ------------------------------------------------------
-        // Only upload images a material actually samples (VRM files carry
+        // Only upload images a material actually samples (some files carry
         // thumbnails and utility maps), and optionally cap texture size —
         // authoring resolutions (4096²) dwarf what a small widget window can
         // ever show, and GPU memory is the dominant cost of a character.
@@ -1038,15 +1101,8 @@ impl ModelAsset {
                 textures.push(white.clone());
                 continue;
             }
-            let mut rgba = to_rgba8(img);
-            let (mut w, mut h) = (img.width, img.height);
-            if let Some(max) = opts.max_texture_dim {
-                while w.max(h) > max && w % 2 == 0 && h % 2 == 0 {
-                    rgba = downsample_rgba(&rgba, w, h);
-                    w /= 2;
-                    h /= 2;
-                }
-            }
+            let (rgba, w, h) =
+                cap_texture_rgba(to_rgba8(img), img.width, img.height, opts.max_texture_dim);
             textures.push(cache.get_or_upload(gpu, &format!("model img {i}"), w, h, rgba));
         }
 
@@ -1095,24 +1151,31 @@ impl ModelAsset {
         // vertex joint indices are remapped below.
         let skins: Vec<Skin> = doc
             .skins()
-            .map(|s| {
+            .map(|s| -> Result<Skin> {
                 let reader = s.reader(|b| buffers.get(b.index()).map(|d| d.0.as_slice()));
-                let inverse_bind: Vec<Mat4> = reader
-                    .read_inverse_bind_matrices()
-                    .map(|it| it.map(|m| Mat4::from_cols_array_2d(&m)).collect())
-                    .unwrap_or_default();
                 let joints: Vec<usize> = s.joints().map(|j| j.index()).collect();
-                let inverse_bind = if inverse_bind.len() == joints.len() {
-                    inverse_bind
-                } else {
-                    vec![Mat4::IDENTITY; joints.len()]
+                let inverse_bind = match reader.read_inverse_bind_matrices() {
+                    Some(it) => {
+                        let inverse_bind: Vec<_> =
+                            it.map(|m| Mat4::from_cols_array_2d(&m)).collect();
+                        if inverse_bind.len() != joints.len() {
+                            bail!(
+                                "inverse bind matrix count {} does not match skin joint count {} in {}",
+                                inverse_bind.len(),
+                                joints.len(),
+                                path.display()
+                            );
+                        }
+                        inverse_bind
+                    }
+                    None => vec![Mat4::IDENTITY; joints.len()],
                 };
-                Skin {
+                Ok(Skin {
                     joints,
                     inverse_bind,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let skin_base: Vec<u32> = skins
             .iter()
             .scan(0u32, |acc, s| {
@@ -1168,20 +1231,62 @@ impl ModelAsset {
                 let base = vertices.len() as u32;
 
                 let positions: Vec<[f32; 3]> = pos_iter.collect();
-                let normals: Vec<[f32; 3]> = reader
-                    .read_normals()
-                    .map(|it| it.collect())
-                    .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; positions.len()]);
-                let texcoord0: Option<Vec<[f32; 2]>> =
-                    reader.read_tex_coords(0).map(|it| it.into_f32().collect());
-                let joints: Vec<[u16; 4]> = reader
-                    .read_joints(0)
-                    .map(|it| it.into_u16().collect())
-                    .unwrap_or_else(|| vec![[0, 0, 0, 0]; positions.len()]);
-                let weights: Vec<[f32; 4]> = reader
-                    .read_weights(0)
-                    .map(|it| it.into_f32().collect())
-                    .unwrap_or_else(|| vec![[1.0, 0.0, 0.0, 0.0]; positions.len()]);
+                let normals: Vec<[f32; 3]> = match reader.read_normals() {
+                    Some(it) => {
+                        let normals: Vec<_> = it.collect();
+                        validate_attribute_count("NORMAL", positions.len(), normals.len(), path)?;
+                        normals
+                    }
+                    None => vec![[0.0, 1.0, 0.0]; positions.len()],
+                };
+                let texcoord0: Option<Vec<[f32; 2]>> = match reader.read_tex_coords(0) {
+                    Some(it) => {
+                        let texcoords: Vec<_> = it.into_f32().collect();
+                        validate_attribute_count(
+                            "TEXCOORD_0",
+                            positions.len(),
+                            texcoords.len(),
+                            path,
+                        )?;
+                        Some(texcoords)
+                    }
+                    None => None,
+                };
+                let joints: Vec<[u16; 4]> = match reader.read_joints(0) {
+                    Some(it) => {
+                        let joints: Vec<_> = it.into_u16().collect();
+                        validate_attribute_count("JOINTS_0", positions.len(), joints.len(), path)?;
+                        joints
+                    }
+                    None => vec![[0, 0, 0, 0]; positions.len()],
+                };
+                let weights: Vec<[f32; 4]> = match reader.read_weights(0) {
+                    Some(it) => {
+                        let weights: Vec<_> = it.into_f32().collect();
+                        validate_attribute_count(
+                            "WEIGHTS_0",
+                            positions.len(),
+                            weights.len(),
+                            path,
+                        )?;
+                        weights
+                    }
+                    None => vec![[1.0, 0.0, 0.0, 0.0]; positions.len()],
+                };
+
+                if let Some(si) = node_skin {
+                    let joint_count = skins[si].joints.len();
+                    for (vertex, joints) in joints.iter().enumerate() {
+                        for (slot, &joint) in joints.iter().enumerate() {
+                            if joint as usize >= joint_count {
+                                bail!(
+                                    "JOINTS_0 vertex {vertex} index {joint} at slot {slot} exceeds skin joint count {joint_count} in {}",
+                                    path.display()
+                                );
+                            }
+                        }
+                    }
+                }
 
                 for i in 0..positions.len() {
                     let p = bake.transform_point3(Vec3::from(positions[i]));
@@ -1233,7 +1338,18 @@ impl ModelAsset {
 
                 let first = indices.len() as u32;
                 match reader.read_indices() {
-                    Some(idx) => indices.extend(idx.into_u32().map(|i| base + i)),
+                    Some(idx) => {
+                        for i in idx.into_u32() {
+                            if i as usize >= positions.len() {
+                                bail!(
+                                    "index {i} exceeds POSITION count {} in {}",
+                                    positions.len(),
+                                    path.display()
+                                );
+                            }
+                            indices.push(base + i);
+                        }
+                    }
                     None => indices.extend(base..vertices.len() as u32),
                 }
                 let count = indices.len() as u32 - first;
@@ -1271,7 +1387,7 @@ impl ModelAsset {
                 let mut alpha_mode = MaterialAlphaMode::from_gltf(material.alpha_mode());
                 let alpha_cutoff = material.alpha_cutoff().unwrap_or(0.5);
                 let double_sided = material.double_sided();
-                let mut unlit = false;
+                let mut unlit = material.unlit();
                 if let Some(override_index) = texture_override {
                     let material_override = &overrides[override_index];
                     if material_override.require_normalized_texcoord0 {
@@ -1304,7 +1420,14 @@ impl ModelAsset {
                         normal: Vec::new(),
                     };
                     if let Some(it) = tpos {
-                        for (i, d) in it.enumerate() {
+                        let deltas: Vec<_> = it.collect();
+                        validate_attribute_count(
+                            "morph POSITION",
+                            positions.len(),
+                            deltas.len(),
+                            path,
+                        )?;
+                        for (i, d) in deltas.into_iter().enumerate() {
                             let d = bake.transform_vector3(Vec3::from(d));
                             if d.length_squared() > 1e-12 {
                                 target.pos.push((i as u32, d));
@@ -1312,7 +1435,14 @@ impl ModelAsset {
                         }
                     }
                     if let Some(it) = tnorm {
-                        for (i, d) in it.enumerate() {
+                        let deltas: Vec<_> = it.collect();
+                        validate_attribute_count(
+                            "morph NORMAL",
+                            positions.len(),
+                            deltas.len(),
+                            path,
+                        )?;
+                        for (i, d) in deltas.into_iter().enumerate() {
                             let d = normal_bake.transform_vector3(Vec3::from(d));
                             if d.length_squared() > 1e-12 {
                                 target.normal.push((i as u32, d));
@@ -1385,11 +1515,20 @@ impl ModelAsset {
         for anim in doc.animations() {
             let mut channels = Vec::new();
             let mut duration = 0.0f32;
-            for ch in anim.channels() {
+            for (ch_index, ch) in anim.channels().enumerate() {
                 let reader = ch.reader(|b| buffers.get(b.index()).map(|d| d.0.as_slice()));
                 let Some(times) = reader.read_inputs().map(|it| it.collect::<Vec<f32>>()) else {
-                    continue;
+                    bail!(
+                        "animation channel {ch_index} in {} has no readable input keys",
+                        path.display()
+                    );
                 };
+                if times.is_empty() {
+                    bail!(
+                        "animation channel {ch_index} in {} has zero input keys",
+                        path.display()
+                    );
+                }
                 if let Some(&last) = times.last() {
                     duration = duration.max(last);
                 }
@@ -1400,7 +1539,13 @@ impl ModelAsset {
                 };
                 let cubic =
                     ch.sampler().interpolation() == gltf::animation::Interpolation::CubicSpline;
-                let (path, values) = match reader.read_outputs() {
+                if cubic && times.len() < 2 {
+                    bail!(
+                        "animation channel {ch_index} in {} has fewer than two CUBICSPLINE keys",
+                        path.display()
+                    );
+                }
+                let (channel_path, values) = match reader.read_outputs() {
                     Some(gltf::animation::util::ReadOutputs::Translations(it)) => {
                         (ChannelPath::Translation, flatten3(it.collect(), cubic))
                     }
@@ -1411,15 +1556,34 @@ impl ModelAsset {
                         ChannelPath::Rotation,
                         flatten4(rot.into_f32().collect(), cubic),
                     ),
-                    _ => continue,
+                    Some(gltf::animation::util::ReadOutputs::MorphTargetWeights(_)) => continue,
+                    None => {
+                        bail!(
+                            "animation channel {ch_index} in {} has output data incompatible with its target",
+                            path.display()
+                        );
+                    }
                 };
-                channels.push(Channel {
+                let channel = Channel {
                     node: ch.target().node().index(),
-                    path,
+                    path: channel_path,
                     interpolation,
                     times,
                     values,
-                });
+                };
+                channel.validate().with_context(|| {
+                    format!(
+                        "validating animation channel {ch_index} in {}",
+                        path.display()
+                    )
+                })?;
+                channel.validate_rotation_keys(false).with_context(|| {
+                    format!(
+                        "validating animation channel {ch_index} in {}",
+                        path.display()
+                    )
+                })?;
+                channels.push(channel);
             }
             clips.push(Clip {
                 name: anim.name().unwrap_or("anim").to_string(),
@@ -1568,23 +1732,51 @@ fn strip_cubic<T: Copy>(v: Vec<T>, cubic: bool) -> Vec<T> {
     v.as_chunks::<3>().0.iter().map(|c| c[1]).collect()
 }
 
+fn validate_load_options(opts: &ModelLoadOptions) -> Result<()> {
+    if opts.max_texture_dim == Some(0) {
+        bail!("max_texture_dim must be greater than zero");
+    }
+    Ok(())
+}
+
 /// Box-filter 2×2 downsample (straight alpha; fine for albedo maps).
 fn downsample_rgba(px: &[u8], w: u32, h: u32) -> Vec<u8> {
-    let (nw, nh) = (w / 2, h / 2);
+    let (nw, nh) = (w.div_ceil(2), h.div_ceil(2));
     let mut out = Vec::with_capacity((nw * nh * 4) as usize);
     for y in 0..nh {
         for x in 0..nw {
             let mut acc = [0u32; 4];
-            for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
-                let src = (((y * 2 + dy) * w + x * 2 + dx) * 4) as usize;
-                for c in 0..4 {
-                    acc[c] += px[src + c] as u32;
+            let mut samples = 0;
+            for sy in (y * 2)..((y * 2 + 2).min(h)) {
+                for sx in (x * 2)..((x * 2 + 2).min(w)) {
+                    let src = ((sy * w + sx) * 4) as usize;
+                    for c in 0..4 {
+                        acc[c] += px[src + c] as u32;
+                    }
+                    samples += 1;
                 }
             }
-            out.extend(acc.map(|v| (v / 4) as u8));
+            out.extend(acc.map(|v| (v / samples) as u8));
         }
     }
     out
+}
+
+fn cap_texture_rgba(
+    mut rgba: Vec<u8>,
+    mut width: u32,
+    mut height: u32,
+    max_texture_dim: Option<u32>,
+) -> (Vec<u8>, u32, u32) {
+    let Some(max) = max_texture_dim else {
+        return (rgba, width, height);
+    };
+    while width.max(height) > max {
+        rgba = downsample_rgba(&rgba, width, height);
+        width = width.div_ceil(2);
+        height = height.div_ceil(2);
+    }
+    (rgba, width, height)
 }
 
 fn to_rgba8(img: &gltf::image::Data) -> Vec<u8> {
@@ -1665,30 +1857,674 @@ type ImportedGltf = (
     Vec<gltf::image::Data>,
 );
 
-fn import_glb_slice(bytes: &[u8], label: &str) -> Result<ImportedGltf> {
-    gltf::import_slice(bytes).with_context(|| format!("importing embedded GLB {label}"))
+fn validate_attribute_count(
+    attribute: &str,
+    position_count: usize,
+    actual_count: usize,
+    path: &Path,
+) -> Result<()> {
+    if actual_count != position_count {
+        bail!(
+            "{attribute} accessor count {actual_count} does not match POSITION count {position_count} in {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+const MAX_RENDERER_JOINTS: usize = 512;
+
+fn validate_joint_palette_count(joint_count: usize, path: &Path) -> Result<()> {
+    if joint_count > MAX_RENDERER_JOINTS {
+        bail!(
+            "combined skin joint count {joint_count} exceeds renderer joint palette limit {MAX_RENDERER_JOINTS} in {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn validate_model_input(
+    doc: &gltf::Document,
+    buffers: &[gltf::buffer::Data],
+    path: &Path,
+) -> Result<()> {
+    let node_count = doc.nodes().count();
+    let skin_joint_counts: Vec<Vec<usize>> = doc
+        .skins()
+        .map(|skin| skin.joints().map(|joint| joint.index()).collect())
+        .collect();
+    let combined_joint_count = skin_joint_counts.iter().map(Vec::len).sum();
+    validate_joint_palette_count(combined_joint_count, path)?;
+
+    for (skin_index, skin) in doc.skins().enumerate() {
+        let joint_count = skin_joint_counts[skin_index].len();
+        let reader = skin.reader(|b| buffers.get(b.index()).map(|data| data.0.as_slice()));
+        if let Some(matrices) = reader.read_inverse_bind_matrices() {
+            let matrix_count = matrices.count();
+            if matrix_count != joint_count {
+                bail!(
+                    "inverse bind matrix count {matrix_count} does not match skin joint count {joint_count} in {}",
+                    path.display()
+                );
+            }
+        }
+        for (joint_index, &node) in skin_joint_counts[skin_index].iter().enumerate() {
+            if node >= node_count {
+                bail!(
+                    "skin joint {joint_index} references node {node}, but the model has {node_count} nodes in {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    for node in doc.nodes() {
+        let node_skin = node.skin().map(|skin| skin.index());
+        if let Some(mesh) = node.mesh() {
+            for primitive in mesh.primitives() {
+                let reader =
+                    primitive.reader(|b| buffers.get(b.index()).map(|data| data.0.as_slice()));
+                let Some(positions) = reader.read_positions() else {
+                    continue;
+                };
+                let position_count = positions.count();
+
+                if let Some(normals) = reader.read_normals() {
+                    validate_attribute_count("NORMAL", position_count, normals.count(), path)?;
+                }
+                if let Some(texcoords) = reader.read_tex_coords(0) {
+                    validate_attribute_count(
+                        "TEXCOORD_0",
+                        position_count,
+                        texcoords.into_f32().count(),
+                        path,
+                    )?;
+                }
+                if let Some(joints) = reader.read_joints(0) {
+                    let joints: Vec<_> = joints.into_u16().collect();
+                    validate_attribute_count("JOINTS_0", position_count, joints.len(), path)?;
+                    if let Some(skin_index) = node_skin {
+                        let joint_count = skin_joint_counts[skin_index].len();
+                        for (vertex, joints) in joints.iter().enumerate() {
+                            for (slot, &joint) in joints.iter().enumerate() {
+                                if joint as usize >= joint_count {
+                                    bail!(
+                                        "JOINTS_0 vertex {vertex} index {joint} at slot {slot} exceeds skin joint count {joint_count} in {}",
+                                        path.display()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(weights) = reader.read_weights(0) {
+                    validate_attribute_count(
+                        "WEIGHTS_0",
+                        position_count,
+                        weights.into_f32().count(),
+                        path,
+                    )?;
+                }
+                if let Some(indices) = reader.read_indices() {
+                    for index in indices.into_u32() {
+                        if index as usize >= position_count {
+                            bail!(
+                                "index {index} exceeds POSITION count {position_count} in {}",
+                                path.display()
+                            );
+                        }
+                    }
+                }
+
+                for (target_index, (positions, normals, _tangents)) in
+                    reader.read_morph_targets().enumerate()
+                {
+                    if let Some(positions) = positions {
+                        validate_attribute_count(
+                            &format!("morph POSITION target {target_index}"),
+                            position_count,
+                            positions.count(),
+                            path,
+                        )?;
+                    }
+                    if let Some(normals) = normals {
+                        validate_attribute_count(
+                            &format!("morph NORMAL target {target_index}"),
+                            position_count,
+                            normals.count(),
+                            path,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    for (animation_index, animation) in doc.animations().enumerate() {
+        for (channel_index, channel) in animation.channels().enumerate() {
+            let input = channel.sampler().input();
+            if input.count() == 0 {
+                bail!(
+                    "animation channel {channel_index} in animation {animation_index} in {} has zero input keys",
+                    path.display()
+                );
+            }
+            let reader = channel.reader(|b| buffers.get(b.index()).map(|data| data.0.as_slice()));
+            let Some(times) = reader.read_inputs() else {
+                bail!(
+                    "animation channel {channel_index} in animation {animation_index} in {} has no readable input keys",
+                    path.display()
+                );
+            };
+            let times: Vec<_> = times.collect();
+            if times.is_empty() {
+                bail!(
+                    "animation channel {channel_index} in animation {animation_index} in {} has zero input keys",
+                    path.display()
+                );
+            }
+            if times.iter().any(|time| !time.is_finite() || *time < 0.0)
+                || times.windows(2).any(|window| window[1] <= window[0])
+            {
+                bail!(
+                    "animation channel {channel_index} in animation {animation_index} has invalid or unsorted input keys in {}",
+                    path.display()
+                );
+            }
+
+            let property = channel.target().property();
+            if matches!(property, gltf::animation::Property::MorphTargetWeights) {
+                continue;
+            }
+            let cubic =
+                channel.sampler().interpolation() == gltf::animation::Interpolation::CubicSpline;
+            if cubic && times.len() < 2 {
+                bail!(
+                    "animation channel {channel_index} in animation {animation_index} has fewer than two CUBICSPLINE keys in {}",
+                    path.display()
+                );
+            }
+            let output = channel.sampler().output();
+            let expected_dimensions = match property {
+                gltf::animation::Property::Translation | gltf::animation::Property::Scale => {
+                    gltf::accessor::Dimensions::Vec3
+                }
+                gltf::animation::Property::Rotation => gltf::accessor::Dimensions::Vec4,
+                gltf::animation::Property::MorphTargetWeights => unreachable!(),
+            };
+            if output.dimensions() != expected_dimensions {
+                bail!(
+                    "animation channel {channel_index} in animation {animation_index} has output dimensions incompatible with its target in {}",
+                    path.display()
+                );
+            }
+            let expected_output_count = input
+                .count()
+                .checked_mul(if cubic { 3 } else { 1 })
+                .ok_or_else(|| anyhow::anyhow!("animation output count overflows"))?;
+            if output.count() != expected_output_count {
+                bail!(
+                    "animation channel output count {} does not match input key count {}{} in {}",
+                    output.count(),
+                    input.count(),
+                    if cubic { " × 3 for CUBICSPLINE" } else { "" },
+                    path.display()
+                );
+            }
+            let Some(outputs) = reader.read_outputs() else {
+                bail!(
+                    "animation channel {channel_index} in animation {animation_index} in {} has output data incompatible with its target",
+                    path.display()
+                );
+            };
+            let output_count = match outputs {
+                gltf::animation::util::ReadOutputs::Translations(values) => values.count(),
+                gltf::animation::util::ReadOutputs::Scales(values) => values.count(),
+                gltf::animation::util::ReadOutputs::Rotations(values) => {
+                    let values: Vec<_> = values.into_f32().collect();
+                    let stride = if cubic { 3 } else { 1 };
+                    for key in 0..times.len() {
+                        let value_index = key * stride + usize::from(cubic);
+                        let Some(&quaternion) = values.get(value_index) else {
+                            bail!(
+                                "animation channel {channel_index} in animation {animation_index} has truncated rotation output in {}",
+                                path.display()
+                            );
+                        };
+                        let length_squared =
+                            quaternion.iter().map(|value| value * value).sum::<f32>();
+                        if !length_squared.is_finite() || length_squared <= 1.0e-12 {
+                            bail!(
+                                "animation channel {channel_index} in animation {animation_index} has a zero or non-finite rotation quaternion at key {key} in {}",
+                                path.display()
+                            );
+                        }
+                    }
+                    values.len()
+                }
+                gltf::animation::util::ReadOutputs::MorphTargetWeights(_) => continue,
+            };
+            if output_count != expected_output_count {
+                bail!(
+                    "animation channel output count {output_count} does not match input key count {}{} in {}",
+                    times.len(),
+                    if cubic { " × 3 for CUBICSPLINE" } else { "" },
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_glb_container<'a>(bytes: &'a [u8], label: &str) -> Result<Cow<'a, [u8]>> {
+    if bytes.len() < 12 {
+        bail!("invalid GLB {label}: header is truncated");
+    }
+    if &bytes[..4] != b"glTF" {
+        bail!("invalid GLB {label}: bad magic");
+    }
+    let mut version_bytes = [0u8; 4];
+    version_bytes.copy_from_slice(&bytes[4..8]);
+    let version = u32::from_le_bytes(version_bytes);
+    if version != 2 {
+        bail!("invalid GLB {label}: unsupported version {version}");
+    }
+    let mut length_bytes = [0u8; 4];
+    length_bytes.copy_from_slice(&bytes[8..12]);
+    let declared_length = u32::from_le_bytes(length_bytes) as usize;
+    if declared_length != bytes.len() {
+        bail!(
+            "invalid GLB {label}: declared length {declared_length} does not match byte length {}",
+            bytes.len()
+        );
+    }
+
+    let read_chunk = |offset: usize| -> Result<([u8; 4], usize)> {
+        if offset > declared_length || declared_length - offset < 8 {
+            bail!("invalid GLB {label}: truncated chunk header");
+        }
+        let mut chunk_length_bytes = [0u8; 4];
+        chunk_length_bytes.copy_from_slice(&bytes[offset..offset + 4]);
+        let chunk_length = u32::from_le_bytes(chunk_length_bytes) as usize;
+        let data_start = offset + 8;
+        let data_end = data_start
+            .checked_add(chunk_length)
+            .ok_or_else(|| anyhow::anyhow!("invalid GLB {label}: chunk length overflows"))?;
+        if data_end > declared_length {
+            bail!("invalid GLB {label}: chunk exceeds declared length");
+        }
+        let mut chunk_type = [0u8; 4];
+        chunk_type.copy_from_slice(&bytes[offset + 4..offset + 8]);
+        Ok((chunk_type, data_end))
+    };
+
+    let (json_type, json_end) = read_chunk(12)?;
+    if &json_type != b"JSON" {
+        bail!("invalid GLB {label}: first chunk is not JSON");
+    }
+
+    let mut offset = json_end;
+    let mut bin_range = None;
+    let mut has_unknown_chunks = false;
+    while offset < declared_length {
+        let chunk_start = offset;
+        let (chunk_type, chunk_end) = read_chunk(offset)?;
+        if &chunk_type == b"BIN\0" {
+            if bin_range.is_some() {
+                bail!("invalid GLB {label}: multiple BIN chunks");
+            }
+            bin_range = Some((chunk_start, chunk_end));
+        } else if &chunk_type == b"JSON" {
+            bail!("invalid GLB {label}: multiple JSON chunks");
+        } else {
+            has_unknown_chunks = true;
+        }
+        offset = chunk_end;
+    }
+
+    if !has_unknown_chunks {
+        return Ok(Cow::Borrowed(bytes));
+    }
+
+    // gltf 1.4.1 rejects unknown chunks while parsing, even though the GLB
+    // format requires clients to ignore them. Repack only the recognized
+    // JSON/BIN chunks for that parser; all chunk bounds were checked above.
+    let bin_len = bin_range.map_or(0, |(start, end)| end - start);
+    let normalized_len = 12 + (json_end - 12) + bin_len;
+    let normalized_len_u32 = u32::try_from(normalized_len)
+        .with_context(|| format!("normalizing GLB {label}: normalized length overflows u32"))?;
+    let mut normalized = Vec::with_capacity(normalized_len);
+    normalized.extend_from_slice(&bytes[..8]);
+    normalized.extend_from_slice(&normalized_len_u32.to_le_bytes());
+    normalized.extend_from_slice(&bytes[12..json_end]);
+    if let Some((bin_start, bin_end)) = bin_range {
+        normalized.extend_from_slice(&bytes[bin_start..bin_end]);
+    }
+    Ok(Cow::Owned(normalized))
+}
+
+fn validate_self_contained_resources(doc: &gltf::Document) -> Result<()> {
+    for buffer in doc.buffers() {
+        if let gltf::buffer::Source::Uri(uri) = buffer.source()
+            && !uri.starts_with("data:")
+        {
+            bail!("external buffer URI {uri:?} is not allowed for byte-loaded GLB");
+        }
+    }
+    for image in doc.images() {
+        if let gltf::image::Source::Uri { uri, .. } = image.source() {
+            if !uri.starts_with("data:") {
+                bail!("external image URI {uri:?} is not allowed for byte-loaded GLB");
+            }
+        }
+    }
+    Ok(())
+}
+
+const MAX_BYTE_IMAGE_DECODE_DIM: u32 = 16_384;
+const DEFAULT_BYTE_IMAGE_DECODE_DIM: u32 = 8_192;
+const MAX_BYTE_IMAGE_DECODE_ALLOC: u64 = 512 * 1024 * 1024;
+const MAX_BYTE_IMAGE_COUNT: usize = 64;
+const MAX_BYTE_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+
+fn byte_image_decode_dim(max_texture_dim: Option<u32>) -> u32 {
+    max_texture_dim
+        .map(|max| max.saturating_mul(4).clamp(2, MAX_BYTE_IMAGE_DECODE_DIM))
+        .unwrap_or(DEFAULT_BYTE_IMAGE_DECODE_DIM)
+}
+
+fn image_decode_limits(max_decode_dim: u32) -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(max_decode_dim);
+    limits.max_image_height = Some(max_decode_dim);
+    limits.max_alloc = Some(MAX_BYTE_IMAGE_DECODE_ALLOC);
+    limits
+}
+
+#[derive(Default)]
+struct ByteImageBudget {
+    image_count: usize,
+    decoded_bytes: u64,
+}
+
+impl ByteImageBudget {
+    fn reserve(&mut self, image_index: usize, width: u32, height: u32, label: &str) -> Result<()> {
+        if self.image_count >= MAX_BYTE_IMAGE_COUNT {
+            bail!(
+                "byte-loaded GLB {label} references more than {MAX_BYTE_IMAGE_COUNT} decoded images"
+            );
+        }
+        let bytes = u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| {
+                anyhow::anyhow!("decoded image {image_index} in {label} is too large")
+            })?;
+        let next = self
+            .decoded_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow::anyhow!("decoded image byte budget overflows in {label}"))?;
+        if next > MAX_BYTE_IMAGE_BYTES {
+            bail!(
+                "decoded image byte budget exceeds {MAX_BYTE_IMAGE_BYTES} bytes at image {image_index} in {label}"
+            );
+        }
+        self.image_count += 1;
+        self.decoded_bytes = next;
+        Ok(())
+    }
+}
+
+fn decode_byte_image(
+    encoded: &[u8],
+    mime_type: Option<&str>,
+    max_decode_dim: u32,
+    budget: &mut ByteImageBudget,
+    label: &str,
+    image_index: usize,
+) -> Result<gltf::image::Data> {
+    let make_reader = || -> Result<image::ImageReader<Cursor<&[u8]>>> {
+        match mime_type {
+            Some("image/png") => Ok(image::ImageReader::with_format(
+                Cursor::new(encoded),
+                image::ImageFormat::Png,
+            )),
+            Some("image/jpeg") => Ok(image::ImageReader::with_format(
+                Cursor::new(encoded),
+                image::ImageFormat::Jpeg,
+            )),
+            _ => image::ImageReader::new(Cursor::new(encoded))
+                .with_guessed_format()
+                .with_context(|| format!("guessing format for image {image_index} in {label}")),
+        }
+    };
+    let mut reader = make_reader()?;
+    reader.limits(image_decode_limits(max_decode_dim));
+    let (width, height) = reader
+        .into_dimensions()
+        .with_context(|| format!("reading dimensions for image {image_index} in {label}"))?;
+    budget.reserve(image_index, width, height, label)?;
+
+    let mut reader = make_reader()?;
+    reader.limits(image_decode_limits(max_decode_dim));
+    let decoded = reader
+        .decode()
+        .with_context(|| format!("decoding image {image_index} in {label}"))?;
+    let rgba = decoded.to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    Ok(gltf::image::Data {
+        pixels: rgba.into_raw(),
+        format: gltf::image::Format::R8G8B8A8,
+        width,
+        height,
+    })
+}
+
+fn decode_data_uri(uri: &str, label: &str, image_index: usize) -> Result<Vec<u8>> {
+    let encoded = uri
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(";base64,").map(|(_, encoded)| encoded))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "image {image_index} in {label} has an unsupported data URI; expected base64"
+            )
+        })?;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .with_context(|| format!("decoding data URI for image {image_index} in {label}"))
+}
+
+fn decode_byte_image_source(
+    source: gltf::image::Source<'_>,
+    buffers: &[gltf::buffer::Data],
+    max_decode_dim: u32,
+    budget: &mut ByteImageBudget,
+    label: &str,
+    image_index: usize,
+) -> Result<gltf::image::Data> {
+    match source {
+        gltf::image::Source::Uri { uri, mime_type } => {
+            let encoded = decode_data_uri(uri, label, image_index)?;
+            decode_byte_image(
+                &encoded,
+                mime_type,
+                max_decode_dim,
+                budget,
+                label,
+                image_index,
+            )
+        }
+        gltf::image::Source::View { view, mime_type } => {
+            let data = buffers.get(view.buffer().index()).ok_or_else(|| {
+                anyhow::anyhow!("image {image_index} in {label} references a missing buffer")
+            })?;
+            let begin = view.offset();
+            let end = begin.checked_add(view.length()).ok_or_else(|| {
+                anyhow::anyhow!("image {image_index} in {label} buffer view overflows")
+            })?;
+            let encoded = data.0.get(begin..end).ok_or_else(|| {
+                anyhow::anyhow!("image {image_index} in {label} buffer view exceeds its buffer")
+            })?;
+            decode_byte_image(
+                encoded,
+                Some(mime_type),
+                max_decode_dim,
+                budget,
+                label,
+                image_index,
+            )
+        }
+    }
+}
+
+fn import_byte_images(
+    doc: &gltf::Document,
+    buffers: &[gltf::buffer::Data],
+    max_texture_dim: Option<u32>,
+    label: &str,
+) -> Result<Vec<gltf::image::Data>> {
+    let image_slot_count = doc.images().count();
+    if image_slot_count > MAX_BYTE_IMAGE_COUNT {
+        bail!(
+            "byte-loaded GLB {label} declares {image_slot_count} images, exceeding the limit of {MAX_BYTE_IMAGE_COUNT}"
+        );
+    }
+    let used: HashSet<usize> = doc
+        .nodes()
+        .filter_map(|node| node.mesh())
+        .flat_map(|mesh| mesh.primitives())
+        .filter_map(|primitive| {
+            primitive
+                .material()
+                .pbr_metallic_roughness()
+                .base_color_texture()
+                .map(|texture| texture.texture().source().index())
+        })
+        .collect();
+    let max_decode_dim = byte_image_decode_dim(max_texture_dim);
+    let mut budget = ByteImageBudget::default();
+    let fallback = gltf::image::Data {
+        pixels: vec![255, 255, 255, 255],
+        format: gltf::image::Format::R8G8B8A8,
+        width: 1,
+        height: 1,
+    };
+    let mut images = vec![fallback; doc.images().count()];
+    for image in doc.images() {
+        if !used.contains(&image.index()) {
+            continue;
+        }
+        images[image.index()] = decode_byte_image_source(
+            image.source(),
+            buffers,
+            max_decode_dim,
+            &mut budget,
+            label,
+            image.index(),
+        )?;
+    }
+    Ok(images)
+}
+
+#[cfg(test)]
+fn import_glb_slice(
+    bytes: &[u8],
+    label: &str,
+    allowed_required_extensions: &[String],
+) -> Result<ImportedGltf> {
+    import_glb_slice_with_options(bytes, label, allowed_required_extensions, None)
+}
+
+fn import_glb_slice_with_options(
+    bytes: &[u8],
+    label: &str,
+    allowed_required_extensions: &[String],
+    max_texture_dim: Option<u32>,
+) -> Result<ImportedGltf> {
+    let normalized = normalize_glb_container(bytes, label)?;
+    let mut parsed = gltf::Gltf::from_slice_without_validation(&normalized)
+        .with_context(|| format!("parsing embedded GLB {label}"))?;
+    let mut root = parsed.document.into_json();
+    let required_extensions = root.extensions_required.clone();
+    let document = match gltf::Document::from_json(root.clone()) {
+        // This is the normal glTF crate validation path. It accepts every
+        // extension compiled into the dependency, including KHR_materials_unlit.
+        Ok(document) => document,
+        Err(validation_error) => {
+            // Retry with the required-extension list removed only to tell an
+            // unsupported required extension apart from an ordinary malformed
+            // core document. The retry never becomes the accepted document.
+            let mut core_root = root.clone();
+            core_root.extensions_required.clear();
+            if gltf::Document::from_json(core_root).is_err() {
+                return Err(validation_error)
+                    .with_context(|| format!("validating embedded GLB {label}"));
+            }
+            for extension in required_extensions.iter().filter(|extension| {
+                !allowed_required_extensions
+                    .iter()
+                    .any(|allowed| allowed == *extension)
+            }) {
+                // Probe each name in isolation. This distinguishes an
+                // unknown extension from a supported required extension when
+                // both appear in the same document.
+                let mut trial_root = root.clone();
+                trial_root.extensions_required = vec![extension.clone()];
+                if gltf::Document::from_json(trial_root).is_err() {
+                    bail!(
+                        "required extension {extension} is not enabled or caller-validated for byte-loaded GLB {label}"
+                    );
+                }
+            }
+            root.extensions_required.retain(|extension| {
+                !allowed_required_extensions
+                    .iter()
+                    .any(|allowed| allowed == extension)
+            });
+            gltf::Document::from_json(root)
+                .with_context(|| format!("validating embedded GLB {label}"))?
+        }
+    };
+    validate_self_contained_resources(&document)?;
+    let buffers = gltf::import_buffers(&document, None, parsed.blob.take())
+        .with_context(|| format!("importing embedded GLB buffers {label}"))?;
+    let images = import_byte_images(&document, &buffers, max_texture_dim, label)
+        .with_context(|| format!("importing embedded GLB images {label}"))?;
+    Ok((document, buffers, images))
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
+    use base64::Engine as _;
     use glam::{Quat, Vec3};
+    use serde_json::{Value, json};
 
     use crate::anim::{AnimState, Channel, ChannelPath, Clip, Interpolation, NodeTrs, Skeleton};
+    use crate::gpu::Gpu;
+    use crate::texture::Samplers;
 
     use super::{
-        MaterialBaseColorMode, MaterialRaw, ModelTextureCacheKey, find_node_named,
-        import_glb_slice, pocket3d_base_color_mode_from_extras, pocket3d_role_from_extras,
-        sample_node_transform, semantic_material_matches, to_rgba8, validate_normalized_texcoord0,
+        ByteImageBudget, MAX_BYTE_IMAGE_BYTES, MAX_BYTE_IMAGE_COUNT, MaterialBaseColorMode,
+        MaterialRaw, ModelAsset, ModelLoadOptions, ModelTextureCacheKey, cap_texture_rgba,
+        find_node_named, import_glb_slice, import_glb_slice_with_options,
+        pocket3d_base_color_mode_from_extras, pocket3d_role_from_extras, sample_node_transform,
+        semantic_material_matches, to_rgba8, validate_joint_palette_count, validate_model_input,
+        validate_normalized_texcoord0,
     };
 
-    fn minimal_glb() -> Vec<u8> {
-        let mut json = br#"{"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[]}]}"#.to_vec();
+    fn glb_from_json(value: Value, bin: &[u8]) -> Vec<u8> {
+        let mut json = serde_json::to_vec(&value).unwrap();
         while !json.len().is_multiple_of(4) {
             json.push(b' ');
         }
-        let total_len = 12 + 8 + json.len();
+        let include_bin = !bin.is_empty() || value.get("buffers").is_some();
+        let padded_bin_len = (bin.len() + 3) & !3;
+        let total_len = 12 + 8 + json.len() + if include_bin { 8 + padded_bin_len } else { 0 };
         let mut glb = Vec::with_capacity(total_len);
         glb.extend_from_slice(b"glTF");
         glb.extend_from_slice(&2u32.to_le_bytes());
@@ -1696,12 +2532,314 @@ mod tests {
         glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
         glb.extend_from_slice(b"JSON");
         glb.extend_from_slice(&json);
+        if include_bin {
+            glb.extend_from_slice(&(padded_bin_len as u32).to_le_bytes());
+            glb.extend_from_slice(b"BIN\0");
+            glb.extend_from_slice(bin);
+            glb.resize(glb.len() + padded_bin_len - bin.len(), 0);
+        }
         glb
+    }
+
+    fn minimal_glb() -> Vec<u8> {
+        glb_from_json(
+            json!({
+                "asset": {"version": "2.0"},
+                "scene": 0,
+                "scenes": [{"nodes": []}]
+            }),
+            &[],
+        )
+    }
+
+    fn append_unknown_chunk(mut glb: Vec<u8>) -> Vec<u8> {
+        let payload = [1u8, 2, 3, 4];
+        glb.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"TEST");
+        glb.extend_from_slice(&payload);
+        let length = glb.len() as u32;
+        glb[8..12].copy_from_slice(&length.to_le_bytes());
+        glb
+    }
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_image_data(&vec![255; (width * height * 4) as usize])
+            .unwrap();
+        drop(writer);
+        encoded
+    }
+
+    fn data_uri_image_glb(width: u32, height: u32) -> Vec<u8> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(png_bytes(width, height));
+        let mut bin = Vec::new();
+        let mut views = Vec::new();
+        let mut accessors = Vec::new();
+        let position = append_f32_accessor(&mut bin, &mut views, &mut accessors, 3, 3);
+        glb_from_json(
+            json!({
+                "asset": {"version": "2.0"},
+                "scene": 0,
+                "scenes": [{"nodes": [0]}],
+                "nodes": [{"mesh": 0}],
+                "meshes": [{"primitives": [{
+                    "attributes": {"POSITION": position},
+                    "material": 0
+                }]}],
+                "images": [{"uri": format!("data:image/png;base64,{encoded}")}],
+                "textures": [{"source": 0}],
+                "materials": [{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}],
+                "buffers": [{"byteLength": bin.len()}],
+                "bufferViews": views,
+                "accessors": accessors
+            }),
+            &bin,
+        )
+    }
+
+    fn append_f32_accessor(
+        bin: &mut Vec<u8>,
+        views: &mut Vec<Value>,
+        accessors: &mut Vec<Value>,
+        count: usize,
+        components: usize,
+    ) -> usize {
+        let offset = bin.len();
+        for i in 0..count * components {
+            bin.extend_from_slice(&(i as f32).to_le_bytes());
+        }
+        let view = views.len();
+        views.push(json!({
+            "buffer": 0,
+            "byteOffset": offset,
+            "byteLength": count * components * 4,
+            "target": 34962
+        }));
+        let accessor_index = accessors.len();
+        let kind = match components {
+            1 => "SCALAR",
+            2 => "VEC2",
+            3 => "VEC3",
+            4 => "VEC4",
+            _ => panic!("unsupported test accessor width"),
+        };
+        let mut accessor = json!({
+            "bufferView": view,
+            "componentType": 5126,
+            "count": count,
+            "type": kind
+        });
+        if components == 3 {
+            accessor["min"] = json!([0.0, 0.0, 0.0]);
+            accessor["max"] = json!([1.0, 1.0, 1.0]);
+        }
+        accessors.push(accessor);
+        accessor_index
+    }
+
+    fn append_u16_vec4_accessor(
+        bin: &mut Vec<u8>,
+        views: &mut Vec<Value>,
+        accessors: &mut Vec<Value>,
+        count: usize,
+    ) -> usize {
+        let offset = bin.len();
+        for _ in 0..count {
+            bin.extend_from_slice(&[0u8; 8]);
+        }
+        let view = views.len();
+        views.push(json!({
+            "buffer": 0,
+            "byteOffset": offset,
+            "byteLength": count * 8,
+            "target": 34962
+        }));
+        let accessor = accessors.len();
+        accessors.push(json!({
+            "bufferView": view,
+            "componentType": 5123,
+            "count": count,
+            "type": "VEC4"
+        }));
+        accessor
+    }
+
+    fn mesh_fixture(
+        normal_count: Option<usize>,
+        joints_count: Option<usize>,
+        weights_count: Option<usize>,
+        morph_position_count: Option<usize>,
+        morph_normal_count: Option<usize>,
+    ) -> Vec<u8> {
+        let mut bin = Vec::new();
+        let mut views = Vec::new();
+        let mut accessors = Vec::new();
+        let position = append_f32_accessor(&mut bin, &mut views, &mut accessors, 4, 3);
+        let normal = normal_count
+            .map(|count| append_f32_accessor(&mut bin, &mut views, &mut accessors, count, 3));
+        let joints = joints_count
+            .map(|count| append_u16_vec4_accessor(&mut bin, &mut views, &mut accessors, count));
+        let weights = weights_count
+            .map(|count| append_f32_accessor(&mut bin, &mut views, &mut accessors, count, 4));
+        let morph_position = morph_position_count
+            .map(|count| append_f32_accessor(&mut bin, &mut views, &mut accessors, count, 3));
+        let morph_normal = morph_normal_count
+            .map(|count| append_f32_accessor(&mut bin, &mut views, &mut accessors, count, 3));
+
+        let mut attributes = serde_json::Map::new();
+        attributes.insert("POSITION".to_owned(), json!(position));
+        if let Some(normal) = normal {
+            attributes.insert("NORMAL".to_owned(), json!(normal));
+        }
+        if let Some(joints) = joints {
+            attributes.insert("JOINTS_0".to_owned(), json!(joints));
+        }
+        if let Some(weights) = weights {
+            attributes.insert("WEIGHTS_0".to_owned(), json!(weights));
+        }
+        let mut primitive = json!({"attributes": attributes});
+        let mut targets = Vec::new();
+        let mut target = serde_json::Map::new();
+        if let Some(position) = morph_position {
+            target.insert("POSITION".to_owned(), json!(position));
+        }
+        if let Some(normal) = morph_normal {
+            target.insert("NORMAL".to_owned(), json!(normal));
+        }
+        if !target.is_empty() {
+            targets.push(Value::Object(target));
+            primitive["targets"] = Value::Array(targets);
+        }
+
+        glb_from_json(
+            json!({
+                "asset": {"version": "2.0"},
+                "scene": 0,
+                "scenes": [{"nodes": [0]}],
+                "nodes": [{"mesh": 0}],
+                "meshes": [{"primitives": [primitive]}],
+                "buffers": [{"byteLength": bin.len()}],
+                "bufferViews": views,
+                "accessors": accessors
+            }),
+            &bin,
+        )
+    }
+
+    fn animation_fixture(
+        input_count: usize,
+        output_count: usize,
+        output_components: usize,
+        path: &str,
+    ) -> Vec<u8> {
+        animation_fixture_with_interpolation(
+            input_count,
+            output_count,
+            output_components,
+            path,
+            "LINEAR",
+        )
+    }
+
+    fn animation_fixture_with_interpolation(
+        input_count: usize,
+        output_count: usize,
+        output_components: usize,
+        path: &str,
+        interpolation: &str,
+    ) -> Vec<u8> {
+        let mut bin = Vec::new();
+        let mut views = Vec::new();
+        let mut accessors = Vec::new();
+        let input = append_f32_accessor(&mut bin, &mut views, &mut accessors, input_count, 1);
+        let output = append_f32_accessor(
+            &mut bin,
+            &mut views,
+            &mut accessors,
+            output_count,
+            output_components,
+        );
+        glb_from_json(
+            json!({
+                "asset": {"version": "2.0"},
+                "scene": 0,
+                "scenes": [{"nodes": [0]}],
+                "nodes": [{}],
+                "animations": [{
+                    "samplers": [{"input": input, "output": output, "interpolation": interpolation}],
+                    "channels": [{"sampler": 0, "target": {"node": 0, "path": path}}]
+                }],
+                "buffers": [{"byteLength": bin.len()}],
+                "bufferViews": views,
+                "accessors": accessors
+            }),
+            &bin,
+        )
+    }
+
+    fn animation_fixture_with_duplicate_times() -> Vec<u8> {
+        let mut bytes = animation_fixture(2, 2, 3, "translation");
+        let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let input_start = 12 + 8 + json_len + 8;
+        bytes[input_start + 4..input_start + 8].copy_from_slice(&0.0f32.to_le_bytes());
+        bytes
+    }
+
+    fn zero_rotation_animation_fixture() -> Vec<u8> {
+        let mut bytes = animation_fixture(1, 1, 4, "rotation");
+        let json_len = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let output_start = 12 + 8 + json_len + 8 + 4;
+        for offset in (output_start..output_start + 16).step_by(4) {
+            bytes[offset..offset + 4].copy_from_slice(&0.0f32.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn unlit_fixture() -> Vec<u8> {
+        let mut bin = Vec::new();
+        let mut views = Vec::new();
+        let mut accessors = Vec::new();
+        let position = append_f32_accessor(&mut bin, &mut views, &mut accessors, 3, 3);
+        glb_from_json(
+            json!({
+                "asset": {"version": "2.0"},
+                "extensionsUsed": ["KHR_materials_unlit", "X_TEST_VALIDATED"],
+                "extensionsRequired": ["KHR_materials_unlit", "X_TEST_VALIDATED"],
+                "scene": 0,
+                "scenes": [{"nodes": [0]}],
+                "nodes": [{"mesh": 0}],
+                "meshes": [{"primitives": [{"attributes": {"POSITION": position}, "material": 0}]}],
+                "materials": [{"extensions": {"KHR_materials_unlit": {}}, "doubleSided": true}],
+                "buffers": [{"byteLength": bin.len()}],
+                "bufferViews": views,
+                "accessors": accessors
+            }),
+            &bin,
+        )
     }
 
     #[test]
     fn embedded_glb_imports_from_memory() {
-        let (doc, buffers, images) = import_glb_slice(&minimal_glb(), "embedded-test.glb").unwrap();
+        let (doc, buffers, images) =
+            import_glb_slice(&minimal_glb(), "embedded-test.glb", &[]).unwrap();
+        assert_eq!(doc.scenes().count(), 1);
+        assert!(buffers.is_empty());
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn unknown_glb_chunks_are_ignored() {
+        let (doc, buffers, images) = import_glb_slice(
+            &append_unknown_chunk(minimal_glb()),
+            "unknown-chunk.glb",
+            &[],
+        )
+        .unwrap();
         assert_eq!(doc.scenes().count(), 1);
         assert!(buffers.is_empty());
         assert!(images.is_empty());
@@ -1709,8 +2847,251 @@ mod tests {
 
     #[test]
     fn embedded_glb_error_includes_label() {
-        let err = import_glb_slice(b"not a glb", "player.glb").unwrap_err();
+        let err = import_glb_slice(b"not a glb", "player.glb", &[]).unwrap_err();
         assert!(format!("{err:#}").contains("player.glb"));
+    }
+
+    #[test]
+    fn byte_loader_rejects_external_buffer_uri() {
+        let bytes = glb_from_json(
+            json!({
+                "asset": {"version": "2.0"},
+                "buffers": [{"uri": "relative.bin", "byteLength": 4}],
+                "scene": 0,
+                "scenes": [{"nodes": []}]
+            }),
+            &[],
+        );
+        let err = import_glb_slice(&bytes, "external.glb", &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("external buffer URI"));
+        assert!(format!("{err:#}").contains("not allowed for byte-loaded GLB"));
+    }
+
+    #[test]
+    fn data_uri_buffer_imports_from_memory() {
+        let bytes = glb_from_json(
+            json!({
+                "asset": {"version": "2.0"},
+                "scene": 0,
+                "scenes": [{"nodes": []}],
+                "buffers": [{"uri": "data:application/octet-stream;base64,AQIDBA==", "byteLength": 4}]
+            }),
+            &[],
+        );
+        let (_, buffers, _) = import_glb_slice(&bytes, "data-buffer.glb", &[]).unwrap();
+        assert_eq!(&buffers[0].0[..4], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn data_uri_image_imports_from_memory() {
+        let (_, _, images) =
+            import_glb_slice(&data_uri_image_glb(2, 1), "data-image.glb", &[]).unwrap();
+        assert_eq!((images[0].width, images[0].height), (2, 1));
+        assert_eq!(images[0].format, gltf::image::Format::R8G8B8A8);
+    }
+
+    #[test]
+    fn bytes_image_decode_preserves_downsampling_behavior() {
+        let (_, _, images) = import_glb_slice_with_options(
+            &data_uri_image_glb(2, 1),
+            "limited-image.glb",
+            &[],
+            Some(1),
+        )
+        .unwrap();
+        let (pixels, width, height) = cap_texture_rgba(
+            to_rgba8(&images[0]),
+            images[0].width,
+            images[0].height,
+            Some(1),
+        );
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(pixels.len(), 4);
+    }
+
+    #[test]
+    fn byte_image_budget_rejects_cumulative_decoded_bytes() {
+        let mut budget = ByteImageBudget::default();
+        for image_index in 0..(MAX_BYTE_IMAGE_BYTES / (4096 * 4096 * 4)) as usize {
+            budget
+                .reserve(image_index, 4096, 4096, "budget.glb")
+                .unwrap();
+        }
+        let err = budget.reserve(4, 4096, 4096, "budget.glb").unwrap_err();
+        assert!(format!("{err:#}").contains("decoded image byte budget"));
+    }
+
+    #[test]
+    fn byte_image_budget_rejects_excessive_image_count() {
+        let mut budget = ByteImageBudget::default();
+        for image_index in 0..MAX_BYTE_IMAGE_COUNT {
+            budget.reserve(image_index, 1, 1, "count.glb").unwrap();
+        }
+        let err = budget
+            .reserve(MAX_BYTE_IMAGE_COUNT, 1, 1, "count.glb")
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("decoded images"));
+    }
+
+    #[test]
+    fn oversized_joint_palette_returns_loader_error() {
+        let err = validate_joint_palette_count(513, Path::new("oversized-rig.glb")).unwrap_err();
+        assert!(format!("{err:#}").contains("combined skin joint count 513"));
+        assert!(format!("{err:#}").contains("limit 512"));
+    }
+
+    #[test]
+    fn caller_validated_required_extension_is_tolerated_without_disabling_core_validation() {
+        let bytes = glb_from_json(
+            json!({
+                "asset": {"version": "2.0"},
+                "extensionsUsed": ["X_TEST_VALIDATED"],
+                "extensionsRequired": ["X_TEST_VALIDATED"],
+                "scene": 0,
+                "scenes": [{"nodes": []}]
+            }),
+            &[],
+        );
+        let (doc, buffers, images) = import_glb_slice(
+            &bytes,
+            "validated-extension.glb",
+            &["X_TEST_VALIDATED".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(doc.scenes().count(), 1);
+        assert!(buffers.is_empty());
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn unknown_required_extension_is_rejected() {
+        let bytes = glb_from_json(
+            json!({
+                "asset": {"version": "2.0"},
+                "extensionsRequired": ["X_TEST_UNKNOWN"],
+                "scene": 0,
+                "scenes": [{"nodes": []}]
+            }),
+            &[],
+        );
+        let err = import_glb_slice(&bytes, "unknown-extension.glb", &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("required extension X_TEST_UNKNOWN"));
+        assert!(format!("{err:#}").contains("not enabled or caller-validated"));
+    }
+
+    #[test]
+    fn odd_texture_dimensions_are_capped_by_max_texture_dim() {
+        let rgba = vec![255u8; 5 * 3 * 4];
+        let (rgba, width, height) = cap_texture_rgba(rgba, 5, 3, Some(2));
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(rgba.len(), (width * height * 4) as usize);
+    }
+
+    fn validate_fixture(bytes: &[u8]) -> anyhow::Error {
+        let (doc, buffers, _) = import_glb_slice(bytes, "malformed.glb", &[]).unwrap();
+        validate_model_input(&doc, &buffers, Path::new("malformed.glb")).unwrap_err()
+    }
+
+    #[test]
+    fn short_normal_accessor_returns_loader_error() {
+        let err = validate_fixture(&mesh_fixture(Some(3), None, None, None, None));
+        assert!(format!("{err:#}").contains("NORMAL accessor count 3"));
+        assert!(format!("{err:#}").contains("POSITION count 4"));
+    }
+
+    #[test]
+    fn short_joints_accessor_returns_loader_error() {
+        let err = validate_fixture(&mesh_fixture(None, Some(3), None, None, None));
+        assert!(format!("{err:#}").contains("JOINTS_0 accessor count 3"));
+        assert!(format!("{err:#}").contains("POSITION count 4"));
+    }
+
+    #[test]
+    fn short_weights_accessor_returns_loader_error() {
+        let err = validate_fixture(&mesh_fixture(None, None, Some(3), None, None));
+        assert!(format!("{err:#}").contains("WEIGHTS_0 accessor count 3"));
+        assert!(format!("{err:#}").contains("POSITION count 4"));
+    }
+
+    #[test]
+    fn morph_target_count_mismatch_returns_loader_error() {
+        let err = validate_fixture(&mesh_fixture(None, None, None, Some(3), None));
+        assert!(format!("{err:#}").contains("morph POSITION target 0 accessor count 3"));
+        assert!(format!("{err:#}").contains("POSITION count 4"));
+    }
+
+    #[test]
+    fn zero_animation_keys_return_loader_error() {
+        let err = validate_fixture(&animation_fixture(0, 1, 3, "translation"));
+        assert!(format!("{err:#}").contains("has zero input keys"));
+    }
+
+    #[test]
+    fn animation_input_output_mismatch_returns_loader_error() {
+        let err = validate_fixture(&animation_fixture(2, 1, 3, "translation"));
+        assert!(format!("{err:#}").contains("animation channel output count 1"));
+        assert!(format!("{err:#}").contains("input key count 2"));
+    }
+
+    #[test]
+    fn duplicate_animation_times_return_loader_error() {
+        let err = validate_fixture(&animation_fixture_with_duplicate_times());
+        assert!(format!("{err:#}").contains("invalid or unsorted input keys"));
+    }
+
+    #[test]
+    fn cubic_spline_requires_two_keys() {
+        let err = validate_fixture(&animation_fixture_with_interpolation(
+            1,
+            3,
+            3,
+            "translation",
+            "CUBICSPLINE",
+        ));
+        assert!(format!("{err:#}").contains("fewer than two CUBICSPLINE keys"));
+    }
+
+    #[test]
+    fn zero_rotation_quaternion_returns_loader_error() {
+        let err = validate_fixture(&zero_rotation_animation_fixture());
+        assert!(format!("{err:#}").contains("zero or non-finite rotation quaternion"));
+    }
+
+    #[test]
+    fn malformed_rotation_output_returns_loader_error() {
+        let err = validate_fixture(&animation_fixture(1, 1, 3, "rotation"));
+        assert!(format!("{err:#}").contains("output dimensions incompatible with its target"));
+    }
+
+    #[test]
+    fn valid_animation_fixture_passes_loader_validation() {
+        let bytes = animation_fixture(2, 2, 3, "translation");
+        let (doc, buffers, _) = import_glb_slice(&bytes, "valid-animation.glb", &[]).unwrap();
+        validate_model_input(&doc, &buffers, Path::new("valid-animation.glb")).unwrap();
+    }
+
+    #[test]
+    fn bytes_options_and_unlit_material_load_into_existing_primitive_state() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for this loader test");
+        let samplers = Samplers::new(&gpu);
+        let layout = ModelAsset::material_layout(&gpu);
+        let opts = ModelLoadOptions {
+            max_texture_dim: Some(4),
+            ..Default::default()
+        };
+        let asset = ModelAsset::load_glb_bytes_opts_with_allowed_required_extensions(
+            &gpu,
+            &layout,
+            &samplers,
+            &unlit_fixture(),
+            "unlit.glb",
+            &opts,
+            ["X_TEST_VALIDATED"],
+        )
+        .unwrap();
+        assert_eq!(asset.primitives.len(), 1);
+        assert!(asset.primitives[0].unlit);
+        assert!(asset.primitives[0].double_sided);
     }
 
     #[test]

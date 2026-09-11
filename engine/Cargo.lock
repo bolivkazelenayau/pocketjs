@@ -1860,10 +1860,12 @@ name = "pocket3d"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "bytemuck",
  "font8x8",
  "glam",
  "gltf",
+ "image",
  "log",
  "png",
  "pocket3d-bsp",

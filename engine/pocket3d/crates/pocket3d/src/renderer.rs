@@ -884,8 +884,8 @@ impl Renderer {
 
 const INSTANCE_STRIDE: u64 = 256;
 const JOINT_ALIGN: u64 = 256;
-/// Fixed window each draw binds from the joints buffer: 512 mat4s (32 KB —
-/// VRoid-style humanoid rigs carry ~270 joints across their skins).
+/// Fixed window each draw binds from the joints buffer: 512 mat4s (32 KB),
+/// sized for typical articulated character skins.
 const JOINT_WINDOW: u64 = 512 * 64;
 
 #[repr(C)]

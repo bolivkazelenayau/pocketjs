@@ -1,5 +1,6 @@
 //! Skeletal animation: clips of TRS channels sampled onto a node hierarchy.
 
+use anyhow::{Result, bail};
 use glam::{Mat4, Quat, Vec3};
 
 #[derive(Clone, Copy, Debug)]
@@ -44,6 +45,64 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// Validate the invariants required by [`Self::sample`].
+    ///
+    /// glTF input is checked before channels are constructed, but keeping the
+    /// check here makes the sampling contract explicit for other callers too.
+    pub fn validate(&self) -> Result<()> {
+        if self.times.is_empty() {
+            bail!("animation channel has no key times");
+        }
+        if self
+            .times
+            .iter()
+            .any(|time| !time.is_finite() || *time < 0.0)
+        {
+            bail!("animation channel has invalid key times");
+        }
+        if self.times.windows(2).any(|window| window[1] <= window[0]) {
+            bail!("animation channel key times are not sorted");
+        }
+
+        let values_per_key = match self.path {
+            ChannelPath::Translation | ChannelPath::Scale => 3,
+            ChannelPath::Rotation => 4,
+        };
+        let expected_values = self
+            .times
+            .len()
+            .checked_mul(values_per_key)
+            .ok_or_else(|| anyhow::anyhow!("animation channel value count overflows"))?;
+        if self.values.len() != expected_values {
+            bail!(
+                "animation channel value count {} does not match {} key(s) of {} component(s)",
+                self.values.len(),
+                self.times.len(),
+                values_per_key
+            );
+        }
+        if self.values.iter().any(|value| !value.is_finite()) {
+            bail!("animation channel has non-finite values");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_rotation_keys(&self, cubic_spline: bool) -> Result<()> {
+        if self.path != ChannelPath::Rotation {
+            return Ok(());
+        }
+        let stride = if cubic_spline { 3 } else { 1 };
+        for key in 0..self.times.len() {
+            let value_index = (key * stride + usize::from(cubic_spline)) * 4;
+            let q = &self.values[value_index..value_index + 4];
+            let length_squared = q.iter().map(|value| value * value).sum::<f32>();
+            if !length_squared.is_finite() || length_squared <= 1.0e-12 {
+                bail!("animation rotation key {key} has a zero or non-finite quaternion");
+            }
+        }
+        Ok(())
+    }
+
     fn key_span(&self, t: f32) -> (usize, usize, f32) {
         let times = &self.times;
         if times.is_empty() {
@@ -74,16 +133,33 @@ impl Channel {
 
     fn quat_at(&self, key: usize) -> Quat {
         let i = key * 4;
-        Quat::from_xyzw(
+        let q = Quat::from_xyzw(
             self.values[i],
             self.values[i + 1],
             self.values[i + 2],
             self.values[i + 3],
-        )
-        .normalize()
+        );
+        if !q.length_squared().is_finite() || q.length_squared() <= 1.0e-12 {
+            Quat::IDENTITY
+        } else {
+            q.normalize()
+        }
     }
 
     pub fn sample(&self, t: f32, out: &mut NodeTrs) {
+        let values_per_key = match self.path {
+            ChannelPath::Translation | ChannelPath::Scale => 3,
+            ChannelPath::Rotation => 4,
+        };
+        let Some(&first_time) = self.times.first() else {
+            return;
+        };
+        let Some(required_values) = self.times.len().checked_mul(values_per_key) else {
+            return;
+        };
+        if !t.is_finite() || !first_time.is_finite() || self.values.len() < required_values {
+            return;
+        }
         let (lo, hi, f) = self.key_span(t);
         let f = if self.interpolation == Interpolation::Step {
             0.0
@@ -117,6 +193,25 @@ pub struct Skeleton {
     pub rest: Vec<NodeTrs>,
     /// Indices into nodes, ordered so parents precede children.
     pub order: Vec<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Channel, ChannelPath, Interpolation, NodeTrs};
+
+    #[test]
+    fn sample_ignores_nonfinite_first_timestamp() {
+        let channel = Channel {
+            node: 0,
+            path: ChannelPath::Translation,
+            interpolation: Interpolation::Linear,
+            times: vec![f32::NAN],
+            values: vec![1.0, 2.0, 3.0],
+        };
+        let mut output = NodeTrs::IDENTITY;
+        channel.sample(0.0, &mut output);
+        assert_eq!(output.translation, NodeTrs::IDENTITY.translation);
+    }
 }
 
 impl Skeleton {
