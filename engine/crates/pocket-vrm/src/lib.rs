@@ -4,8 +4,8 @@
 //! behavior stay in the host):
 //! - **Parsing**: the `extensions.VRM` block of a `.vrm` GLB — humanoid bone
 //!   map, blend-shape expressions, spring-bone config, look-at ranges, MToon
-//!   material facts — into plain-data structs ([`VrmDoc`]). VRM 1.0 files
-//!   are rejected with a clear error.
+//!   material facts — into plain-data structs ([`VrmDoc`]). The additive
+//!   [`Vrm1Doc`] parser handles minimal VRM 1.0 semantic facts separately.
 //! - **Spring bones**: UniVRM-style verlet simulation ([`SpringSolver`])
 //!   writing local rotations into a pocket3d skeleton pose.
 //! - **VRMA**: `.vrma` (VRMC_vrm_animation) loading and humanoid retargeting
@@ -26,6 +26,7 @@ pub mod glb;
 pub mod lookat;
 pub mod parse;
 pub mod spring;
+pub mod vrm1;
 pub mod vrma;
 
 pub use lookat::apply_eye_look;
@@ -34,4 +35,5 @@ pub use parse::{
     SpringGroup, VrmDoc, VrmExpression, VrmMaterialInfo, VrmMeta,
 };
 pub use spring::SpringSolver;
+pub use vrm1::{Vrm1Doc, Vrm1ExtensionInfo, Vrm1HumanBone, Vrm1Humanoid, Vrm1Meta};
 pub use vrma::{VrmaDoc, load_vrma_bytes, retarget};
