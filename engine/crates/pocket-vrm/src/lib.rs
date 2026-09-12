@@ -35,5 +35,8 @@ pub use parse::{
     SpringGroup, VrmDoc, VrmExpression, VrmMaterialInfo, VrmMeta,
 };
 pub use spring::SpringSolver;
-pub use vrm1::{Vrm1Doc, Vrm1ExtensionInfo, Vrm1HumanBone, Vrm1Humanoid, Vrm1Meta};
+pub use vrm1::{
+    Vrm1Doc, Vrm1Expression, Vrm1ExpressionKind, Vrm1ExpressionOverride, Vrm1ExtensionInfo,
+    Vrm1HumanBone, Vrm1Humanoid, Vrm1Meta, Vrm1MorphTargetBind,
+};
 pub use vrma::{HumanoidView, VrmaDoc, load_vrma_bytes, retarget, retarget_with_humanoid};

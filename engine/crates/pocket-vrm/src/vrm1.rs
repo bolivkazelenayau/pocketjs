@@ -242,21 +242,70 @@ pub struct Vrm1ExtensionInfo {
     pub version: Option<String>,
 }
 
+/// Whether a VRM 1.0 expression came from the preset or custom expression
+/// namespace.  The namespaces remain distinct in the parser even though the
+/// host addresses both with the expression's authored name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vrm1ExpressionKind {
+    Preset,
+    Custom,
+}
+
+/// VRM 1.0's blink/eye/mouth override mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vrm1ExpressionOverride {
+    None,
+    Block,
+    Blend,
+}
+
+/// A typed morph target bind from a VRM 1.0 expression.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vrm1MorphTargetBind {
+    pub node: usize,
+    pub index: usize,
+    pub weight: f32,
+}
+
+/// The expression semantics retained from VRMC_vrm.  Material and texture
+/// binds are intentionally represented only by presence: this first runtime
+/// slice is morph-only, but their presence still affects validation and
+/// diagnostics in the host.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vrm1Expression {
+    pub name: String,
+    pub kind: Vrm1ExpressionKind,
+    pub morph_target_binds: Vec<Vrm1MorphTargetBind>,
+    pub is_binary: bool,
+    pub override_blink: Vrm1ExpressionOverride,
+    pub override_look_at: Vrm1ExpressionOverride,
+    pub override_mouth: Vrm1ExpressionOverride,
+    pub has_material_color_binds: bool,
+    pub has_texture_transform_binds: bool,
+}
+
 /// Minimal, structurally validated VRM 1.0 semantic facts.
 ///
 /// This is not full humanoid conformance validation: ancestry, positive bone
 /// scales, and runtime retargeting rules remain outside this API.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Vrm1Doc {
     pub meta: Vrm1Meta,
     pub humanoid: Vrm1Humanoid,
     pub materials_mtoon: Vrm1ExtensionInfo,
     pub spring_bone: Vrm1ExtensionInfo,
     pub node_constraint: Vrm1ExtensionInfo,
+    pub expressions: Vec<Vrm1Expression>,
     pub has_expressions: bool,
     pub has_look_at: bool,
     pub has_first_person: bool,
     pub node_count: usize,
+    /// glTF mesh index for each glTF node, when the node has a mesh.
+    pub node_meshes: Vec<Option<usize>>,
+    /// Primitive count for each glTF mesh.  The parent uses this to reject a
+    /// morph bind when even one primitive of the referenced mesh cannot carry
+    /// the target.
+    pub mesh_primitive_counts: Vec<usize>,
 }
 
 impl Vrm1Doc {
@@ -288,12 +337,15 @@ impl Vrm1Doc {
             "VRMC_vrm specVersion must be \"1.0\", got \"{spec_version}\""
         );
 
-        let node_children = validate_nodes(&glb.json)?;
+        let (node_children, node_meshes, mesh_primitive_counts) = validate_nodes(&glb.json)?;
         let meta = parse_meta(vrm)?;
         let humanoid = parse_humanoid(vrm, node_children.len())?;
         let materials_mtoon =
             extension_info_in_array(&glb.json, "materials", "VRMC_materials_mtoon")?;
         let node_constraint = extension_info_in_array(&glb.json, "nodes", "VRMC_node_constraint")?;
+
+        let has_expressions = vrm.contains_key("expressions");
+        let expressions = parse_expressions(vrm)?;
 
         Ok(Self {
             meta,
@@ -301,12 +353,206 @@ impl Vrm1Doc {
             materials_mtoon,
             spring_bone: extension_info(extensions, "VRMC_springBone")?,
             node_constraint,
-            has_expressions: optional_object(vrm, "expressions")?,
+            expressions,
+            has_expressions,
             has_look_at: optional_object(vrm, "lookAt")?,
             has_first_person: optional_object(vrm, "firstPerson")?,
             node_count: node_children.len(),
+            node_meshes,
+            mesh_primitive_counts,
         })
     }
+}
+
+fn parse_expressions(vrm: &Map<String, Value>) -> Result<Vec<Vrm1Expression>> {
+    let Some(value) = vrm.get("expressions") else {
+        return Ok(Vec::new());
+    };
+    let expressions = value
+        .as_object()
+        .context("VRMC_vrm.expressions must be an object when present")?;
+    let mut parsed = Vec::new();
+    parse_expression_group(
+        expressions,
+        "preset",
+        Vrm1ExpressionKind::Preset,
+        &mut parsed,
+    )?;
+    parse_expression_group(
+        expressions,
+        "custom",
+        Vrm1ExpressionKind::Custom,
+        &mut parsed,
+    )?;
+    Ok(parsed)
+}
+
+fn parse_expression_group(
+    expressions: &Map<String, Value>,
+    group_name: &str,
+    kind: Vrm1ExpressionKind,
+    output: &mut Vec<Vrm1Expression>,
+) -> Result<()> {
+    let Some(value) = expressions.get(group_name) else {
+        return Ok(());
+    };
+    let group = value.as_object().with_context(|| {
+        format!("VRMC_vrm.expressions.{group_name} must be an object when present")
+    })?;
+    for (name, value) in group {
+        let expression = value.as_object().with_context(|| {
+            format!("VRMC_vrm.expressions.{group_name}.{name} must be an object")
+        })?;
+        output.push(parse_expression(name, kind, expression)?);
+    }
+    Ok(())
+}
+
+fn parse_expression(
+    name: &str,
+    kind: Vrm1ExpressionKind,
+    expression: &Map<String, Value>,
+) -> Result<Vrm1Expression> {
+    if kind == Vrm1ExpressionKind::Preset {
+        ensure!(
+            is_canonical_preset_name(name),
+            "unknown VRM 1.0 preset expression {name:?}"
+        );
+    } else {
+        ensure!(
+            !is_canonical_preset_name(name),
+            "custom VRM 1.0 expression name {name:?} conflicts with a preset"
+        );
+    }
+    let morph_target_binds = match expression.get("morphTargetBinds") {
+        None => Vec::new(),
+        Some(value) => {
+            let binds = value
+                .as_array()
+                .with_context(|| format!("expression {name}.morphTargetBinds must be an array"))?;
+            let mut parsed = Vec::with_capacity(binds.len());
+            for (bind_index, value) in binds.iter().enumerate() {
+                let bind = value.as_object().with_context(|| {
+                    format!("expression {name}.morphTargetBinds[{bind_index}] must be an object")
+                })?;
+                let node = required_usize(bind, "node", &format!("expression {name} morph bind"))?;
+                let index =
+                    required_usize(bind, "index", &format!("expression {name} morph bind"))?;
+                let weight =
+                    required_f32(bind, "weight", &format!("expression {name} morph bind"))?;
+                parsed.push(Vrm1MorphTargetBind {
+                    node,
+                    index,
+                    weight,
+                });
+            }
+            parsed
+        }
+    };
+
+    Ok(Vrm1Expression {
+        name: name.to_owned(),
+        kind,
+        morph_target_binds,
+        is_binary: optional_bool(expression, "isBinary", name)?.unwrap_or(false),
+        override_blink: parse_override(expression, "overrideBlink", name)?,
+        override_look_at: parse_override(expression, "overrideLookAt", name)?,
+        override_mouth: parse_override(expression, "overrideMouth", name)?,
+        has_material_color_binds: optional_array_presence(expression, "materialColorBinds", name)?,
+        has_texture_transform_binds: optional_array_presence(
+            expression,
+            "textureTransformBinds",
+            name,
+        )?,
+    })
+}
+
+fn is_canonical_preset_name(name: &str) -> bool {
+    matches!(
+        name,
+        "neutral"
+            | "happy"
+            | "angry"
+            | "sad"
+            | "relaxed"
+            | "surprised"
+            | "aa"
+            | "ih"
+            | "ou"
+            | "ee"
+            | "oh"
+            | "blink"
+            | "blinkLeft"
+            | "blinkRight"
+            | "lookUp"
+            | "lookDown"
+            | "lookLeft"
+            | "lookRight"
+    )
+}
+
+fn required_usize(object: &Map<String, Value>, key: &str, context: &str) -> Result<usize> {
+    let value = object
+        .get(key)
+        .with_context(|| format!("{context} is missing required {key}"))?
+        .as_u64()
+        .with_context(|| format!("{context}.{key} must be an integer"))?;
+    usize::try_from(value).with_context(|| format!("{context}.{key} does not fit in usize"))
+}
+
+fn required_f32(object: &Map<String, Value>, key: &str, context: &str) -> Result<f32> {
+    let value = object
+        .get(key)
+        .with_context(|| format!("{context} is missing required {key}"))?
+        .as_f64()
+        .with_context(|| format!("{context}.{key} must be a number"))?;
+    Ok(value as f32)
+}
+
+fn optional_bool(object: &Map<String, Value>, key: &str, context: &str) -> Result<Option<bool>> {
+    let Some(value) = object.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .with_context(|| format!("expression {context}.{key} must be a boolean"))
+}
+
+fn parse_override(
+    object: &Map<String, Value>,
+    key: &str,
+    expression_name: &str,
+) -> Result<Vrm1ExpressionOverride> {
+    let Some(value) = object.get(key) else {
+        return Ok(Vrm1ExpressionOverride::None);
+    };
+    let value = value.as_str().with_context(|| {
+        format!("expression {expression_name}.{key} must be one of none, block, blend")
+    })?;
+    match value {
+        "none" => Ok(Vrm1ExpressionOverride::None),
+        "block" => Ok(Vrm1ExpressionOverride::Block),
+        "blend" => Ok(Vrm1ExpressionOverride::Blend),
+        _ => bail!(
+            "expression {expression_name}.{key} must be one of none, block, blend, got {value:?}"
+        ),
+    }
+}
+
+fn optional_array_presence(
+    object: &Map<String, Value>,
+    key: &str,
+    expression_name: &str,
+) -> Result<bool> {
+    let Some(value) = object.get(key) else {
+        return Ok(false);
+    };
+    ensure!(
+        value.is_array(),
+        "expression {expression_name}.{key} must be an array when present"
+    );
+    Ok(true)
 }
 
 fn required_string(object: &Map<String, Value>, key: &str, context: &str) -> Result<String> {
@@ -493,19 +739,59 @@ fn optional_object(vrm: &Map<String, Value>, name: &str) -> Result<bool> {
     Ok(true)
 }
 
-fn validate_nodes(json: &Value) -> Result<Vec<Vec<usize>>> {
+fn validate_nodes(json: &Value) -> Result<(Vec<Vec<usize>>, Vec<Option<usize>>, Vec<usize>)> {
     let nodes = json
         .get("nodes")
         .context("GLB is missing required glTF nodes array")?
         .as_array()
         .context("glTF nodes must be an array")?;
     let count = nodes.len();
+    let mesh_primitive_counts = match json.get("meshes") {
+        None => Vec::new(),
+        Some(value) => {
+            let meshes = value.as_array().context("glTF meshes must be an array")?;
+            let mut counts = Vec::with_capacity(meshes.len());
+            for (index, mesh) in meshes.iter().enumerate() {
+                let mesh = mesh
+                    .as_object()
+                    .with_context(|| format!("glTF mesh {index} must be an object"))?;
+                let primitives = mesh
+                    .get("primitives")
+                    .with_context(|| format!("glTF mesh {index} is missing primitives"))?
+                    .as_array()
+                    .with_context(|| format!("glTF mesh {index}.primitives must be an array"))?;
+                counts.push(primitives.len());
+            }
+            counts
+        }
+    };
+    let mesh_count = json.get("meshes").map(|_| mesh_primitive_counts.len());
     let mut children = Vec::with_capacity(count);
+    let mut node_meshes = Vec::with_capacity(count);
     let mut parent = vec![None; count];
     for (index, node) in nodes.iter().enumerate() {
         let node = node
             .as_object()
             .with_context(|| format!("glTF node {index} must be an object"))?;
+        let mesh = match node.get("mesh") {
+            None => None,
+            Some(value) => {
+                let mesh = value
+                    .as_u64()
+                    .with_context(|| format!("glTF node {index}.mesh must be an integer"))?;
+                let mesh = usize::try_from(mesh)
+                    .with_context(|| format!("glTF node {index}.mesh index is too large"))?;
+                let mesh_count = mesh_count.with_context(|| {
+                    format!("glTF node {index}.mesh is present but meshes is missing")
+                })?;
+                ensure!(
+                    mesh < mesh_count,
+                    "glTF node {index}.mesh {mesh} is out of range for {mesh_count} meshes"
+                );
+                Some(mesh)
+            }
+        };
+        node_meshes.push(mesh);
         let mut node_children = Vec::new();
         let mut seen = HashSet::new();
         if let Some(values) = node.get("children") {
@@ -564,7 +850,7 @@ fn validate_nodes(json: &Value) -> Result<Vec<Vec<usize>>> {
             }
         }
     }
-    Ok(children)
+    Ok((children, node_meshes, mesh_primitive_counts))
 }
 
 #[cfg(test)]
@@ -649,6 +935,109 @@ mod tests {
         assert_eq!(doc.spring_bone.version.as_deref(), Some("1.0"));
         assert!(doc.node_constraint.present);
         assert_eq!(doc.node_constraint.version.as_deref(), Some("1.0"));
+        assert_eq!(doc.node_meshes.len(), doc.node_count);
+        assert!(doc.node_meshes.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn expressions_retain_preset_custom_and_unsupported_semantics() {
+        let mut value = valid_document();
+        value["extensions"]["VRMC_vrm"]["expressions"] = json!({
+            "preset": {
+                "blink": {
+                    "morphTargetBinds": [{ "node": 2, "index": 3, "weight": 0.75 }],
+                    "isBinary": true,
+                    "overrideBlink": "block",
+                    "overrideLookAt": "blend",
+                    "overrideMouth": "none",
+                    "materialColorBinds": [],
+                    "textureTransformBinds": []
+                }
+            },
+            "custom": {
+                "MyFace": {
+                    "morphTargetBinds": [{ "node": 3, "index": 1, "weight": 1.0 }]
+                }
+            }
+        });
+        let doc = parse(value).unwrap();
+        assert_eq!(doc.expressions.len(), 2);
+        let blink = &doc.expressions[0];
+        assert_eq!(blink.name, "blink");
+        assert_eq!(blink.kind, Vrm1ExpressionKind::Preset);
+        assert_eq!(blink.morph_target_binds[0].node, 2);
+        assert_eq!(blink.morph_target_binds[0].index, 3);
+        assert_eq!(blink.morph_target_binds[0].weight, 0.75);
+        assert!(blink.is_binary);
+        assert_eq!(blink.override_blink, Vrm1ExpressionOverride::Block);
+        assert_eq!(blink.override_look_at, Vrm1ExpressionOverride::Blend);
+        assert_eq!(blink.override_mouth, Vrm1ExpressionOverride::None);
+        assert!(blink.has_material_color_binds);
+        assert!(blink.has_texture_transform_binds);
+        assert_eq!(doc.expressions[1].kind, Vrm1ExpressionKind::Custom);
+        assert!(!doc.expressions[1].is_binary);
+    }
+
+    #[test]
+    fn node_mesh_mapping_is_retained_and_checked() {
+        let mut value = valid_document();
+        value["meshes"] = json!([{ "primitives": [] }]);
+        value["nodes"][0]["mesh"] = json!(0);
+        value["nodes"][1]["mesh"] = json!(0);
+        let doc = parse(value).unwrap();
+        assert_eq!(doc.node_meshes[0], Some(0));
+        assert_eq!(doc.node_meshes[1], Some(0));
+        assert!(doc.node_meshes[2].is_none());
+
+        let mut out_of_range = valid_document();
+        out_of_range["meshes"] = json!([{ "primitives": [] }]);
+        out_of_range["nodes"][0]["mesh"] = json!(1);
+        let error = parse(out_of_range).unwrap_err().to_string();
+        assert!(error.contains("node 0.mesh 1 is out of range"), "{error}");
+    }
+
+    #[test]
+    fn malformed_expression_structure_is_rejected() {
+        let mut non_object = valid_document();
+        non_object["extensions"]["VRMC_vrm"]["expressions"] = json!({
+            "preset": []
+        });
+        let error = parse(non_object).unwrap_err().to_string();
+        assert!(
+            error.contains("expressions.preset must be an object"),
+            "{error}"
+        );
+
+        let mut malformed_bind = valid_document();
+        malformed_bind["extensions"]["VRMC_vrm"]["expressions"] = json!({
+            "custom": {
+                "face": {
+                    "morphTargetBinds": [{ "node": 0, "index": "bad", "weight": 1.0 }]
+                }
+            }
+        });
+        let error = parse(malformed_bind).unwrap_err().to_string();
+        assert!(
+            error.contains("morph bind.index must be an integer"),
+            "{error}"
+        );
+
+        let mut malformed_override = valid_document();
+        malformed_override["extensions"]["VRMC_vrm"]["expressions"] = json!({
+            "custom": { "face": { "overrideBlink": "invalid" } }
+        });
+        let error = parse(malformed_override).unwrap_err().to_string();
+        assert!(error.contains("overrideBlink must be one of"), "{error}");
+    }
+
+    #[test]
+    fn custom_expression_cannot_use_a_canonical_preset_name() {
+        let mut value = valid_document();
+        value["extensions"]["VRMC_vrm"]["expressions"] = json!({
+            "custom": { "blink": {} }
+        });
+        let error = parse(value).unwrap_err().to_string();
+        assert!(error.contains("conflicts with a preset"), "{error}");
     }
 
     #[test]
