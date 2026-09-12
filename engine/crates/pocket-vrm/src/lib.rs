@@ -36,4 +36,4 @@ pub use parse::{
 };
 pub use spring::SpringSolver;
 pub use vrm1::{Vrm1Doc, Vrm1ExtensionInfo, Vrm1HumanBone, Vrm1Humanoid, Vrm1Meta};
-pub use vrma::{VrmaDoc, load_vrma_bytes, retarget};
+pub use vrma::{HumanoidView, VrmaDoc, load_vrma_bytes, retarget, retarget_with_humanoid};

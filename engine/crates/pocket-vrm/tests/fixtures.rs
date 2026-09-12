@@ -24,6 +24,20 @@ fn fixture(name: &str) -> Option<Vec<u8>> {
     }
 }
 
+fn bundled_fixture(name: &str) -> Option<Vec<u8>> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../..")
+        .join("assets")
+        .join(name);
+    match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            eprintln!("skipping: bundled fixture {} not found", path.display());
+            None
+        }
+    }
+}
+
 fn parse_model() -> Option<VrmDoc> {
     Some(VrmDoc::from_glb_bytes(&fixture("AvatarSample_A.vrm")?).expect("parse AvatarSample_A"))
 }
@@ -122,6 +136,35 @@ fn retargets_idle_loop_onto_model() {
         assert!(key[0].abs() < 1.0 && key[2].abs() < 1.0, "hips key {key:?}");
         assert!(key[1] > 0.5 && key[1] < 1.5, "hips height {key:?}");
     }
+}
+
+#[test]
+fn bundled_idle_loop_is_a_supported_vrma_animation() {
+    let Some(bytes) = bundled_fixture("idle_loop.vrma") else {
+        return;
+    };
+    let vrma = load_vrma_bytes(&bytes).expect("parse bundled idle_loop.vrma");
+    assert_eq!(vrma.humanoid.len(), 22);
+    assert_eq!(
+        vrma.channels
+            .iter()
+            .filter(|channel| {
+                channel.path == ChannelPath::Rotation
+                    && vrma.humanoid.iter().any(|(_, node)| *node == channel.node)
+            })
+            .count(),
+        21
+    );
+    assert_eq!(
+        vrma.channels
+            .iter()
+            .filter(|channel| {
+                channel.path == ChannelPath::Translation
+                    && vrma.humanoid.iter().any(|(_, node)| *node == channel.node)
+            })
+            .count(),
+        1
+    );
 }
 
 #[test]
