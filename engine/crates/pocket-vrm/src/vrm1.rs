@@ -1,27 +1,25 @@
-//! Minimal VRM 1.0 semantic facts parsed from a self-contained GLB.
+//! Typed VRM 1.0 semantic data, including the VRMC_springBone extension.
 //!
-//! This module intentionally does not load meshes, apply presentation
-//! transforms, or implement any VRM runtime systems. It only validates and
-//! retains the semantic information needed by a future host-side loader.
+//! Runtime objects and transforms deliberately do not live here. This module
+//! validates JSON indices and hierarchy relationships before an avatar
+//! candidate is committed.
 
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result, bail, ensure};
+use glam::Vec3;
 use serde_json::{Map, Value};
 
 use crate::glb;
 
-/// The metadata fields retained from VRMC_vrm.meta.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vrm1Meta {
     pub name: String,
-    /// Optional in the VRM 1.0 schema.
     pub version: Option<String>,
     pub authors: Vec<String>,
     pub license_url: String,
 }
 
-/// A typed VRM 1.0 humanoid bone name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Vrm1HumanBone {
     Hips,
@@ -82,7 +80,7 @@ pub enum Vrm1HumanBone {
 }
 
 impl Vrm1HumanBone {
-    const REQUIRED: &'static [Self] = &[
+    pub(crate) const REQUIRED: &'static [Self] = &[
         Self::Hips,
         Self::Spine,
         Self::Head,
@@ -99,7 +97,6 @@ impl Vrm1HumanBone {
         Self::RightLowerArm,
         Self::RightHand,
     ];
-
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
             "hips" => Self::Hips,
@@ -160,8 +157,6 @@ impl Vrm1HumanBone {
             _ => return None,
         })
     }
-
-    /// The spelling used as a key in humanoid.humanBones.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Hips => "hips",
@@ -223,54 +218,37 @@ impl Vrm1HumanBone {
     }
 }
 
-/// Validated VRM 1.0 human-bone to glTF-node mapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vrm1Humanoid {
     pub human_bones: BTreeMap<Vrm1HumanBone, usize>,
 }
-
 impl Vrm1Humanoid {
     pub fn node_for(&self, bone: Vrm1HumanBone) -> Option<usize> {
         self.human_bones.get(&bone).copied()
     }
 }
-
-/// Presence and declared version of a recognized VRM 1.0 extension.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Vrm1ExtensionInfo {
     pub present: bool,
     pub version: Option<String>,
 }
-
-/// Whether a VRM 1.0 expression came from the preset or custom expression
-/// namespace.  The namespaces remain distinct in the parser even though the
-/// host addresses both with the expression's authored name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Vrm1ExpressionKind {
     Preset,
     Custom,
 }
-
-/// VRM 1.0's blink/eye/mouth override mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Vrm1ExpressionOverride {
     None,
     Block,
     Blend,
 }
-
-/// A typed morph target bind from a VRM 1.0 expression.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vrm1MorphTargetBind {
     pub node: usize,
     pub index: usize,
     pub weight: f32,
 }
-
-/// The expression semantics retained from VRMC_vrm.  Material and texture
-/// binds are intentionally represented only by presence: this first runtime
-/// slice is morph-only, but their presence still affects validation and
-/// diagnostics in the host.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vrm1Expression {
     pub name: String,
@@ -284,192 +262,515 @@ pub struct Vrm1Expression {
     pub has_texture_transform_binds: bool,
 }
 
-/// Minimal, structurally validated VRM 1.0 semantic facts.
-///
-/// This is not full humanoid conformance validation: ancestry, positive bone
-/// scales, and runtime retargeting rules remain outside this API.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vrm1SphereCollider {
+    pub offset: Vec3,
+    pub radius: f32,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vrm1CapsuleCollider {
+    pub offset: Vec3,
+    pub tail: Vec3,
+    pub radius: f32,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub enum Vrm1ColliderShape {
+    Sphere(Vrm1SphereCollider),
+    Capsule(Vrm1CapsuleCollider),
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vrm1Collider {
+    pub node: usize,
+    pub shape: Vrm1ColliderShape,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vrm1ColliderGroup {
+    pub name: Option<String>,
+    pub colliders: Vec<usize>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vrm1SpringJoint {
+    pub node: usize,
+    pub hit_radius: f32,
+    pub stiffness: f32,
+    pub gravity_power: f32,
+    pub gravity_dir: Vec3,
+    pub drag_force: f32,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vrm1Spring {
+    pub name: Option<String>,
+    pub center: Option<usize>,
+    pub collider_groups: Vec<usize>,
+    pub joints: Vec<Vrm1SpringJoint>,
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vrm1SpringBone {
+    pub colliders: Vec<Vrm1Collider>,
+    pub collider_groups: Vec<Vrm1ColliderGroup>,
+    pub springs: Vec<Vrm1Spring>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vrm1Doc {
     pub meta: Vrm1Meta,
     pub humanoid: Vrm1Humanoid,
     pub materials_mtoon: Vrm1ExtensionInfo,
     pub spring_bone: Vrm1ExtensionInfo,
+    pub spring_bone_semantics: Option<Vrm1SpringBone>,
     pub node_constraint: Vrm1ExtensionInfo,
     pub expressions: Vec<Vrm1Expression>,
     pub has_expressions: bool,
     pub has_look_at: bool,
     pub has_first_person: bool,
     pub node_count: usize,
-    /// glTF mesh index for each glTF node, when the node has a mesh.
     pub node_meshes: Vec<Option<usize>>,
-    /// Primitive count for each glTF mesh.  The parent uses this to reject a
-    /// morph bind when even one primitive of the referenced mesh cannot carry
-    /// the target.
     pub mesh_primitive_counts: Vec<usize>,
 }
 
 impl Vrm1Doc {
-    /// Parse a VRM 1.0 semantic document from a self-contained GLB byte slice.
-    ///
-    /// This method intentionally does not read files or invoke a mesh
-    /// importer. The caller retains ownership of the original bytes.
     pub fn from_glb_bytes(bytes: &[u8]) -> Result<Self> {
         let glb = glb::parse_glb(bytes).context("failed to parse VRM 1.0 GLB")?;
-        let extensions = glb
+        let ex = glb
             .json
             .get("extensions")
             .and_then(Value::as_object)
             .context("GLB root is missing an extensions object")?;
-
-        if extensions.contains_key("VRM") {
-            bail!("legacy VRM 0.x extension is not accepted by Vrm1Doc");
-        }
-
-        let vrm = extensions
+        ensure!(
+            !ex.contains_key("VRM"),
+            "legacy VRM 0.x extension is not accepted by Vrm1Doc"
+        );
+        let vrm = ex
             .get("VRMC_vrm")
-            .context("GLB root is missing required VRMC_vrm extension")?;
-        let vrm = vrm
+            .context("GLB root is missing required VRMC_vrm extension")?
             .as_object()
             .context("root VRMC_vrm extension must be an object")?;
-        let spec_version = required_string(vrm, "specVersion", "VRMC_vrm")?;
         ensure!(
-            spec_version == "1.0",
-            "VRMC_vrm specVersion must be \"1.0\", got \"{spec_version}\""
+            required_string(vrm, "specVersion", "VRMC_vrm")? == "1.0",
+            "VRMC_vrm specVersion must be \"1.0\""
         );
-
-        let (node_children, node_meshes, mesh_primitive_counts) = validate_nodes(&glb.json)?;
-        let meta = parse_meta(vrm)?;
-        let humanoid = parse_humanoid(vrm, node_children.len())?;
-        let materials_mtoon =
-            extension_info_in_array(&glb.json, "materials", "VRMC_materials_mtoon")?;
-        let node_constraint = extension_info_in_array(&glb.json, "nodes", "VRMC_node_constraint")?;
-
-        let has_expressions = vrm.contains_key("expressions");
-        let expressions = parse_expressions(vrm)?;
-
+        let (children, node_meshes, mesh_primitive_counts, parents) = validate_nodes(&glb.json)?;
+        let spring_bone = extension_info(ex, "VRMC_springBone")?;
+        let spring_bone_semantics = ex
+            .get("VRMC_springBone")
+            .map(|v| parse_spring_bone(v, children.len(), &parents))
+            .transpose()?;
         Ok(Self {
-            meta,
-            humanoid,
-            materials_mtoon,
-            spring_bone: extension_info(extensions, "VRMC_springBone")?,
-            node_constraint,
-            expressions,
-            has_expressions,
+            meta: parse_meta(vrm)?,
+            humanoid: parse_humanoid(vrm, children.len())?,
+            materials_mtoon: extension_info_in_array(
+                &glb.json,
+                "materials",
+                "VRMC_materials_mtoon",
+            )?,
+            spring_bone,
+            spring_bone_semantics,
+            node_constraint: extension_info_in_array(&glb.json, "nodes", "VRMC_node_constraint")?,
+            expressions: parse_expressions(vrm)?,
+            has_expressions: vrm.contains_key("expressions"),
             has_look_at: optional_object(vrm, "lookAt")?,
             has_first_person: optional_object(vrm, "firstPerson")?,
-            node_count: node_children.len(),
+            node_count: children.len(),
             node_meshes,
             mesh_primitive_counts,
         })
     }
 }
 
-fn parse_expressions(vrm: &Map<String, Value>) -> Result<Vec<Vrm1Expression>> {
-    let Some(value) = vrm.get("expressions") else {
-        return Ok(Vec::new());
-    };
-    let expressions = value
+fn parse_spring_bone(
+    value: &Value,
+    node_count: usize,
+    parents: &[Option<usize>],
+) -> Result<Vrm1SpringBone> {
+    let root = value
         .as_object()
-        .context("VRMC_vrm.expressions must be an object when present")?;
-    let mut parsed = Vec::new();
-    parse_expression_group(
-        expressions,
-        "preset",
-        Vrm1ExpressionKind::Preset,
-        &mut parsed,
-    )?;
-    parse_expression_group(
-        expressions,
-        "custom",
-        Vrm1ExpressionKind::Custom,
-        &mut parsed,
-    )?;
-    Ok(parsed)
-}
-
-fn parse_expression_group(
-    expressions: &Map<String, Value>,
-    group_name: &str,
-    kind: Vrm1ExpressionKind,
-    output: &mut Vec<Vrm1Expression>,
-) -> Result<()> {
-    let Some(value) = expressions.get(group_name) else {
-        return Ok(());
+        .context("VRMC_springBone extension must be an object")?;
+    ensure!(
+        required_string(root, "specVersion", "VRMC_springBone")? == "1.0",
+        "VRMC_springBone.specVersion must be \"1.0\""
+    );
+    let colliders = match root.get("colliders") {
+        None => Vec::new(),
+        Some(v) => {
+            let a = v
+                .as_array()
+                .context("VRMC_springBone.colliders must be an array")?;
+            ensure!(!a.is_empty(), "VRMC_springBone.colliders must not be empty");
+            a.iter()
+                .enumerate()
+                .map(|(i, v)| parse_collider(v, i, node_count))
+                .collect::<Result<Vec<_>>>()?
+        }
     };
-    let group = value.as_object().with_context(|| {
-        format!("VRMC_vrm.expressions.{group_name} must be an object when present")
-    })?;
-    for (name, value) in group {
-        let expression = value.as_object().with_context(|| {
-            format!("VRMC_vrm.expressions.{group_name}.{name} must be an object")
-        })?;
-        output.push(parse_expression(name, kind, expression)?);
+    let collider_groups = match root.get("colliderGroups") {
+        None => Vec::new(),
+        Some(v) => {
+            let a = v
+                .as_array()
+                .context("VRMC_springBone.colliderGroups must be an array")?;
+            ensure!(
+                !a.is_empty(),
+                "VRMC_springBone.colliderGroups must not be empty"
+            );
+            a.iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let o = v
+                        .as_object()
+                        .with_context(|| format!("colliderGroups[{i}] must be an object"))?;
+                    let a = o
+                        .get("colliders")
+                        .with_context(|| format!("colliderGroups[{i}] is missing colliders"))?
+                        .as_array()
+                        .with_context(|| {
+                            format!("colliderGroups[{i}].colliders must be an array")
+                        })?;
+                    ensure!(
+                        !a.is_empty(),
+                        "colliderGroups[{i}].colliders must not be empty"
+                    );
+                    let refs = a
+                        .iter()
+                        .enumerate()
+                        .map(|(j, v)| {
+                            let r = index_value(v, &format!("colliderGroups[{i}].colliders[{j}]"))?;
+                            ensure!(
+                                r < colliders.len(),
+                                "colliderGroups[{i}] references collider {r} out of range"
+                            );
+                            Ok(r)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Vrm1ColliderGroup {
+                        name: optional_string(o, "name", &format!("colliderGroups[{i}]"))?,
+                        colliders: refs,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    let springs = match root.get("springs") {
+        None => Vec::new(),
+        Some(v) => {
+            let a = v
+                .as_array()
+                .context("VRMC_springBone.springs must be an array")?;
+            ensure!(!a.is_empty(), "VRMC_springBone.springs must not be empty");
+            a.iter()
+                .enumerate()
+                .map(|(i, v)| parse_spring(v, i, node_count, collider_groups.len()))
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    validate_spring_relationships(&springs, parents)?;
+    Ok(Vrm1SpringBone {
+        colliders,
+        collider_groups,
+        springs,
+    })
+}
+fn parse_collider(value: &Value, index: usize, node_count: usize) -> Result<Vrm1Collider> {
+    let o = value
+        .as_object()
+        .with_context(|| format!("colliders[{index}] must be an object"))?;
+    let node = index_value(
+        o.get("node")
+            .with_context(|| format!("colliders[{index}] is missing node"))?,
+        &format!("colliders[{index}].node"),
+    )?;
+    ensure!(
+        node < node_count,
+        "colliders[{index}].node {node} is out of range"
+    );
+    let shape = o
+        .get("shape")
+        .with_context(|| format!("colliders[{index}] is missing shape"))?
+        .as_object()
+        .with_context(|| format!("colliders[{index}].shape must be an object"))?;
+    let shape_count =
+        usize::from(shape.contains_key("sphere")) + usize::from(shape.contains_key("capsule"));
+    ensure!(
+        shape_count == 1,
+        "colliders[{index}].shape must contain exactly one sphere or capsule"
+    );
+    let shape = if let Some(v) = shape.get("sphere") {
+        let s = v
+            .as_object()
+            .with_context(|| format!("colliders[{index}].shape.sphere must be an object"))?;
+        Vrm1ColliderShape::Sphere(Vrm1SphereCollider {
+            offset: optional_vec3(s, "offset", &format!("colliders[{index}].sphere"))?
+                .unwrap_or(Vec3::ZERO),
+            radius: nonnegative(
+                optional_f32(s, "radius", &format!("colliders[{index}].sphere"))?.unwrap_or(0.0),
+                &format!("colliders[{index}].sphere.radius"),
+            )?,
+        })
+    } else if let Some(v) = shape.get("capsule") {
+        let s = v
+            .as_object()
+            .with_context(|| format!("colliders[{index}].shape.capsule must be an object"))?;
+        Vrm1ColliderShape::Capsule(Vrm1CapsuleCollider {
+            offset: optional_vec3(s, "offset", &format!("colliders[{index}].capsule"))?
+                .unwrap_or(Vec3::ZERO),
+            tail: optional_vec3(s, "tail", &format!("colliders[{index}].capsule"))?
+                .unwrap_or(Vec3::ZERO),
+            radius: nonnegative(
+                optional_f32(s, "radius", &format!("colliders[{index}].capsule"))?.unwrap_or(0.0),
+                &format!("colliders[{index}].capsule.radius"),
+            )?,
+        })
+    } else {
+        bail!("colliders[{index}].shape must contain sphere or capsule")
+    };
+    Ok(Vrm1Collider { node, shape })
+}
+fn parse_spring(
+    value: &Value,
+    index: usize,
+    node_count: usize,
+    group_count: usize,
+) -> Result<Vrm1Spring> {
+    let o = value
+        .as_object()
+        .with_context(|| format!("springs[{index}] must be an object"))?;
+    let a = o
+        .get("joints")
+        .with_context(|| format!("springs[{index}] is missing joints"))?
+        .as_array()
+        .with_context(|| format!("springs[{index}].joints must be an array"))?;
+    ensure!(!a.is_empty(), "springs[{index}].joints must not be empty");
+    let joints = a
+        .iter()
+        .enumerate()
+        .map(|(j, v)| {
+            let x = v
+                .as_object()
+                .with_context(|| format!("springs[{index}].joints[{j}] must be an object"))?;
+            let c = format!("springs[{index}].joints[{j}]");
+            let node = index_value(
+                x.get("node")
+                    .with_context(|| format!("{c} is missing node"))?,
+                &format!("{c}.node"),
+            )?;
+            ensure!(node < node_count, "{c}.node {node} is out of range");
+            Ok(Vrm1SpringJoint {
+                node,
+                hit_radius: nonnegative(
+                    optional_f32(x, "hitRadius", &c)?.unwrap_or(0.0),
+                    &format!("{c}.hitRadius"),
+                )?,
+                stiffness: nonnegative(
+                    optional_f32(x, "stiffness", &c)?.unwrap_or(1.0),
+                    &format!("{c}.stiffness"),
+                )?,
+                gravity_power: nonnegative(
+                    optional_f32(x, "gravityPower", &c)?.unwrap_or(0.0),
+                    &format!("{c}.gravityPower"),
+                )?,
+                gravity_dir: optional_vec3(x, "gravityDir", &c)?
+                    .unwrap_or(Vec3::new(0.0, -1.0, 0.0)),
+                drag_force: bounded(
+                    optional_f32(x, "dragForce", &c)?.unwrap_or(0.5),
+                    0.0,
+                    1.0,
+                    &format!("{c}.dragForce"),
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let groups = match o.get("colliderGroups") {
+        None => Vec::new(),
+        Some(v) => {
+            let a = v
+                .as_array()
+                .with_context(|| format!("springs[{index}].colliderGroups must be an array"))?;
+            ensure!(
+                !a.is_empty(),
+                "springs[{index}].colliderGroups must not be empty"
+            );
+            a.iter()
+                .enumerate()
+                .map(|(j, v)| {
+                    let r = index_value(v, &format!("springs[{index}].colliderGroups[{j}]"))?;
+                    ensure!(
+                        r < group_count,
+                        "springs[{index}] references collider group {r} out of range"
+                    );
+                    Ok(r)
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
+    let center = optional_index(o, "center", &format!("springs[{index}]"))?;
+    if let Some(n) = center {
+        ensure!(
+            n < node_count,
+            "springs[{index}].center {n} is out of range"
+        )
+    }
+    Ok(Vrm1Spring {
+        name: optional_string(o, "name", &format!("springs[{index}]"))?,
+        center,
+        collider_groups: groups,
+        joints,
+    })
+}
+fn validate_spring_relationships(springs: &[Vrm1Spring], parents: &[Option<usize>]) -> Result<()> {
+    let mut owners = vec![None; parents.len()];
+    for (si, s) in springs.iter().enumerate() {
+        for p in s.joints.windows(2) {
+            ensure!(
+                is_ancestor(p[0].node, p[1].node, parents),
+                "spring {si} joint {} must be an ancestor of joint {}",
+                p[0].node,
+                p[1].node
+            );
+            let mut node = p[1].node;
+            loop {
+                if let Some(owner) = owners[node] {
+                    ensure!(
+                        owner == si,
+                        "spring joint node {node} is owned by more than one spring"
+                    )
+                } else {
+                    owners[node] = Some(si);
+                }
+                if node == p[0].node {
+                    break;
+                }
+                node = parents[node].context("spring joint ancestry is malformed")?;
+            }
+        }
+        if s.joints.len() == 1 {
+            let node = s.joints[0].node;
+            ensure!(
+                owners[node].is_none(),
+                "spring joint node {node} is owned by more than one spring"
+            );
+            owners[node] = Some(si);
+        }
+        if let Some(c) = s.center {
+            ensure!(
+                c == s.joints[0].node || is_ancestor(c, s.joints[0].node, parents),
+                "spring {si} center must be the first joint or one of its ancestors"
+            )
+        }
+    }
+    for (si, s) in springs.iter().enumerate() {
+        if let Some(c) = s.center {
+            for (oi, o) in springs.iter().enumerate() {
+                if si != oi {
+                    for j in &o.joints {
+                        ensure!(
+                            !(c == j.node || is_ancestor(j.node, c, parents)),
+                            "spring {si} center is a joint or descendant of another spring"
+                        )
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
-
-fn parse_expression(
-    name: &str,
-    kind: Vrm1ExpressionKind,
-    expression: &Map<String, Value>,
-) -> Result<Vrm1Expression> {
-    if kind == Vrm1ExpressionKind::Preset {
-        ensure!(
-            is_canonical_preset_name(name),
-            "unknown VRM 1.0 preset expression {name:?}"
-        );
-    } else {
-        ensure!(
-            !is_canonical_preset_name(name),
-            "custom VRM 1.0 expression name {name:?} conflicts with a preset"
-        );
-    }
-    let morph_target_binds = match expression.get("morphTargetBinds") {
-        None => Vec::new(),
-        Some(value) => {
-            let binds = value
-                .as_array()
-                .with_context(|| format!("expression {name}.morphTargetBinds must be an array"))?;
-            let mut parsed = Vec::with_capacity(binds.len());
-            for (bind_index, value) in binds.iter().enumerate() {
-                let bind = value.as_object().with_context(|| {
-                    format!("expression {name}.morphTargetBinds[{bind_index}] must be an object")
-                })?;
-                let node = required_usize(bind, "node", &format!("expression {name} morph bind"))?;
-                let index =
-                    required_usize(bind, "index", &format!("expression {name} morph bind"))?;
-                let weight =
-                    required_f32(bind, "weight", &format!("expression {name} morph bind"))?;
-                parsed.push(Vrm1MorphTargetBind {
-                    node,
-                    index,
-                    weight,
-                });
-            }
-            parsed
+fn is_ancestor(a: usize, mut n: usize, p: &[Option<usize>]) -> bool {
+    while let Some(x) = p[n] {
+        if x == a {
+            return true;
         }
-    };
-
-    Ok(Vrm1Expression {
-        name: name.to_owned(),
-        kind,
-        morph_target_binds,
-        is_binary: optional_bool(expression, "isBinary", name)?.unwrap_or(false),
-        override_blink: parse_override(expression, "overrideBlink", name)?,
-        override_look_at: parse_override(expression, "overrideLookAt", name)?,
-        override_mouth: parse_override(expression, "overrideMouth", name)?,
-        has_material_color_binds: optional_array_presence(expression, "materialColorBinds", name)?,
-        has_texture_transform_binds: optional_array_presence(
-            expression,
-            "textureTransformBinds",
-            name,
-        )?,
-    })
+        n = x
+    }
+    false
 }
 
-fn is_canonical_preset_name(name: &str) -> bool {
+fn parse_expressions(vrm: &Map<String, Value>) -> Result<Vec<Vrm1Expression>> {
+    let Some(v) = vrm.get("expressions") else {
+        return Ok(Vec::new());
+    };
+    let g = v
+        .as_object()
+        .context("VRMC_vrm.expressions must be an object when present")?;
+    let mut out = Vec::new();
+    for (group, kind) in [
+        ("preset", Vrm1ExpressionKind::Preset),
+        ("custom", Vrm1ExpressionKind::Custom),
+    ] {
+        let Some(v) = g.get(group) else { continue };
+        let o = v.as_object().with_context(|| {
+            format!("VRMC_vrm.expressions.{group} must be an object when present")
+        })?;
+        for (name, v) in o {
+            let x = v.as_object().with_context(|| {
+                format!("VRMC_vrm.expressions.{group}.{name} must be an object")
+            })?;
+            if kind == Vrm1ExpressionKind::Preset {
+                ensure!(
+                    is_preset(name),
+                    "unknown VRM 1.0 preset expression {name:?}"
+                )
+            } else {
+                ensure!(
+                    !is_preset(name),
+                    "custom VRM 1.0 expression name {name:?} conflicts with a preset"
+                )
+            }
+            let binds = match x.get("morphTargetBinds") {
+                None => Vec::new(),
+                Some(v) => {
+                    let a = v.as_array().with_context(|| {
+                        format!("expression {name}.morphTargetBinds must be an array")
+                    })?;
+                    a.iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            let b = v.as_object().with_context(|| {
+                                format!("expression {name}.morphTargetBinds[{i}] must be an object")
+                            })?;
+                            Ok(Vrm1MorphTargetBind {
+                                node: index_value(
+                                    b.get("node").with_context(|| {
+                                        format!("expression {name} morph bind is missing node")
+                                    })?,
+                                    "morph bind.node",
+                                )?,
+                                index: index_value(
+                                    b.get("index").with_context(|| {
+                                        format!("expression {name} morph bind is missing index")
+                                    })?,
+                                    "morph bind.index",
+                                )?,
+                                weight: required_f32(
+                                    b.get("weight").with_context(|| {
+                                        format!("expression {name} morph bind is missing weight")
+                                    })?,
+                                    "morph bind.weight",
+                                )?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                }
+            };
+            out.push(Vrm1Expression {
+                name: name.clone(),
+                kind,
+                morph_target_binds: binds,
+                is_binary: optional_bool(x, "isBinary", name)?.unwrap_or(false),
+                override_blink: parse_override(x, "overrideBlink", name)?,
+                override_look_at: parse_override(x, "overrideLookAt", name)?,
+                override_mouth: parse_override(x, "overrideMouth", name)?,
+                has_material_color_binds: optional_array_presence(x, "materialColorBinds", name)?,
+                has_texture_transform_binds: optional_array_presence(
+                    x,
+                    "textureTransformBinds",
+                    name,
+                )?,
+            })
+        }
+    }
+    Ok(out)
+}
+fn is_preset(s: &str) -> bool {
     matches!(
-        name,
+        s,
         "neutral"
             | "happy"
             | "angry"
@@ -490,196 +791,117 @@ fn is_canonical_preset_name(name: &str) -> bool {
             | "lookRight"
     )
 }
-
-fn required_usize(object: &Map<String, Value>, key: &str, context: &str) -> Result<usize> {
-    let value = object
-        .get(key)
-        .with_context(|| format!("{context} is missing required {key}"))?
-        .as_u64()
-        .with_context(|| format!("{context}.{key} must be an integer"))?;
-    usize::try_from(value).with_context(|| format!("{context}.{key} does not fit in usize"))
-}
-
-fn required_f32(object: &Map<String, Value>, key: &str, context: &str) -> Result<f32> {
-    let value = object
-        .get(key)
-        .with_context(|| format!("{context} is missing required {key}"))?
-        .as_f64()
-        .with_context(|| format!("{context}.{key} must be a number"))?;
-    Ok(value as f32)
-}
-
-fn optional_bool(object: &Map<String, Value>, key: &str, context: &str) -> Result<Option<bool>> {
-    let Some(value) = object.get(key) else {
-        return Ok(None);
-    };
-    value
-        .as_bool()
-        .map(Some)
-        .with_context(|| format!("expression {context}.{key} must be a boolean"))
-}
-
-fn parse_override(
-    object: &Map<String, Value>,
-    key: &str,
-    expression_name: &str,
-) -> Result<Vrm1ExpressionOverride> {
-    let Some(value) = object.get(key) else {
-        return Ok(Vrm1ExpressionOverride::None);
-    };
-    let value = value.as_str().with_context(|| {
-        format!("expression {expression_name}.{key} must be one of none, block, blend")
-    })?;
-    match value {
-        "none" => Ok(Vrm1ExpressionOverride::None),
-        "block" => Ok(Vrm1ExpressionOverride::Block),
-        "blend" => Ok(Vrm1ExpressionOverride::Blend),
-        _ => bail!(
-            "expression {expression_name}.{key} must be one of none, block, blend, got {value:?}"
-        ),
+fn parse_override(o: &Map<String, Value>, key: &str, name: &str) -> Result<Vrm1ExpressionOverride> {
+    match o.get(key) {
+        None => Ok(Vrm1ExpressionOverride::None),
+        Some(v) => match v
+            .as_str()
+            .with_context(|| format!("expression {name}.{key} must be one of none, block, blend"))?
+        {
+            "none" => Ok(Vrm1ExpressionOverride::None),
+            "block" => Ok(Vrm1ExpressionOverride::Block),
+            "blend" => Ok(Vrm1ExpressionOverride::Blend),
+            v => bail!("expression {name}.{key} must be one of none, block, blend, got {v:?}"),
+        },
     }
 }
-
-fn optional_array_presence(
-    object: &Map<String, Value>,
-    key: &str,
-    expression_name: &str,
-) -> Result<bool> {
-    let Some(value) = object.get(key) else {
+fn optional_array_presence(o: &Map<String, Value>, key: &str, name: &str) -> Result<bool> {
+    let Some(v) = o.get(key) else {
         return Ok(false);
     };
     ensure!(
-        value.is_array(),
-        "expression {expression_name}.{key} must be an array when present"
+        v.is_array(),
+        "expression {name}.{key} must be an array when present"
     );
     Ok(true)
 }
-
-fn required_string(object: &Map<String, Value>, key: &str, context: &str) -> Result<String> {
-    let value = object
-        .get(key)
-        .with_context(|| format!("{context} is missing required {key}"))?;
-    let value = value
-        .as_str()
-        .with_context(|| format!("{context}.{key} must be a string"))?;
-    ensure!(
-        !value.trim().is_empty(),
-        "{context}.{key} must not be empty"
-    );
-    Ok(value.to_owned())
-}
-
-fn parse_meta(vrm: &Map<String, Value>) -> Result<Vrm1Meta> {
-    let meta = vrm
+fn parse_meta(v: &Map<String, Value>) -> Result<Vrm1Meta> {
+    let m = v
         .get("meta")
         .context("VRMC_vrm is missing required meta section")?
         .as_object()
         .context("VRMC_vrm.meta must be an object")?;
-    let authors_value = meta
+    let a = m
         .get("authors")
-        .context("VRMC_vrm.meta is missing required authors")?;
-    let authors_array = authors_value
+        .context("VRMC_vrm.meta is missing required authors")?
         .as_array()
         .context("VRMC_vrm.meta.authors must be an array")?;
     ensure!(
-        !authors_array.is_empty(),
+        !a.is_empty(),
         "VRMC_vrm.meta.authors must contain at least one author"
     );
-    let mut authors = Vec::with_capacity(authors_array.len());
-    for (index, author) in authors_array.iter().enumerate() {
-        let author = author
-            .as_str()
-            .with_context(|| format!("VRMC_vrm.meta.authors[{index}] must be a string"))?;
-        ensure!(
-            !author.trim().is_empty(),
-            "VRMC_vrm.meta.authors[{index}] must not be empty"
-        );
-        authors.push(author.to_owned());
-    }
+    let authors = a
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let s = v
+                .as_str()
+                .with_context(|| format!("VRMC_vrm.meta.authors[{i}] must be a string"))?;
+            ensure!(
+                !s.trim().is_empty(),
+                "VRMC_vrm.meta.authors[{i}] must not be empty"
+            );
+            Ok(s.to_owned())
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok(Vrm1Meta {
-        name: required_string(meta, "name", "VRMC_vrm.meta")?,
-        version: optional_string(meta, "version", "VRMC_vrm.meta")?,
+        name: required_string(m, "name", "VRMC_vrm.meta")?,
+        version: optional_string(m, "version", "VRMC_vrm.meta")?,
         authors,
-        license_url: required_string(meta, "licenseUrl", "VRMC_vrm.meta")?,
+        license_url: required_string(m, "licenseUrl", "VRMC_vrm.meta")?,
     })
 }
-
-fn optional_string(
-    object: &Map<String, Value>,
-    key: &str,
-    context: &str,
-) -> Result<Option<String>> {
-    let Some(value) = object.get(key) else {
-        return Ok(None);
-    };
-    let value = value
-        .as_str()
-        .with_context(|| format!("{context}.{key} must be a string"))?;
-    Ok(Some(value.to_owned()))
-}
-
-fn parse_humanoid(vrm: &Map<String, Value>, node_count: usize) -> Result<Vrm1Humanoid> {
-    let human_bones = vrm
+fn parse_humanoid(v: &Map<String, Value>, n: usize) -> Result<Vrm1Humanoid> {
+    let h = v
         .get("humanoid")
         .context("VRMC_vrm is missing required humanoid section")?
         .get("humanBones")
         .context("VRMC_vrm.humanoid is missing required humanBones")?
         .as_object()
         .context("VRMC_vrm.humanoid.humanBones must be an object")?;
-
-    let mut mappings = BTreeMap::new();
-    let mut used_nodes = HashSet::new();
-    for (name, entry) in human_bones {
-        let bone = Vrm1HumanBone::parse(name)
+    let mut out = BTreeMap::new();
+    let mut used = HashSet::new();
+    for (name, v) in h {
+        let b = Vrm1HumanBone::parse(name)
             .with_context(|| format!("unknown VRM 1.0 human bone {name}"))?;
-        let entry = entry
+        let o = v
             .as_object()
-            .with_context(|| format!("VRMC_vrm.humanoid.humanBones.{name} must be an object"))?;
-        let node = entry
-            .get("node")
-            .with_context(|| format!("human bone {name} is missing node"))?
-            .as_u64()
-            .with_context(|| format!("human bone {name}.node must be an integer"))?;
-        let node = usize::try_from(node)
-            .with_context(|| format!("human bone {name}.node does not fit in usize"))?;
+            .with_context(|| format!("human bone {name} must be an object"))?;
+        let node = index_value(
+            o.get("node")
+                .with_context(|| format!("human bone {name} is missing node"))?,
+            &format!("human bone {name}.node"),
+        )?;
         ensure!(
-            node < node_count,
-            "human bone {name}.node {node} is out of range for {node_count} nodes"
+            node < n,
+            "human bone {name}.node {node} is out of range for {n} nodes"
         );
         ensure!(
-            used_nodes.insert(node),
+            used.insert(node),
             "multiple human bones map to glTF node {node}"
         );
-        ensure!(
-            mappings.insert(bone, node).is_none(),
-            "duplicate human bone {name}"
-        );
+        ensure!(out.insert(b, node).is_none(), "duplicate human bone {name}")
     }
-
-    for &bone in Vrm1HumanBone::REQUIRED {
+    for b in Vrm1HumanBone::REQUIRED {
         ensure!(
-            mappings.contains_key(&bone),
+            out.contains_key(b),
             "VRMC_vrm.humanoid is missing required human bone {}",
-            bone.as_str()
-        );
+            b.as_str()
+        )
     }
-    Ok(Vrm1Humanoid {
-        human_bones: mappings,
-    })
+    Ok(Vrm1Humanoid { human_bones: out })
 }
-
-fn extension_info(extensions: &Map<String, Value>, name: &str) -> Result<Vrm1ExtensionInfo> {
-    let Some(value) = extensions.get(name) else {
-        return Ok(Vrm1ExtensionInfo::default());
-    };
-    required_extension_info(value, name)
+fn extension_info(e: &Map<String, Value>, name: &str) -> Result<Vrm1ExtensionInfo> {
+    match e.get(name) {
+        None => Ok(Vrm1ExtensionInfo::default()),
+        Some(v) => required_extension_info(v, name),
+    }
 }
-
-fn required_extension_info(value: &Value, name: &str) -> Result<Vrm1ExtensionInfo> {
-    let object = value
+fn required_extension_info(v: &Value, name: &str) -> Result<Vrm1ExtensionInfo> {
+    let o = v
         .as_object()
         .with_context(|| format!("{name} extension must be an object"))?;
-    let version = required_string(object, "specVersion", name)?;
+    let version = required_string(o, "specVersion", name)?;
     ensure!(
         version == "1.0",
         "{name}.specVersion must be \"1.0\", got \"{version}\""
@@ -689,168 +911,229 @@ fn required_extension_info(value: &Value, name: &str) -> Result<Vrm1ExtensionInf
         version: Some(version),
     })
 }
-
 fn extension_info_in_array(
     root: &Value,
     array_name: &str,
-    extension_name: &str,
+    name: &str,
 ) -> Result<Vrm1ExtensionInfo> {
-    let Some(items) = root.get(array_name) else {
+    let Some(v) = root.get(array_name) else {
         return Ok(Vrm1ExtensionInfo::default());
     };
-    let items = items
+    let a = v
         .as_array()
         .with_context(|| format!("glTF {array_name} must be an array"))?;
-    let mut found: Option<Vrm1ExtensionInfo> = None;
-    for (index, item) in items.iter().enumerate() {
-        let item = item
+    let mut f: Option<Vrm1ExtensionInfo> = None;
+    for (i, v) in a.iter().enumerate() {
+        let o = v
             .as_object()
-            .with_context(|| format!("glTF {array_name}[{index}] must be an object"))?;
-        let Some(item_extensions) = item.get("extensions") else {
+            .with_context(|| format!("glTF {array_name}[{i}] must be an object"))?;
+        let Some(v) = o.get("extensions") else {
             continue;
         };
-        let item_extensions = item_extensions
+        let v = v
             .as_object()
-            .with_context(|| format!("glTF {array_name}[{index}].extensions must be an object"))?;
-        let Some(value) = item_extensions.get(extension_name) else {
-            continue;
-        };
-        let context = format!("{array_name}[{index}].extensions.{extension_name}");
-        let info = required_extension_info(value, &context)?;
-        if let Some(previous) = &found {
+            .with_context(|| format!("glTF {array_name}[{i}].extensions must be an object"))?;
+        let Some(x) = v.get(name) else { continue };
+        let info = required_extension_info(x, &format!("{array_name}[{i}].extensions.{name}"))?;
+        if let Some(old) = &f {
             ensure!(
-                previous.version == info.version,
-                "{extension_name} has conflicting specVersion values"
-            );
+                old.version == info.version,
+                "{name} has conflicting specVersion values"
+            )
         }
-        found = Some(info);
+        f = Some(info)
     }
-    Ok(found.unwrap_or_default())
+    Ok(f.unwrap_or_default())
 }
-
-fn optional_object(vrm: &Map<String, Value>, name: &str) -> Result<bool> {
-    let Some(value) = vrm.get(name) else {
+fn optional_object(v: &Map<String, Value>, name: &str) -> Result<bool> {
+    let Some(x) = v.get(name) else {
         return Ok(false);
     };
     ensure!(
-        value.is_object(),
+        x.is_object(),
         "VRMC_vrm.{name} must be an object when present"
     );
     Ok(true)
 }
-
-fn validate_nodes(json: &Value) -> Result<(Vec<Vec<usize>>, Vec<Option<usize>>, Vec<usize>)> {
-    let nodes = json
+fn validate_nodes(
+    root: &Value,
+) -> Result<(
+    Vec<Vec<usize>>,
+    Vec<Option<usize>>,
+    Vec<usize>,
+    Vec<Option<usize>>,
+)> {
+    let a = root
         .get("nodes")
         .context("GLB is missing required glTF nodes array")?
         .as_array()
         .context("glTF nodes must be an array")?;
-    let count = nodes.len();
-    let mesh_primitive_counts = match json.get("meshes") {
+    let n = a.len();
+    let meshes = match root.get("meshes") {
         None => Vec::new(),
-        Some(value) => {
-            let meshes = value.as_array().context("glTF meshes must be an array")?;
-            let mut counts = Vec::with_capacity(meshes.len());
-            for (index, mesh) in meshes.iter().enumerate() {
-                let mesh = mesh
-                    .as_object()
-                    .with_context(|| format!("glTF mesh {index} must be an object"))?;
-                let primitives = mesh
+        Some(v) => v
+            .as_array()
+            .context("glTF meshes must be an array")?
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                v.as_object()
+                    .with_context(|| format!("glTF mesh {i} must be an object"))?
                     .get("primitives")
-                    .with_context(|| format!("glTF mesh {index} is missing primitives"))?
+                    .with_context(|| format!("glTF mesh {i} is missing primitives"))?
                     .as_array()
-                    .with_context(|| format!("glTF mesh {index}.primitives must be an array"))?;
-                counts.push(primitives.len());
-            }
-            counts
-        }
+                    .with_context(|| format!("glTF mesh {i}.primitives must be an array"))
+                    .map(Vec::len)
+            })
+            .collect::<Result<Vec<_>>>()?,
     };
-    let mesh_count = json.get("meshes").map(|_| mesh_primitive_counts.len());
-    let mut children = Vec::with_capacity(count);
-    let mut node_meshes = Vec::with_capacity(count);
-    let mut parent = vec![None; count];
-    for (index, node) in nodes.iter().enumerate() {
-        let node = node
+    let mesh_count = root.get("meshes").map(|_| meshes.len());
+    let mut c = vec![Vec::new(); n];
+    let mut nm = vec![None; n];
+    let mut p = vec![None; n];
+    for (i, v) in a.iter().enumerate() {
+        let o = v
             .as_object()
-            .with_context(|| format!("glTF node {index} must be an object"))?;
-        let mesh = match node.get("mesh") {
-            None => None,
-            Some(value) => {
-                let mesh = value
-                    .as_u64()
-                    .with_context(|| format!("glTF node {index}.mesh must be an integer"))?;
-                let mesh = usize::try_from(mesh)
-                    .with_context(|| format!("glTF node {index}.mesh index is too large"))?;
-                let mesh_count = mesh_count.with_context(|| {
-                    format!("glTF node {index}.mesh is present but meshes is missing")
-                })?;
-                ensure!(
-                    mesh < mesh_count,
-                    "glTF node {index}.mesh {mesh} is out of range for {mesh_count} meshes"
-                );
-                Some(mesh)
-            }
-        };
-        node_meshes.push(mesh);
-        let mut node_children = Vec::new();
-        let mut seen = HashSet::new();
-        if let Some(values) = node.get("children") {
-            let values = values
+            .with_context(|| format!("glTF node {i} must be an object"))?;
+        if let Some(v) = o.get("mesh") {
+            let m = index_value(v, &format!("glTF node {i}.mesh"))?;
+            ensure!(
+                Some(m) < mesh_count,
+                "glTF node {i}.mesh {m} is out of range for meshes"
+            );
+            nm[i] = Some(m)
+        }
+        if let Some(v) = o.get("children") {
+            let a = v
                 .as_array()
-                .with_context(|| format!("glTF node {index}.children must be an array"))?;
-            for value in values {
-                let child = value.as_u64().with_context(|| {
-                    format!("glTF node {index}.children contains a non-integer")
-                })?;
-                let child = usize::try_from(child)
-                    .with_context(|| format!("glTF node {index}.children index is too large"))?;
+                .with_context(|| format!("glTF node {i}.children must be an array"))?;
+            let mut seen = HashSet::new();
+            for v in a {
+                let x = index_value(v, &format!("glTF node {i}.children"))?;
                 ensure!(
-                    child < count,
-                    "glTF node {index}.children references node {child}, but node count is {count}"
+                    x < n,
+                    "glTF node {i}.children references node {x}, but node count is {n}"
                 );
                 ensure!(
-                    parent[child].replace(index).is_none(),
-                    "glTF node {child} has more than one parent"
+                    seen.insert(x),
+                    "glTF node {i}.children contains duplicate node {x}"
                 );
                 ensure!(
-                    seen.insert(child),
-                    "glTF node {index}.children contains duplicate node {child}"
+                    p[x].replace(i).is_none(),
+                    "glTF node {x} has more than one parent"
                 );
-                node_children.push(child);
+                c[i].push(x)
             }
         }
-        children.push(node_children);
     }
-
-    // Iterative DFS keeps malformed deep input from overflowing the Rust call
-    // stack and detects back-edges before any consumer can walk the hierarchy.
-    let mut state = vec![0_u8; count];
-    for start in 0..count {
+    let mut state = vec![0u8; n];
+    for start in 0..n {
         if state[start] != 0 {
             continue;
         }
         state[start] = 1;
-        let mut stack = vec![(start, 0_usize)];
-        while let Some((node, child_index)) = stack.last_mut() {
-            if *child_index == children[*node].len() {
+        let mut stack = vec![(start, 0)];
+        while let Some((node, ci)) = stack.last_mut() {
+            if *ci == c[*node].len() {
                 state[*node] = 2;
                 stack.pop();
                 continue;
             }
-            let child = children[*node][*child_index];
-            *child_index += 1;
-            match state[child] {
+            let x = c[*node][*ci];
+            *ci += 1;
+            match state[x] {
                 0 => {
-                    state[child] = 1;
-                    stack.push((child, 0));
+                    state[x] = 1;
+                    stack.push((x, 0))
                 }
-                1 => bail!("glTF node hierarchy contains a cycle through node {child}"),
+                1 => bail!("glTF node hierarchy contains a cycle through node {x}"),
                 2 => {}
                 _ => unreachable!(),
             }
         }
     }
-    Ok((children, node_meshes, mesh_primitive_counts))
+    Ok((c, nm, meshes, p))
+}
+fn required_string(o: &Map<String, Value>, key: &str, context: &str) -> Result<String> {
+    let v = o
+        .get(key)
+        .with_context(|| format!("{context} is missing required {key}"))?
+        .as_str()
+        .with_context(|| format!("{context}.{key} must be a string"))?;
+    ensure!(!v.trim().is_empty(), "{context}.{key} must not be empty");
+    Ok(v.to_owned())
+}
+fn optional_string(o: &Map<String, Value>, key: &str, context: &str) -> Result<Option<String>> {
+    match o.get(key) {
+        None => Ok(None),
+        Some(v) => Ok(Some(
+            v.as_str()
+                .with_context(|| format!("{context}.{key} must be a string"))?
+                .to_owned(),
+        )),
+    }
+}
+fn index_value(v: &Value, context: &str) -> Result<usize> {
+    let n = v
+        .as_u64()
+        .with_context(|| format!("{context} must be an integer"))?;
+    usize::try_from(n).with_context(|| format!("{context} does not fit in usize"))
+}
+fn optional_index(o: &Map<String, Value>, key: &str, context: &str) -> Result<Option<usize>> {
+    o.get(key)
+        .map(|v| index_value(v, &format!("{context}.{key}")))
+        .transpose()
+}
+fn number(v: &Value, context: &str) -> Result<f32> {
+    let n = v
+        .as_f64()
+        .with_context(|| format!("{context} must be a number"))? as f32;
+    ensure!(
+        n.is_finite(),
+        "{context} must remain finite after f32 conversion"
+    );
+    Ok(n)
+}
+fn required_f32(v: &Value, context: &str) -> Result<f32> {
+    v.as_f64()
+        .with_context(|| format!("{context} must be a number"))
+        .map(|n| n as f32)
+}
+fn optional_f32(o: &Map<String, Value>, key: &str, context: &str) -> Result<Option<f32>> {
+    o.get(key)
+        .map(|v| number(v, &format!("{context}.{key}")))
+        .transpose()
+}
+fn optional_bool(o: &Map<String, Value>, key: &str, context: &str) -> Result<Option<bool>> {
+    match o.get(key) {
+        None => Ok(None),
+        Some(v) => Ok(Some(v.as_bool().with_context(|| {
+            format!("expression {context}.{key} must be a boolean")
+        })?)),
+    }
+}
+fn optional_vec3(o: &Map<String, Value>, key: &str, context: &str) -> Result<Option<Vec3>> {
+    let Some(v) = o.get(key) else { return Ok(None) };
+    let a = v
+        .as_array()
+        .with_context(|| format!("{context}.{key} must be an array"))?;
+    ensure!(
+        a.len() == 3,
+        "{context}.{key} must contain exactly three numbers"
+    );
+    Ok(Some(Vec3::new(
+        number(&a[0], &format!("{context}.{key}[0]"))?,
+        number(&a[1], &format!("{context}.{key}[1]"))?,
+        number(&a[2], &format!("{context}.{key}[2]"))?,
+    )))
+}
+fn nonnegative(v: f32, c: &str) -> Result<f32> {
+    ensure!(v >= 0.0, "{c} must be non-negative");
+    Ok(v)
+}
+fn bounded(v: f32, lo: f32, hi: f32, c: &str) -> Result<f32> {
+    ensure!((lo..=hi).contains(&v), "{c} must be in [{lo}, {hi}]");
+    Ok(v)
 }
 
 #[cfg(test)]
@@ -858,60 +1141,52 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn glb(json_value: Value) -> Vec<u8> {
-        let mut json_bytes = serde_json::to_vec(&json_value).unwrap();
+    fn glb(value: Value) -> Vec<u8> {
+        let mut json_bytes = serde_json::to_vec(&value).unwrap();
         while json_bytes.len() % 4 != 0 {
             json_bytes.push(b' ');
         }
-        let total_len = 12 + 8 + json_bytes.len();
-        let mut bytes = Vec::with_capacity(total_len);
+        let total = 12 + 8 + json_bytes.len();
+        let mut bytes = Vec::new();
         bytes.extend_from_slice(b"glTF");
-        bytes.extend_from_slice(&2_u32.to_le_bytes());
-        bytes.extend_from_slice(&(total_len as u32).to_le_bytes());
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&(total as u32).to_le_bytes());
         bytes.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&0x4E4F_534A_u32.to_le_bytes());
+        bytes.extend_from_slice(&0x4E4F_534Au32.to_le_bytes());
         bytes.extend_from_slice(&json_bytes);
         bytes
     }
 
-    fn valid_document() -> Value {
+    fn base() -> Value {
         let mut bones = Map::new();
-        for (index, bone) in Vrm1HumanBone::REQUIRED.iter().enumerate() {
-            bones.insert(bone.as_str().to_owned(), json!({ "node": index }));
+        for (i, bone) in Vrm1HumanBone::REQUIRED.iter().enumerate() {
+            bones.insert(bone.as_str().to_owned(), json!({"node": i}));
         }
-        let mut nodes = Vec::new();
-        for index in 0..Vrm1HumanBone::REQUIRED.len() {
-            let mut node = json!({});
-            if index + 1 < Vrm1HumanBone::REQUIRED.len() {
-                node["children"] = json!([index + 1]);
-            }
-            nodes.push(node);
-        }
-        nodes[0]["extensions"] = json!({ "VRMC_node_constraint": { "specVersion": "1.0" } });
-        let materials =
-            json!([{ "extensions": { "VRMC_materials_mtoon": { "specVersion": "1.0" } } }]);
-        json!({
-            "asset": { "version": "2.0" },
-            "nodes": nodes,
-            "materials": materials,
-            "extensions": {
-                "VRMC_vrm": {
-                    "specVersion": "1.0",
-                    "meta": {
-                        "name": "Generated",
-                        "version": "1.0",
-                        "authors": ["PocketJS"],
-                        "licenseUrl": "https://example.invalid/license"
-                    },
-                    "humanoid": { "humanBones": bones },
-                    "expressions": {},
-                    "lookAt": {},
-                    "firstPerson": {}
-                },
-                "VRMC_springBone": { "specVersion": "1.0" },
-                "X_unknown_optional": { "anything": true }
-            }
-        })
+        let nodes = (0..Vrm1HumanBone::REQUIRED.len())
+            .map(|i| {
+                if i + 1 < Vrm1HumanBone::REQUIRED.len() {
+                    json!({"children":[i+1]})
+                } else {
+                    json!({})
+                }
+            })
+            .collect::<Vec<_>>();
+        json!({"asset":{"version":"2.0"},"nodes":nodes,"extensions":{"VRMC_vrm":{"specVersion":"1.0","meta":{"name":"test","authors":["test"],"licenseUrl":"test"},"humanoid":{"humanBones":bones}}}})
+    }
+
+    fn valid_document() -> Value {
+        let mut value = base();
+        value["materials"] = json!([
+            {"extensions":{"VRMC_materials_mtoon":{"specVersion":"1.0"}}}
+        ]);
+        value["nodes"][0]["extensions"] = json!({"VRMC_node_constraint":{"specVersion":"1.0"}});
+        value["extensions"]["VRMC_vrm"]["meta"]["version"] = json!("1.0");
+        value["extensions"]["VRMC_vrm"]["expressions"] = json!({});
+        value["extensions"]["VRMC_vrm"]["lookAt"] = json!({});
+        value["extensions"]["VRMC_vrm"]["firstPerson"] = json!({});
+        value["extensions"]["VRMC_springBone"] = json!({"specVersion":"1.0"});
+        value["extensions"]["X_unknown_optional"] = json!({"anything":true});
+        value
     }
 
     fn parse(value: Value) -> Result<Vrm1Doc> {
@@ -919,11 +1194,110 @@ mod tests {
     }
 
     #[test]
+    fn spring_defaults_and_shape_order_are_typed() {
+        assert!(parse(base()).unwrap().spring_bone_semantics.is_none());
+        let mut value = base();
+        value["extensions"]["VRMC_springBone"] = json!({
+            "specVersion":"1.0",
+            "colliders":[
+                {"node":0,"shape":{"sphere":{},"extras":{"tag":true}}},
+                {"node":0,"shape":{"capsule":{"tail":[1,2,3],"extensions":{}}}}
+            ],
+            "colliderGroups":[{"name":"body","colliders":[0,1,0]}],
+            "springs":[{"center":0,"colliderGroups":[0],"joints":[{"node":1},{"node":3}]}]
+        });
+        let doc = parse(value).unwrap();
+        let spring = doc.spring_bone_semantics.unwrap();
+        assert_eq!(spring.collider_groups[0].colliders, [0, 1, 0]);
+        assert_eq!(
+            spring.colliders[0],
+            Vrm1Collider {
+                node: 0,
+                shape: Vrm1ColliderShape::Sphere(Vrm1SphereCollider {
+                    offset: Vec3::ZERO,
+                    radius: 0.0
+                })
+            }
+        );
+        assert_eq!(spring.springs[0].joints[0].hit_radius, 0.0);
+        assert_eq!(spring.springs[0].joints[0].stiffness, 1.0);
+        assert_eq!(spring.springs[0].joints[0].gravity_power, 0.0);
+        assert_eq!(
+            spring.springs[0].joints[0].gravity_dir,
+            Vec3::new(0.0, -1.0, 0.0)
+        );
+        assert_eq!(spring.springs[0].joints[0].drag_force, 0.5);
+    }
+
+    #[test]
+    fn malformed_spring_shapes_and_values_fail_without_member_dropping() {
+        let mut value = base();
+        value["extensions"]["VRMC_springBone"] = json!({"specVersion":"1.0","colliders":[{"node":0,"shape":{"sphere":{},"capsule":{}}}]});
+        assert!(parse(value).is_err());
+        let mut value = base();
+        value["extensions"]["VRMC_springBone"] =
+            json!({"specVersion":"1.0","springs":[{"joints":[{"node":1,"gravityDir":[0,0]}]}]});
+        assert!(parse(value).is_err());
+        let mut value = base();
+        value["extensions"]["VRMC_springBone"] =
+            json!({"specVersion":"1.0","springs":[{"joints":[{"node":1,"dragForce":1.1}]}]});
+        assert!(parse(value).is_err());
+        let mut value = base();
+        value["extensions"]["VRMC_springBone"] = json!({"specVersion":"1.0","colliders":[{"node":0,"shape":{"sphere":{"radius":3.5e38}}}]});
+        assert!(parse(value).is_err());
+        for field in ["colliders", "colliderGroups", "springs"] {
+            let mut value = base();
+            value["extensions"]["VRMC_springBone"] = json!({"specVersion":"1.0",field:[]});
+            assert!(parse(value).is_err(), "empty root array {field} must fail");
+        }
+        let mut value = base();
+        value["extensions"]["VRMC_springBone"] =
+            json!({"specVersion":"1.0","springs":[{"joints":[{"node":1}],"colliderGroups":[]}]});
+        assert!(parse(value).is_err());
+    }
+
+    #[test]
+    fn spring_references_ancestry_and_joint_ownership_are_strict() {
+        let mut value = base();
+        value["extensions"]["VRMC_springBone"] =
+            json!({"specVersion":"1.0","springs":[{"joints":[{"node":1},{"node":3}]}]});
+        assert_eq!(
+            parse(value).unwrap().spring_bone_semantics.unwrap().springs[0]
+                .joints
+                .len(),
+            2
+        );
+        let mut value = base();
+        value["extensions"]["VRMC_springBone"] = json!({"specVersion":"1.0","springs":[{"joints":[{"node":1},{"node":3}]},{"joints":[{"node":2},{"node":4}]}]});
+        assert!(parse(value).is_err());
+        let mut value = base();
+        value["extensions"]["VRMC_springBone"] = json!({"specVersion":"1.0","springs":[{"joints":[{"node":1},{"node":3}]},{"joints":[{"node":1}]}]});
+        assert!(parse(value).is_err());
+        let mut value = base();
+        value["extensions"]["VRMC_springBone"] =
+            json!({"specVersion":"1.0","springs":[{"joints":[{"node":3},{"node":1}]}]});
+        assert!(parse(value).is_err());
+    }
+
+    #[test]
+    fn one_joint_spring_is_valid_noop_data() {
+        let mut value = base();
+        value["extensions"]["VRMC_springBone"] =
+            json!({"specVersion":"1.0","springs":[{"joints":[{"node":1}]}]});
+        assert_eq!(
+            parse(value).unwrap().spring_bone_semantics.unwrap().springs[0]
+                .joints
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn valid_minimal_vrm1_retains_semantic_facts() {
         let doc = parse(valid_document()).unwrap();
-        assert_eq!(doc.meta.name, "Generated");
+        assert_eq!(doc.meta.name, "test");
         assert_eq!(doc.meta.version.as_deref(), Some("1.0"));
-        assert_eq!(doc.meta.authors, ["PocketJS"]);
+        assert_eq!(doc.meta.authors, ["test"]);
         assert_eq!(doc.humanoid.node_for(Vrm1HumanBone::Hips), Some(0));
         assert_eq!(doc.node_count, Vrm1HumanBone::REQUIRED.len());
         assert!(doc.has_expressions);
@@ -945,18 +1319,18 @@ mod tests {
         value["extensions"]["VRMC_vrm"]["expressions"] = json!({
             "preset": {
                 "blink": {
-                    "morphTargetBinds": [{ "node": 2, "index": 3, "weight": 0.75 }],
-                    "isBinary": true,
-                    "overrideBlink": "block",
-                    "overrideLookAt": "blend",
-                    "overrideMouth": "none",
-                    "materialColorBinds": [],
-                    "textureTransformBinds": []
+                    "morphTargetBinds":[{"node":2,"index":3,"weight":0.75}],
+                    "isBinary":true,
+                    "overrideBlink":"block",
+                    "overrideLookAt":"blend",
+                    "overrideMouth":"none",
+                    "materialColorBinds":[],
+                    "textureTransformBinds":[]
                 }
             },
             "custom": {
                 "MyFace": {
-                    "morphTargetBinds": [{ "node": 3, "index": 1, "weight": 1.0 }]
+                    "morphTargetBinds":[{"node":3,"index":1,"weight":1.0}]
                 }
             }
         });
@@ -981,7 +1355,7 @@ mod tests {
     #[test]
     fn node_mesh_mapping_is_retained_and_checked() {
         let mut value = valid_document();
-        value["meshes"] = json!([{ "primitives": [] }]);
+        value["meshes"] = json!([{"primitives":[]}]);
         value["nodes"][0]["mesh"] = json!(0);
         value["nodes"][1]["mesh"] = json!(0);
         let doc = parse(value).unwrap();
@@ -990,7 +1364,7 @@ mod tests {
         assert!(doc.node_meshes[2].is_none());
 
         let mut out_of_range = valid_document();
-        out_of_range["meshes"] = json!([{ "primitives": [] }]);
+        out_of_range["meshes"] = json!([{"primitives":[]}]);
         out_of_range["nodes"][0]["mesh"] = json!(1);
         let error = parse(out_of_range).unwrap_err().to_string();
         assert!(error.contains("node 0.mesh 1 is out of range"), "{error}");
@@ -999,9 +1373,7 @@ mod tests {
     #[test]
     fn malformed_expression_structure_is_rejected() {
         let mut non_object = valid_document();
-        non_object["extensions"]["VRMC_vrm"]["expressions"] = json!({
-            "preset": []
-        });
+        non_object["extensions"]["VRMC_vrm"]["expressions"] = json!({"preset":[]});
         let error = parse(non_object).unwrap_err().to_string();
         assert!(
             error.contains("expressions.preset must be an object"),
@@ -1010,11 +1382,7 @@ mod tests {
 
         let mut malformed_bind = valid_document();
         malformed_bind["extensions"]["VRMC_vrm"]["expressions"] = json!({
-            "custom": {
-                "face": {
-                    "morphTargetBinds": [{ "node": 0, "index": "bad", "weight": 1.0 }]
-                }
-            }
+            "custom":{"face":{"morphTargetBinds":[{"node":0,"index":"bad","weight":1.0}]}}
         });
         let error = parse(malformed_bind).unwrap_err().to_string();
         assert!(
@@ -1023,9 +1391,8 @@ mod tests {
         );
 
         let mut malformed_override = valid_document();
-        malformed_override["extensions"]["VRMC_vrm"]["expressions"] = json!({
-            "custom": { "face": { "overrideBlink": "invalid" } }
-        });
+        malformed_override["extensions"]["VRMC_vrm"]["expressions"] =
+            json!({"custom":{"face":{"overrideBlink":"invalid"}}});
         let error = parse(malformed_override).unwrap_err().to_string();
         assert!(error.contains("overrideBlink must be one of"), "{error}");
     }
@@ -1033,38 +1400,27 @@ mod tests {
     #[test]
     fn custom_expression_cannot_use_a_canonical_preset_name() {
         let mut value = valid_document();
-        value["extensions"]["VRMC_vrm"]["expressions"] = json!({
-            "custom": { "blink": {} }
-        });
+        value["extensions"]["VRMC_vrm"]["expressions"] = json!({"custom":{"blink":{}}});
         let error = parse(value).unwrap_err().to_string();
         assert!(error.contains("conflicts with a preset"), "{error}");
     }
 
     #[test]
-    fn meta_version_is_optional() {
+    fn meta_version_is_optional_and_empty_is_valid() {
         let mut value = valid_document();
         value["extensions"]["VRMC_vrm"]["meta"]
             .as_object_mut()
             .unwrap()
             .remove("version");
-        let doc = parse(value).unwrap();
-        assert_eq!(doc.meta.version, None);
-    }
+        assert_eq!(parse(value).unwrap().meta.version, None);
 
-    #[test]
-    fn empty_meta_version_is_valid() {
         let mut value = valid_document();
         value["extensions"]["VRMC_vrm"]["meta"]["version"] = json!("");
-        let doc = parse(value).unwrap();
-        assert_eq!(doc.meta.version.as_deref(), Some(""));
+        assert_eq!(parse(value).unwrap().meta.version.as_deref(), Some(""));
     }
 
     #[test]
     fn material_and_node_extensions_use_standard_locations() {
-        let doc = parse(valid_document()).unwrap();
-        assert!(doc.materials_mtoon.present);
-        assert!(doc.node_constraint.present);
-
         let mut value = valid_document();
         value["materials"][0]["extensions"]
             .as_object_mut()
@@ -1076,11 +1432,11 @@ mod tests {
             .remove("VRMC_node_constraint");
         value["extensions"].as_object_mut().unwrap().insert(
             "VRMC_materials_mtoon".to_owned(),
-            json!({ "specVersion": "1.0" }),
+            json!({"specVersion":"1.0"}),
         );
         value["extensions"].as_object_mut().unwrap().insert(
             "VRMC_node_constraint".to_owned(),
-            json!({ "specVersion": "1.0" }),
+            json!({"specVersion":"1.0"}),
         );
         let doc = parse(value).unwrap();
         assert!(!doc.materials_mtoon.present);
@@ -1129,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_or_missing_spec_version_is_rejected() {
+    fn wrong_or_missing_vrm_spec_version_is_rejected() {
         let mut wrong = valid_document();
         wrong["extensions"]["VRMC_vrm"]["specVersion"] = json!("0.99");
         let error = parse(wrong).unwrap_err().to_string();
@@ -1150,7 +1506,7 @@ mod tests {
         value["extensions"]
             .as_object_mut()
             .unwrap()
-            .insert("VRM".to_owned(), json!({ "meta": {}, "humanoid": {} }));
+            .insert("VRM".to_owned(), json!({"meta":{},"humanoid":{}}));
         let error = parse(value).unwrap_err().to_string();
         assert!(error.contains("legacy VRM 0.x"), "{error}");
     }

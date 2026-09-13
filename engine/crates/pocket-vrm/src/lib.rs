@@ -36,7 +36,9 @@ pub use parse::{
 };
 pub use spring::SpringSolver;
 pub use vrm1::{
-    Vrm1Doc, Vrm1Expression, Vrm1ExpressionKind, Vrm1ExpressionOverride, Vrm1ExtensionInfo,
-    Vrm1HumanBone, Vrm1Humanoid, Vrm1Meta, Vrm1MorphTargetBind,
+    Vrm1CapsuleCollider, Vrm1Collider, Vrm1ColliderGroup, Vrm1ColliderShape, Vrm1Doc,
+    Vrm1Expression, Vrm1ExpressionKind, Vrm1ExpressionOverride, Vrm1ExtensionInfo, Vrm1HumanBone,
+    Vrm1Humanoid, Vrm1Meta, Vrm1MorphTargetBind, Vrm1SphereCollider, Vrm1Spring, Vrm1SpringBone,
+    Vrm1SpringJoint,
 };
 pub use vrma::{HumanoidView, VrmaDoc, load_vrma_bytes, retarget, retarget_with_humanoid};
