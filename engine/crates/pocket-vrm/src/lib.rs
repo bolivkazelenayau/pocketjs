@@ -24,6 +24,7 @@
 
 pub mod glb;
 pub mod lookat;
+pub mod node_constraint;
 pub mod parse;
 pub mod spring;
 pub mod vrm1;
@@ -31,15 +32,21 @@ pub mod vrm1_lookat;
 pub mod vrma;
 
 pub use lookat::apply_eye_look;
+pub use node_constraint::{
+    aim_axis_vector, aim_constraint, aim_target, apply_aim_constraint, apply_roll_constraint,
+    checked_normalize_quat, checked_normalize_vec3, roll_axis_vector, roll_constraint, roll_target,
+    roll_twist, rotation_constraint, shortest_rotation, slerp_shortest,
+};
 pub use parse::{
     ColliderGroup, LookAtDegreeMap, LookAtRanges, MorphBind, SphereCollider, SpringConfig,
     SpringGroup, VrmDoc, VrmExpression, VrmMaterialInfo, VrmMeta,
 };
 pub use spring::SpringSolver;
 pub use vrm1::{
-    Vrm1CapsuleCollider, Vrm1Collider, Vrm1ColliderGroup, Vrm1ColliderShape, Vrm1Doc,
+    Vrm1AimAxis, Vrm1CapsuleCollider, Vrm1Collider, Vrm1ColliderGroup, Vrm1ColliderShape, Vrm1Doc,
     Vrm1Expression, Vrm1ExpressionKind, Vrm1ExpressionOverride, Vrm1ExtensionInfo, Vrm1HumanBone,
     Vrm1Humanoid, Vrm1LookAt, Vrm1LookAtRangeMap, Vrm1LookAtType, Vrm1Meta, Vrm1MorphTargetBind,
+    Vrm1NodeConstraint, Vrm1NodeConstraintKind, Vrm1NodeConstraintSet, Vrm1RollAxis,
     Vrm1SphereCollider, Vrm1Spring, Vrm1SpringBone, Vrm1SpringJoint,
 };
 pub use vrm1_lookat::{

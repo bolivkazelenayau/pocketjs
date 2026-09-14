@@ -380,6 +380,7 @@ mod tests {
             spring_bone: crate::Vrm1ExtensionInfo::default(),
             spring_bone_semantics: None,
             node_constraint: crate::Vrm1ExtensionInfo::default(),
+            node_constraint_semantics: None,
             expressions: Vec::new(),
             has_expressions: false,
             look_at: Some(look_at(kind)),

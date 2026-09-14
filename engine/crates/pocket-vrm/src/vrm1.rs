@@ -232,6 +232,63 @@ pub struct Vrm1ExtensionInfo {
     pub present: bool,
     pub version: Option<String>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vrm1RollAxis {
+    X,
+    Y,
+    Z,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vrm1AimAxis {
+    PositiveX,
+    NegativeX,
+    PositiveY,
+    NegativeY,
+    PositiveZ,
+    NegativeZ,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Vrm1NodeConstraintKind {
+    Roll {
+        source: usize,
+        axis: Vrm1RollAxis,
+        weight: f32,
+    },
+    Aim {
+        source: usize,
+        axis: Vrm1AimAxis,
+        weight: f32,
+    },
+    Rotation {
+        source: usize,
+        weight: f32,
+    },
+}
+
+impl Vrm1NodeConstraintKind {
+    fn source(self) -> usize {
+        match self {
+            Self::Roll { source, .. }
+            | Self::Aim { source, .. }
+            | Self::Rotation { source, .. } => source,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vrm1NodeConstraint {
+    pub destination: usize,
+    pub kind: Vrm1NodeConstraintKind,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Vrm1NodeConstraintSet {
+    pub constraints: Vec<Vrm1NodeConstraint>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Vrm1ExpressionKind {
     Preset,
@@ -341,6 +398,7 @@ pub struct Vrm1Doc {
     pub spring_bone: Vrm1ExtensionInfo,
     pub spring_bone_semantics: Option<Vrm1SpringBone>,
     pub node_constraint: Vrm1ExtensionInfo,
+    pub node_constraint_semantics: Option<Vrm1NodeConstraintSet>,
     pub expressions: Vec<Vrm1Expression>,
     pub has_expressions: bool,
     pub look_at: Option<Vrm1LookAt>,
@@ -377,6 +435,22 @@ impl Vrm1Doc {
             .get("VRMC_springBone")
             .map(|v| parse_spring_bone(v, children.len(), &parents))
             .transpose()?;
+        let node_constraint_required = extension_declaration_contains(
+            &glb.json,
+            "extensionsRequired",
+            "VRMC_node_constraint",
+        )?;
+        let (node_constraint, node_constraint_semantics) =
+            match parse_node_constraints(&glb.json, children.len()) {
+                Ok(parsed) => parsed,
+                Err(error) if node_constraint_required => return Err(error),
+                Err(error) => {
+                    log::warn!(
+                        "disabling malformed optional VRMC_node_constraint extension: {error:#}"
+                    );
+                    (Vrm1ExtensionInfo::default(), None)
+                }
+            };
         let look_at = match parse_look_at(vrm) {
             Ok(look_at) => look_at,
             Err(error) => {
@@ -394,7 +468,8 @@ impl Vrm1Doc {
             )?,
             spring_bone,
             spring_bone_semantics,
-            node_constraint: extension_info_in_array(&glb.json, "nodes", "VRMC_node_constraint")?,
+            node_constraint,
+            node_constraint_semantics,
             expressions: parse_expressions(vrm)?,
             has_expressions: vrm.contains_key("expressions"),
             look_at,
@@ -1034,6 +1109,199 @@ fn extension_info_in_array(
     }
     Ok(f.unwrap_or_default())
 }
+
+fn parse_node_constraints(
+    root: &Value,
+    node_count: usize,
+) -> Result<(Vrm1ExtensionInfo, Option<Vrm1NodeConstraintSet>)> {
+    const NAME: &str = "VRMC_node_constraint";
+    let extensions_used = extension_declaration_contains(root, "extensionsUsed", NAME)?;
+    let extensions_required = extension_declaration_contains(root, "extensionsRequired", NAME)?;
+    ensure!(
+        !extensions_required || extensions_used,
+        "glTF extensionsRequired contains {NAME}, but extensionsUsed does not"
+    );
+
+    let nodes = root
+        .get("nodes")
+        .and_then(Value::as_array)
+        .context("GLB is missing required glTF nodes array")?;
+    let mut info: Option<Vrm1ExtensionInfo> = None;
+    let mut constraints = Vec::new();
+
+    for (destination, node) in nodes.iter().enumerate() {
+        let node = node
+            .as_object()
+            .with_context(|| format!("glTF node {destination} must be an object"))?;
+        let Some(extensions) = node.get("extensions") else {
+            continue;
+        };
+        let extensions = extensions
+            .as_object()
+            .with_context(|| format!("glTF node {destination}.extensions must be an object"))?;
+        let Some(value) = extensions.get(NAME) else {
+            continue;
+        };
+
+        let extension_context = format!("glTF node {destination}.extensions.{NAME}");
+        let extension_info = required_extension_info(value, &extension_context)?;
+        if let Some(previous) = &info {
+            ensure!(
+                previous.version == extension_info.version,
+                "{NAME} has conflicting specVersion values"
+            );
+        }
+        info = Some(extension_info);
+
+        let extension = value
+            .as_object()
+            .with_context(|| format!("{extension_context} extension must be an object"))?;
+        let constraint_context = format!("{extension_context}.constraint");
+        let constraint = extension
+            .get("constraint")
+            .with_context(|| format!("{extension_context} is missing constraint"))?
+            .as_object()
+            .with_context(|| format!("{constraint_context} must be an object"))?;
+        let kind = parse_node_constraint_kind(constraint, &constraint_context)?;
+        let source = kind.source();
+        ensure!(
+            source < node_count,
+            "{extension_context} source {source} is out of range for {node_count} nodes"
+        );
+        ensure!(
+            source != destination,
+            "{extension_context} source must not equal destination node {destination}"
+        );
+        constraints.push(Vrm1NodeConstraint { destination, kind });
+    }
+
+    let Some(info) = info else {
+        ensure!(
+            !extensions_required,
+            "glTF extensionsRequired contains {NAME}, but no node declares the extension"
+        );
+        return Ok((Vrm1ExtensionInfo::default(), None));
+    };
+    ensure!(
+        extensions_used,
+        "{NAME} is present on a node but is missing from glTF extensionsUsed"
+    );
+    Ok((info, Some(Vrm1NodeConstraintSet { constraints })))
+}
+
+fn parse_node_constraint_kind(
+    extension: &Map<String, Value>,
+    context: &str,
+) -> Result<Vrm1NodeConstraintKind> {
+    let variant_count = ["roll", "aim", "rotation"]
+        .into_iter()
+        .filter(|key| extension.contains_key(*key))
+        .count();
+    ensure!(
+        variant_count == 1,
+        "{context} must contain exactly one of roll, aim, or rotation; found {variant_count}"
+    );
+
+    if let Some(value) = extension.get("roll") {
+        let roll = value
+            .as_object()
+            .with_context(|| format!("{context}.roll must be an object"))?;
+        let source = constraint_source(roll, &format!("{context}.roll"))?;
+        let axis = parse_roll_axis(roll, &format!("{context}.roll"))?;
+        let weight = constraint_weight(roll, &format!("{context}.roll"))?;
+        return Ok(Vrm1NodeConstraintKind::Roll {
+            source,
+            axis,
+            weight,
+        });
+    }
+
+    if let Some(value) = extension.get("aim") {
+        let aim = value
+            .as_object()
+            .with_context(|| format!("{context}.aim must be an object"))?;
+        let source = constraint_source(aim, &format!("{context}.aim"))?;
+        let axis = parse_aim_axis(aim, &format!("{context}.aim"))?;
+        let weight = constraint_weight(aim, &format!("{context}.aim"))?;
+        return Ok(Vrm1NodeConstraintKind::Aim {
+            source,
+            axis,
+            weight,
+        });
+    }
+
+    let rotation = extension
+        .get("rotation")
+        .expect("exactly one node constraint variant was counted");
+    let rotation = rotation
+        .as_object()
+        .with_context(|| format!("{context}.rotation must be an object"))?;
+    Ok(Vrm1NodeConstraintKind::Rotation {
+        source: constraint_source(rotation, &format!("{context}.rotation"))?,
+        weight: constraint_weight(rotation, &format!("{context}.rotation"))?,
+    })
+}
+
+fn constraint_source(extension: &Map<String, Value>, context: &str) -> Result<usize> {
+    index_value(
+        extension
+            .get("source")
+            .with_context(|| format!("{context} is missing source"))?,
+        &format!("{context}.source"),
+    )
+}
+
+fn constraint_weight(extension: &Map<String, Value>, context: &str) -> Result<f32> {
+    let weight = extension
+        .get("weight")
+        .map(|value| number(value, &format!("{context}.weight")))
+        .transpose()?
+        .unwrap_or(1.0);
+    bounded(weight, 0.0, 1.0, &format!("{context}.weight"))
+}
+
+fn parse_roll_axis(extension: &Map<String, Value>, context: &str) -> Result<Vrm1RollAxis> {
+    let axis = required_string(extension, "rollAxis", context)?;
+    match axis.as_str() {
+        "X" => Ok(Vrm1RollAxis::X),
+        "Y" => Ok(Vrm1RollAxis::Y),
+        "Z" => Ok(Vrm1RollAxis::Z),
+        _ => bail!("{context}.rollAxis must be one of X, Y, or Z, got {axis:?}"),
+    }
+}
+
+fn parse_aim_axis(extension: &Map<String, Value>, context: &str) -> Result<Vrm1AimAxis> {
+    let axis = required_string(extension, "aimAxis", context)?;
+    match axis.as_str() {
+        "PositiveX" => Ok(Vrm1AimAxis::PositiveX),
+        "NegativeX" => Ok(Vrm1AimAxis::NegativeX),
+        "PositiveY" => Ok(Vrm1AimAxis::PositiveY),
+        "NegativeY" => Ok(Vrm1AimAxis::NegativeY),
+        "PositiveZ" => Ok(Vrm1AimAxis::PositiveZ),
+        "NegativeZ" => Ok(Vrm1AimAxis::NegativeZ),
+        _ => bail!(
+            "{context}.aimAxis must be one of PositiveX, NegativeX, PositiveY, NegativeY, PositiveZ, or NegativeZ, got {axis:?}"
+        ),
+    }
+}
+
+fn extension_declaration_contains(root: &Value, key: &str, name: &str) -> Result<bool> {
+    let Some(value) = root.get(key) else {
+        return Ok(false);
+    };
+    let declarations = value
+        .as_array()
+        .with_context(|| format!("glTF {key} must be an array"))?;
+    let mut found = false;
+    for (index, value) in declarations.iter().enumerate() {
+        let declaration = value
+            .as_str()
+            .with_context(|| format!("glTF {key}[{index}] must be an extension name string"))?;
+        found |= declaration == name;
+    }
+    Ok(found)
+}
+
 fn optional_object(v: &Map<String, Value>, name: &str) -> Result<bool> {
     let Some(x) = v.get(name) else {
         return Ok(false);
@@ -1268,7 +1536,11 @@ mod tests {
         value["materials"] = json!([
             {"extensions":{"VRMC_materials_mtoon":{"specVersion":"1.0"}}}
         ]);
-        value["nodes"][0]["extensions"] = json!({"VRMC_node_constraint":{"specVersion":"1.0"}});
+        value["nodes"][0]["extensions"] = json!({"VRMC_node_constraint":{
+            "specVersion":"1.0",
+            "constraint":{"rotation":{"source":1}}
+        }});
+        value["extensionsUsed"] = json!(["VRMC_node_constraint"]);
         value["extensions"]["VRMC_vrm"]["meta"]["version"] = json!("1.0");
         value["extensions"]["VRMC_vrm"]["expressions"] = json!({});
         value["extensions"]["VRMC_vrm"]["lookAt"] = look_at_json("bone");
@@ -1291,6 +1563,287 @@ mod tests {
 
     fn parse(value: Value) -> Result<Vrm1Doc> {
         Vrm1Doc::from_glb_bytes(&glb(value))
+    }
+
+    fn node_constraint_document(extension: Value) -> Value {
+        let mut value = base();
+        value["extensionsUsed"] = json!(["VRMC_node_constraint"]);
+        value["extensionsRequired"] = json!(["VRMC_node_constraint"]);
+        let mut extension = extension
+            .as_object()
+            .expect("test constraint extension must be an object")
+            .clone();
+        let spec_version = extension.remove("specVersion");
+        let mut node_extension = serde_json::Map::new();
+        if let Some(spec_version) = spec_version {
+            node_extension.insert("specVersion".to_owned(), spec_version);
+        }
+        node_extension.insert("constraint".to_owned(), Value::Object(extension));
+        value["nodes"][0]["extensions"] = json!({
+            "VRMC_node_constraint": Value::Object(node_extension)
+        });
+        value
+    }
+
+    #[test]
+    fn node_constraint_absence_has_no_typed_semantics() {
+        let doc = parse(base()).unwrap();
+        assert!(!doc.node_constraint.present);
+        assert_eq!(doc.node_constraint_semantics, None);
+    }
+
+    #[test]
+    fn valid_node_constraint_variants_are_typed() {
+        let roll = parse(node_constraint_document(json!({
+            "specVersion": "1.0",
+            "roll": {"source": 1, "rollAxis": "Y", "weight": 0.25}
+        })))
+        .unwrap();
+        assert_eq!(
+            roll.node_constraint_semantics
+                .as_ref()
+                .unwrap()
+                .constraints
+                .len(),
+            1
+        );
+        assert_eq!(
+            roll.node_constraint_semantics.as_ref().unwrap().constraints[0],
+            Vrm1NodeConstraint {
+                destination: 0,
+                kind: Vrm1NodeConstraintKind::Roll {
+                    source: 1,
+                    axis: Vrm1RollAxis::Y,
+                    weight: 0.25,
+                },
+            }
+        );
+
+        let aim = parse(node_constraint_document(json!({
+            "specVersion": "1.0",
+            "aim": {"source": 1, "aimAxis": "NegativeZ", "weight": 0.5}
+        })))
+        .unwrap();
+        assert!(matches!(
+            aim.node_constraint_semantics.as_ref().unwrap().constraints[0].kind,
+            Vrm1NodeConstraintKind::Aim {
+                source: 1,
+                axis: Vrm1AimAxis::NegativeZ,
+                weight
+            } if weight == 0.5
+        ));
+
+        let rotation = parse(node_constraint_document(json!({
+            "specVersion": "1.0",
+            "rotation": {"source": 1, "weight": 0.75}
+        })))
+        .unwrap();
+        assert!(matches!(
+            rotation
+                .node_constraint_semantics
+                .as_ref()
+                .unwrap()
+                .constraints[0]
+                .kind,
+            Vrm1NodeConstraintKind::Rotation {
+                source: 1,
+                weight
+            } if weight == 0.75
+        ));
+    }
+
+    #[test]
+    fn node_constraint_weight_defaults_to_one_for_every_variant() {
+        for variant in [
+            json!({"roll": {"source": 1, "rollAxis": "X"}}),
+            json!({"aim": {"source": 1, "aimAxis": "PositiveX"}}),
+            json!({"rotation": {"source": 1}}),
+        ] {
+            let mut extension = variant;
+            extension["specVersion"] = json!("1.0");
+            let doc = parse(node_constraint_document(extension)).unwrap();
+            let kind = doc.node_constraint_semantics.unwrap().constraints[0].kind;
+            let weight = match kind {
+                Vrm1NodeConstraintKind::Roll { weight, .. }
+                | Vrm1NodeConstraintKind::Aim { weight, .. }
+                | Vrm1NodeConstraintKind::Rotation { weight, .. } => weight,
+            };
+            assert_eq!(weight, 1.0);
+        }
+    }
+
+    #[test]
+    fn every_node_constraint_axis_is_typed() {
+        for (axis, expected) in [
+            ("X", Vrm1RollAxis::X),
+            ("Y", Vrm1RollAxis::Y),
+            ("Z", Vrm1RollAxis::Z),
+        ] {
+            let doc = parse(node_constraint_document(json!({
+                "specVersion": "1.0",
+                "roll": {"source": 1, "rollAxis": axis}
+            })))
+            .unwrap();
+            assert!(matches!(
+                doc.node_constraint_semantics.unwrap().constraints[0].kind,
+                Vrm1NodeConstraintKind::Roll { axis, .. } if axis == expected
+            ));
+        }
+
+        for (axis, expected) in [
+            ("PositiveX", Vrm1AimAxis::PositiveX),
+            ("NegativeX", Vrm1AimAxis::NegativeX),
+            ("PositiveY", Vrm1AimAxis::PositiveY),
+            ("NegativeY", Vrm1AimAxis::NegativeY),
+            ("PositiveZ", Vrm1AimAxis::PositiveZ),
+            ("NegativeZ", Vrm1AimAxis::NegativeZ),
+        ] {
+            let doc = parse(node_constraint_document(json!({
+                "specVersion": "1.0",
+                "aim": {"source": 1, "aimAxis": axis}
+            })))
+            .unwrap();
+            assert!(matches!(
+                doc.node_constraint_semantics.unwrap().constraints[0].kind,
+                Vrm1NodeConstraintKind::Aim { axis, .. } if axis == expected
+            ));
+        }
+    }
+
+    #[test]
+    fn node_constraint_requires_exactly_one_variant() {
+        let zero = node_constraint_document(json!({"specVersion": "1.0"}));
+        let error = parse(zero).unwrap_err().to_string();
+        assert!(
+            error.contains("exactly one") && error.contains("found 0"),
+            "{error}"
+        );
+
+        let multiple = node_constraint_document(json!({
+            "specVersion": "1.0",
+            "roll": {"source": 1, "rollAxis": "X"},
+            "rotation": {"source": 1}
+        }));
+        let error = parse(multiple).unwrap_err().to_string();
+        assert!(
+            error.contains("exactly one") && error.contains("found 2"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn node_constraint_requires_the_normative_constraint_object() {
+        let mut value = base();
+        value["extensionsUsed"] = json!(["VRMC_node_constraint"]);
+        value["extensionsRequired"] = json!(["VRMC_node_constraint"]);
+        value["nodes"][0]["extensions"] = json!({
+            "VRMC_node_constraint": {
+                "specVersion": "1.0",
+                "rotation": {"source": 1}
+            }
+        });
+        let error = parse(value).unwrap_err().to_string();
+        assert!(error.contains("missing constraint"), "{error}");
+    }
+
+    #[test]
+    fn node_constraint_indices_and_axes_are_validated() {
+        let missing_source = node_constraint_document(json!({
+            "specVersion": "1.0",
+            "roll": {"rollAxis": "X"}
+        }));
+        let error = parse(missing_source).unwrap_err().to_string();
+        assert!(error.contains("missing source"), "{error}");
+
+        for source in [json!(999), json!(-1), json!("one")] {
+            let value = node_constraint_document(json!({
+                "specVersion": "1.0",
+                "rotation": {"source": source}
+            }));
+            assert!(parse(value).is_err(), "invalid source {source}");
+        }
+
+        let self_reference = node_constraint_document(json!({
+            "specVersion": "1.0",
+            "rotation": {"source": 0}
+        }));
+        let error = parse(self_reference).unwrap_err().to_string();
+        assert!(error.contains("must not equal destination"), "{error}");
+
+        for (variant, axis_key) in [("roll", "rollAxis"), ("aim", "aimAxis")] {
+            let mut body = serde_json::Map::new();
+            body.insert("source".to_owned(), json!(1));
+            body.insert(axis_key.to_owned(), json!("NotAnAxis"));
+            let mut extension = serde_json::Map::new();
+            extension.insert("specVersion".to_owned(), json!("1.0"));
+            extension.insert(variant.to_owned(), Value::Object(body));
+            let error = parse(node_constraint_document(Value::Object(extension)))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("Axis") || error.contains("axis"), "{error}");
+        }
+    }
+
+    #[test]
+    fn node_constraint_weights_are_finite_and_bounded() {
+        for weight in [json!(-0.01), json!(1.01), json!(3.5e38_f64), json!("one")] {
+            let value = node_constraint_document(json!({
+                "specVersion": "1.0",
+                "rotation": {"source": 1, "weight": weight}
+            }));
+            assert!(parse(value).is_err(), "invalid weight {weight}");
+        }
+    }
+
+    #[test]
+    fn node_constraint_spec_version_and_declarations_are_consistent() {
+        for spec_version in [Some(json!("0.9")), None] {
+            let mut extension = json!({"rotation": {"source": 1}});
+            if let Some(spec_version) = spec_version {
+                extension["specVersion"] = spec_version;
+            }
+            let error = parse(node_constraint_document(extension))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("VRMC_node_constraint") && error.contains("specVersion"));
+        }
+
+        let mut undeclared = node_constraint_document(json!({
+            "specVersion": "1.0",
+            "rotation": {"source": 1}
+        }));
+        undeclared.as_object_mut().unwrap().remove("extensionsUsed");
+        let error = parse(undeclared).unwrap_err().to_string();
+        assert!(
+            error.contains("extensionsRequired") && error.contains("extensionsUsed"),
+            "{error}"
+        );
+
+        let mut required_without_used = base();
+        required_without_used["extensionsRequired"] = json!(["VRMC_node_constraint"]);
+        let error = parse(required_without_used).unwrap_err().to_string();
+        assert!(error.contains("extensionsUsed"), "{error}");
+    }
+
+    #[test]
+    fn malformed_optional_node_constraint_disables_the_entire_extension() {
+        let mut value = node_constraint_document(json!({
+            "specVersion": "1.0",
+            "rotation": {}
+        }));
+        value.as_object_mut().unwrap().remove("extensionsRequired");
+        let document = parse(value).expect("malformed optional constraint must not reject VRM");
+        assert!(!document.node_constraint.present);
+        assert!(document.node_constraint_semantics.is_none());
+    }
+
+    #[test]
+    fn required_node_constraint_without_a_payload_is_rejected() {
+        let mut value = base();
+        value["extensionsUsed"] = json!(["VRMC_node_constraint"]);
+        value["extensionsRequired"] = json!(["VRMC_node_constraint"]);
+        let error = parse(value).unwrap_err().to_string();
+        assert!(error.contains("no node declares"), "{error}");
     }
 
     #[test]
@@ -1613,6 +2166,7 @@ mod tests {
         );
 
         let mut node_constraint = valid_document();
+        node_constraint["extensionsRequired"] = json!(["VRMC_node_constraint"]);
         node_constraint["nodes"][0]["extensions"]["VRMC_node_constraint"]
             .as_object_mut()
             .unwrap()
