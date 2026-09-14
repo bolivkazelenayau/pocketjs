@@ -27,6 +27,7 @@ pub mod lookat;
 pub mod parse;
 pub mod spring;
 pub mod vrm1;
+pub mod vrm1_lookat;
 pub mod vrma;
 
 pub use lookat::apply_eye_look;
@@ -38,7 +39,11 @@ pub use spring::SpringSolver;
 pub use vrm1::{
     Vrm1CapsuleCollider, Vrm1Collider, Vrm1ColliderGroup, Vrm1ColliderShape, Vrm1Doc,
     Vrm1Expression, Vrm1ExpressionKind, Vrm1ExpressionOverride, Vrm1ExtensionInfo, Vrm1HumanBone,
-    Vrm1Humanoid, Vrm1Meta, Vrm1MorphTargetBind, Vrm1SphereCollider, Vrm1Spring, Vrm1SpringBone,
-    Vrm1SpringJoint,
+    Vrm1Humanoid, Vrm1LookAt, Vrm1LookAtRangeMap, Vrm1LookAtType, Vrm1Meta, Vrm1MorphTargetBind,
+    Vrm1SphereCollider, Vrm1Spring, Vrm1SpringBone, Vrm1SpringJoint,
+};
+pub use vrm1_lookat::{
+    Vrm1ExpressionLookAt, Vrm1EyeBoneOutput, Vrm1LookAtAngles, Vrm1LookAtOutput, Vrm1LookAtRuntime,
+    map_vrm1_look_at_range,
 };
 pub use vrma::{HumanoidView, VrmaDoc, load_vrma_bytes, retarget, retarget_with_humanoid};

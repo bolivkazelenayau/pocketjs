@@ -243,6 +243,28 @@ pub enum Vrm1ExpressionOverride {
     Block,
     Blend,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vrm1LookAtType {
+    Bone,
+    Expression,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vrm1LookAtRangeMap {
+    pub input_max_value: f32,
+    pub output_scale: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vrm1LookAt {
+    pub kind: Vrm1LookAtType,
+    pub offset_from_head_bone: Vec3,
+    pub range_map_horizontal_inner: Vrm1LookAtRangeMap,
+    pub range_map_horizontal_outer: Vrm1LookAtRangeMap,
+    pub range_map_vertical_down: Vrm1LookAtRangeMap,
+    pub range_map_vertical_up: Vrm1LookAtRangeMap,
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vrm1MorphTargetBind {
     pub node: usize,
@@ -321,7 +343,7 @@ pub struct Vrm1Doc {
     pub node_constraint: Vrm1ExtensionInfo,
     pub expressions: Vec<Vrm1Expression>,
     pub has_expressions: bool,
-    pub has_look_at: bool,
+    pub look_at: Option<Vrm1LookAt>,
     pub has_first_person: bool,
     pub node_count: usize,
     pub node_meshes: Vec<Option<usize>>,
@@ -355,6 +377,13 @@ impl Vrm1Doc {
             .get("VRMC_springBone")
             .map(|v| parse_spring_bone(v, children.len(), &parents))
             .transpose()?;
+        let look_at = match parse_look_at(vrm) {
+            Ok(look_at) => look_at,
+            Err(error) => {
+                log::warn!("disabling malformed VRM 1.0 LookAt metadata: {error:#}");
+                None
+            }
+        };
         Ok(Self {
             meta: parse_meta(vrm)?,
             humanoid: parse_humanoid(vrm, children.len())?,
@@ -368,7 +397,7 @@ impl Vrm1Doc {
             node_constraint: extension_info_in_array(&glb.json, "nodes", "VRMC_node_constraint")?,
             expressions: parse_expressions(vrm)?,
             has_expressions: vrm.contains_key("expressions"),
-            has_look_at: optional_object(vrm, "lookAt")?,
+            look_at,
             has_first_person: optional_object(vrm, "firstPerson")?,
             node_count: children.len(),
             node_meshes,
@@ -768,6 +797,66 @@ fn parse_expressions(vrm: &Map<String, Value>) -> Result<Vec<Vrm1Expression>> {
     }
     Ok(out)
 }
+
+fn parse_look_at(vrm: &Map<String, Value>) -> Result<Option<Vrm1LookAt>> {
+    let Some(value) = vrm.get("lookAt") else {
+        return Ok(None);
+    };
+    let look_at = value
+        .as_object()
+        .context("VRMC_vrm.lookAt must be an object")?;
+    let kind = match required_string(look_at, "type", "VRMC_vrm.lookAt")?.as_str() {
+        "bone" => Vrm1LookAtType::Bone,
+        "expression" => Vrm1LookAtType::Expression,
+        value => bail!("VRMC_vrm.lookAt.type has unknown value {value:?}"),
+    };
+    Ok(Some(Vrm1LookAt {
+        kind,
+        // The specification recommends an implementation fallback when the
+        // offset is absent. Model-space zero is deterministic and keeps the
+        // origin at the authored head node.
+        offset_from_head_bone: optional_vec3(look_at, "offsetFromHeadBone", "VRMC_vrm.lookAt")?
+            .unwrap_or(Vec3::ZERO),
+        range_map_horizontal_inner: parse_look_at_range_map(look_at, "rangeMapHorizontalInner")?,
+        range_map_horizontal_outer: parse_look_at_range_map(look_at, "rangeMapHorizontalOuter")?,
+        range_map_vertical_down: parse_look_at_range_map(look_at, "rangeMapVerticalDown")?,
+        range_map_vertical_up: parse_look_at_range_map(look_at, "rangeMapVerticalUp")?,
+    }))
+}
+
+fn parse_look_at_range_map(look_at: &Map<String, Value>, key: &str) -> Result<Vrm1LookAtRangeMap> {
+    let context = format!("VRMC_vrm.lookAt.{key}");
+    let range = look_at
+        .get(key)
+        .with_context(|| format!("VRMC_vrm.lookAt is missing required {key}"))?
+        .as_object()
+        .with_context(|| format!("{context} must be an object"))?;
+    let input_max_value = number(
+        range
+            .get("inputMaxValue")
+            .with_context(|| format!("{context} is missing inputMaxValue"))?,
+        &format!("{context}.inputMaxValue"),
+    )?;
+    let output_scale = number(
+        range
+            .get("outputScale")
+            .with_context(|| format!("{context} is missing outputScale"))?,
+        &format!("{context}.outputScale"),
+    )?;
+    ensure!(
+        (0.0..=180.0).contains(&input_max_value),
+        "{context}.inputMaxValue must be in [0, 180]"
+    );
+    ensure!(
+        output_scale >= 0.0,
+        "{context}.outputScale must be non-negative"
+    );
+    Ok(Vrm1LookAtRangeMap {
+        input_max_value,
+        output_scale,
+    })
+}
+
 fn is_preset(s: &str) -> bool {
     matches!(
         s,
@@ -1182,11 +1271,22 @@ mod tests {
         value["nodes"][0]["extensions"] = json!({"VRMC_node_constraint":{"specVersion":"1.0"}});
         value["extensions"]["VRMC_vrm"]["meta"]["version"] = json!("1.0");
         value["extensions"]["VRMC_vrm"]["expressions"] = json!({});
-        value["extensions"]["VRMC_vrm"]["lookAt"] = json!({});
+        value["extensions"]["VRMC_vrm"]["lookAt"] = look_at_json("bone");
         value["extensions"]["VRMC_vrm"]["firstPerson"] = json!({});
         value["extensions"]["VRMC_springBone"] = json!({"specVersion":"1.0"});
         value["extensions"]["X_unknown_optional"] = json!({"anything":true});
         value
+    }
+
+    fn look_at_json(kind: &str) -> Value {
+        json!({
+            "type": kind,
+            "offsetFromHeadBone": [0.1, 0.2, 0.3],
+            "rangeMapHorizontalInner": { "inputMaxValue": 10.0, "outputScale": 1.0 },
+            "rangeMapHorizontalOuter": { "inputMaxValue": 20.0, "outputScale": 2.0 },
+            "rangeMapVerticalDown": { "inputMaxValue": 30.0, "outputScale": 3.0 },
+            "rangeMapVerticalUp": { "inputMaxValue": 40.0, "outputScale": 4.0 }
+        })
     }
 
     fn parse(value: Value) -> Result<Vrm1Doc> {
@@ -1301,7 +1401,13 @@ mod tests {
         assert_eq!(doc.humanoid.node_for(Vrm1HumanBone::Hips), Some(0));
         assert_eq!(doc.node_count, Vrm1HumanBone::REQUIRED.len());
         assert!(doc.has_expressions);
-        assert!(doc.has_look_at);
+        let look_at = doc.look_at.as_ref().unwrap();
+        assert_eq!(look_at.kind, Vrm1LookAtType::Bone);
+        assert_eq!(look_at.offset_from_head_bone, Vec3::new(0.1, 0.2, 0.3));
+        assert_eq!(look_at.range_map_horizontal_inner.input_max_value, 10.0);
+        assert_eq!(look_at.range_map_horizontal_outer.output_scale, 2.0);
+        assert_eq!(look_at.range_map_vertical_down.input_max_value, 30.0);
+        assert_eq!(look_at.range_map_vertical_up.output_scale, 4.0);
         assert!(doc.has_first_person);
         assert!(doc.materials_mtoon.present);
         assert_eq!(doc.materials_mtoon.version.as_deref(), Some("1.0"));
@@ -1311,6 +1417,59 @@ mod tests {
         assert_eq!(doc.node_constraint.version.as_deref(), Some("1.0"));
         assert_eq!(doc.node_meshes.len(), doc.node_count);
         assert!(doc.node_meshes.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn look_at_absence_and_valid_expression_are_typed() {
+        assert!(parse(base()).unwrap().look_at.is_none());
+        let mut value = base();
+        value["extensions"]["VRMC_vrm"]["lookAt"] = look_at_json("expression");
+        let look_at = parse(value).unwrap().look_at.unwrap();
+        assert_eq!(look_at.kind, Vrm1LookAtType::Expression);
+        assert_eq!(look_at.offset_from_head_bone, Vec3::new(0.1, 0.2, 0.3));
+    }
+
+    #[test]
+    fn look_at_without_offset_uses_head_origin() {
+        let mut value = base();
+        let mut look_at = look_at_json("bone");
+        look_at
+            .as_object_mut()
+            .unwrap()
+            .remove("offsetFromHeadBone");
+        value["extensions"]["VRMC_vrm"]["lookAt"] = look_at;
+        assert_eq!(
+            parse(value).unwrap().look_at.unwrap().offset_from_head_bone,
+            Vec3::ZERO
+        );
+    }
+
+    #[test]
+    fn malformed_or_partial_look_at_is_disabled_without_rejecting_avatar() {
+        let mut malformed_enum = base();
+        malformed_enum["extensions"]["VRMC_vrm"]["lookAt"] = look_at_json("bones");
+        assert!(parse(malformed_enum).unwrap().look_at.is_none());
+
+        let mut partial = base();
+        let mut look_at = look_at_json("bone");
+        look_at
+            .as_object_mut()
+            .unwrap()
+            .remove("rangeMapVerticalUp");
+        partial["extensions"]["VRMC_vrm"]["lookAt"] = look_at;
+        assert!(parse(partial).unwrap().look_at.is_none());
+
+        let mut overflow = base();
+        let mut look_at = look_at_json("bone");
+        look_at["rangeMapHorizontalInner"]["outputScale"] = json!(3.5e38_f64);
+        overflow["extensions"]["VRMC_vrm"]["lookAt"] = look_at;
+        assert!(parse(overflow).unwrap().look_at.is_none());
+
+        let mut wrong_numeric_type = base();
+        let mut look_at = look_at_json("bone");
+        look_at["offsetFromHeadBone"] = json!([0.0, "bad", 0.0]);
+        wrong_numeric_type["extensions"]["VRMC_vrm"]["lookAt"] = look_at;
+        assert!(parse(wrong_numeric_type).unwrap().look_at.is_none());
     }
 
     #[test]
