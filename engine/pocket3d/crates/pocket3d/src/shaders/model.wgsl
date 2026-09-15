@@ -54,6 +54,7 @@ struct VsIn {
     @location(2) uv: vec2f,
     @location(3) joints: vec4u,
     @location(4) weights: vec4f,
+    @location(5) uv1: vec2f,
 }
 
 struct VsOut {
@@ -61,6 +62,9 @@ struct VsOut {
     @location(0) uv: vec2f,
     @location(1) normal: vec3f,
     @location(2) world_pos: vec3f,
+    // Retained for Stage B material texture selection; current shaders keep
+    // sampling the existing TEXCOORD_0 path.
+    @location(3) uv1: vec2f,
 }
 
 fn safe_normalize(v: vec3f) -> vec3f {
@@ -93,6 +97,7 @@ fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip = globals.view_proj * wp;
     out.uv = in.uv;
+    out.uv1 = in.uv1;
     out.normal = safe_normalize(
         (instance.normal_model * vec4f(skinned_normal, 0.0)).xyz,
     );

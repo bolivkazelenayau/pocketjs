@@ -8,7 +8,8 @@ use glam::{Mat4, Vec3};
 use crate::camera::Camera;
 use crate::gpu::{DEPTH_FORMAT, DepthTarget, Gpu};
 use crate::hud::{ATLAS_H, ATLAS_W, Hud, HudVertex, build_font_atlas};
-use crate::model::{MaterialAlphaMode, ModelAsset, ModelInstance, ModelVertex};
+use crate::material::RenderPassClass;
+use crate::model::{ModelAsset, ModelInstance, ModelVertex};
 use crate::scene::Scene;
 use crate::texture::{GpuTexture, Samplers, create_rgba_texture};
 use crate::world::{WorldBatchKind, WorldVertex};
@@ -1238,8 +1239,8 @@ impl ModelPass {
         if draws.is_empty() {
             return;
         }
-        self.draw_phase(pass, draws, false);
-        self.draw_phase(pass, draws, true);
+        self.draw_phase(pass, draws, RenderPassClass::Solid);
+        self.draw_phase(pass, draws, RenderPassClass::Blend);
     }
 
     /// Draw all opaque/masked primitives across all instances before any
@@ -1249,7 +1250,7 @@ impl ModelPass {
         &'p self,
         pass: &mut wgpu::RenderPass<'p>,
         draws: &'p [ModelDraw],
-        blend_phase: bool,
+        pass_class: RenderPassClass,
     ) {
         for d in draws {
             pass.set_bind_group(2, &self.object_bg, &[d.inst_offset, d.joints_offset]);
@@ -1257,14 +1258,14 @@ impl ModelPass {
             pass.set_index_buffer(d.asset.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             let mut overlay_bound = false;
             for (pi, prim) in d.asset.primitives.iter().enumerate() {
-                if (prim.alpha_mode == MaterialAlphaMode::Blend) != blend_phase {
+                if prim.render_phase.pass_class() != pass_class {
                     continue;
                 }
-                let pipeline = match (blend_phase, prim.double_sided) {
-                    (false, false) => &self.opaque,
-                    (false, true) => &self.opaque_double_sided,
-                    (true, false) => &self.blend,
-                    (true, true) => &self.blend_double_sided,
+                let pipeline = match (pass_class, prim.double_sided) {
+                    (RenderPassClass::Solid, false) => &self.opaque,
+                    (RenderPassClass::Solid, true) => &self.opaque_double_sided,
+                    (RenderPassClass::Blend, false) => &self.blend,
+                    (RenderPassClass::Blend, true) => &self.blend_double_sided,
                 };
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(1, &prim.bind_group, &[]);

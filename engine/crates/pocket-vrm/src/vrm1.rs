@@ -11,6 +11,7 @@ use glam::Vec3;
 use serde_json::{Map, Value};
 
 use crate::glb;
+use crate::mtoon::{Vrm1MtoonMaterial, parse_mtoon_materials};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vrm1Meta {
@@ -395,6 +396,7 @@ pub struct Vrm1Doc {
     pub meta: Vrm1Meta,
     pub humanoid: Vrm1Humanoid,
     pub materials_mtoon: Vrm1ExtensionInfo,
+    pub mtoon_materials: Vec<Vrm1MtoonMaterial>,
     pub spring_bone: Vrm1ExtensionInfo,
     pub spring_bone_semantics: Option<Vrm1SpringBone>,
     pub node_constraint: Vrm1ExtensionInfo,
@@ -409,6 +411,16 @@ pub struct Vrm1Doc {
 }
 
 impl Vrm1Doc {
+    /// Convert the already-validated VRM semantics into Pocket3D's authored
+    /// renderer descriptors. This is the only MToon semantic handoff; the
+    /// renderer does not parse the extension JSON again.
+    pub fn mtoon_material_descriptors(&self) -> Vec<pocket3d::material::MtoonMaterialDescriptor> {
+        self.mtoon_materials
+            .iter()
+            .map(Vrm1MtoonMaterial::to_pocket3d_descriptor)
+            .collect()
+    }
+
     pub fn from_glb_bytes(bytes: &[u8]) -> Result<Self> {
         let glb = glb::parse_glb(bytes).context("failed to parse VRM 1.0 GLB")?;
         let ex = glb
@@ -458,14 +470,20 @@ impl Vrm1Doc {
                 None
             }
         };
+        let mtoon_materials = parse_mtoon_materials(&glb.json)?;
+        let materials_mtoon = if mtoon_materials.is_empty() {
+            Vrm1ExtensionInfo::default()
+        } else {
+            Vrm1ExtensionInfo {
+                present: true,
+                version: Some("1.0".to_owned()),
+            }
+        };
         Ok(Self {
             meta: parse_meta(vrm)?,
             humanoid: parse_humanoid(vrm, children.len())?,
-            materials_mtoon: extension_info_in_array(
-                &glb.json,
-                "materials",
-                "VRMC_materials_mtoon",
-            )?,
+            materials_mtoon,
+            mtoon_materials,
             spring_bone,
             spring_bone_semantics,
             node_constraint,
@@ -1075,41 +1093,6 @@ fn required_extension_info(v: &Value, name: &str) -> Result<Vrm1ExtensionInfo> {
         version: Some(version),
     })
 }
-fn extension_info_in_array(
-    root: &Value,
-    array_name: &str,
-    name: &str,
-) -> Result<Vrm1ExtensionInfo> {
-    let Some(v) = root.get(array_name) else {
-        return Ok(Vrm1ExtensionInfo::default());
-    };
-    let a = v
-        .as_array()
-        .with_context(|| format!("glTF {array_name} must be an array"))?;
-    let mut f: Option<Vrm1ExtensionInfo> = None;
-    for (i, v) in a.iter().enumerate() {
-        let o = v
-            .as_object()
-            .with_context(|| format!("glTF {array_name}[{i}] must be an object"))?;
-        let Some(v) = o.get("extensions") else {
-            continue;
-        };
-        let v = v
-            .as_object()
-            .with_context(|| format!("glTF {array_name}[{i}].extensions must be an object"))?;
-        let Some(x) = v.get(name) else { continue };
-        let info = required_extension_info(x, &format!("{array_name}[{i}].extensions.{name}"))?;
-        if let Some(old) = &f {
-            ensure!(
-                old.version == info.version,
-                "{name} has conflicting specVersion values"
-            )
-        }
-        f = Some(info)
-    }
-    Ok(f.unwrap_or_default())
-}
-
 fn parse_node_constraints(
     root: &Value,
     node_count: usize,

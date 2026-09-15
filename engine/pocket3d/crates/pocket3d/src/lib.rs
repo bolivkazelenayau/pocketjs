@@ -15,6 +15,7 @@ pub mod collide;
 pub mod gpu;
 pub mod hud;
 pub mod input;
+pub mod material;
 pub mod model;
 mod presentation;
 pub mod renderer;

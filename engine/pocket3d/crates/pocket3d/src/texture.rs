@@ -73,6 +73,10 @@ pub fn create_rgba_texture(
         );
         if level + 1 < mip_level_count {
             let (nw, nh) = ((w / 2).max(1), (h / 2).max(1));
+            // TODO(Stage B): color textures need decode/average/re-encode
+            // sRGB mip generation, while data textures must stay linear.
+            // Keep the established byte-space filter in Stage 0/A to avoid
+            // an un-goldened appearance change in existing PocketLit/Unlit.
             level_data = downsample(&level_data, w, h, nw, nh);
             (w, h) = (nw, nh);
         }

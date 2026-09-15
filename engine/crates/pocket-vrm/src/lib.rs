@@ -24,6 +24,7 @@
 
 pub mod glb;
 pub mod lookat;
+pub mod mtoon;
 pub mod node_constraint;
 pub mod parse;
 pub mod spring;
@@ -32,6 +33,10 @@ pub mod vrm1_lookat;
 pub mod vrma;
 
 pub use lookat::apply_eye_look;
+pub use mtoon::{
+    Vrm1MagFilter, Vrm1MinFilter, Vrm1MtoonAlphaMode, Vrm1MtoonMaterial, Vrm1MtoonOutlineWidthMode,
+    Vrm1Sampler, Vrm1ScaledTextureInfo, Vrm1TextureInfo, Vrm1TextureTransform, Vrm1WrapMode,
+};
 pub use node_constraint::{
     aim_axis_vector, aim_constraint, aim_target, apply_aim_constraint, apply_roll_constraint,
     checked_normalize_quat, checked_normalize_vec3, roll_axis_vector, roll_constraint, roll_target,

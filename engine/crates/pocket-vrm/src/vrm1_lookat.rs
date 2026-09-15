@@ -377,6 +377,7 @@ mod tests {
             },
             humanoid: crate::Vrm1Humanoid { human_bones },
             materials_mtoon: crate::Vrm1ExtensionInfo::default(),
+            mtoon_materials: Vec::new(),
             spring_bone: crate::Vrm1ExtensionInfo::default(),
             spring_bone_semantics: None,
             node_constraint: crate::Vrm1ExtensionInfo::default(),

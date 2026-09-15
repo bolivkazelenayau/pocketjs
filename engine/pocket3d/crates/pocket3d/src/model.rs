@@ -15,7 +15,15 @@ use glam::{Mat4, Vec3};
 
 use crate::anim::{AnimState, Channel, ChannelPath, Clip, Interpolation, NodeTrs, Skeleton};
 use crate::gpu::Gpu;
+use crate::material::{
+    GltfMagFilter, GltfMinFilter, GltfSampler, GltfWrapMode, MaterialAsset, MaterialInputs,
+    MaterialModel, MaterialStateSet, MtoonMaterialDescriptor, PocketLitMaterial, RenderPhase,
+    ScaledTextureInfo, TextureColorSpace, TextureInfo, TextureRole, TextureTransform,
+    UnlitMaterial,
+};
 use crate::texture::{GpuTexture, Samplers, create_rgba_texture};
+
+pub use crate::material::MaterialAlphaMode;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -23,6 +31,7 @@ pub struct ModelVertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
     pub uv: [f32; 2],
+    pub uv1: [f32; 2],
     pub joints: [u32; 4],
     pub weights: [f32; 4],
 }
@@ -32,17 +41,10 @@ impl ModelVertex {
         array_stride: std::mem::size_of::<ModelVertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &wgpu::vertex_attr_array![
-            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Uint32x4, 4 => Float32x4
+            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Uint32x4, 4 => Float32x4,
+            5 => Float32x2
         ],
     };
-}
-
-/// The glTF alpha policy retained on each uploaded primitive.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaterialAlphaMode {
-    Opaque,
-    Mask,
-    Blend,
 }
 
 /// Optional authored treatment of a material's final base color.
@@ -52,16 +54,6 @@ pub enum MaterialBaseColorMode {
     Authored,
     /// Convert the final RGB value to luminance while preserving alpha.
     Monochrome,
-}
-
-impl MaterialAlphaMode {
-    fn from_gltf(mode: gltf::material::AlphaMode) -> Self {
-        match mode {
-            gltf::material::AlphaMode::Opaque => Self::Opaque,
-            gltf::material::AlphaMode::Mask => Self::Mask,
-            gltf::material::AlphaMode::Blend => Self::Blend,
-        }
-    }
 }
 
 /// Replace the base-color texture of semantically tagged glTF materials.
@@ -145,6 +137,7 @@ struct ModelTextureCacheKey {
     width: u32,
     height: u32,
     rgba: Box<[u8]>,
+    color_space: TextureColorSpace,
 }
 
 /// Explicit content-addressed cache for textures shared by multiple models.
@@ -185,11 +178,13 @@ impl ModelTextureCache {
         width: u32,
         height: u32,
         rgba: Vec<u8>,
+        color_space: TextureColorSpace,
     ) -> Arc<GpuTexture> {
         let key = ModelTextureCacheKey {
             width,
             height,
             rgba: rgba.into_boxed_slice(),
+            color_space,
         };
         match self.entries.entry(key) {
             Entry::Occupied(entry) => {
@@ -199,7 +194,13 @@ impl ModelTextureCache {
             Entry::Vacant(entry) => {
                 let key = entry.key();
                 let texture = Arc::new(create_rgba_texture(
-                    gpu, label, key.width, key.height, &key.rgba, true, true,
+                    gpu,
+                    label,
+                    key.width,
+                    key.height,
+                    &key.rgba,
+                    key.color_space == TextureColorSpace::Srgb,
+                    true,
                 ));
                 entry.insert(texture.clone());
                 texture
@@ -231,6 +232,7 @@ struct PrimitiveUpload {
     material_name: Option<String>,
     material_role: Option<String>,
     texture_override: Option<usize>,
+    material_index: Option<usize>,
 }
 
 pub struct Primitive {
@@ -244,6 +246,8 @@ pub struct Primitive {
     pub base_color_mode: MaterialBaseColorMode,
     pub material_name: Option<String>,
     pub material_role: Option<String>,
+    pub material_index: Option<usize>,
+    pub render_phase: RenderPhase,
     /// Kept alive explicitly alongside the bind group.
     #[allow(dead_code)]
     material_buf: wgpu::Buffer,
@@ -381,6 +385,8 @@ pub struct ModelAsset {
     pub vbuf: wgpu::Buffer,
     pub ibuf: wgpu::Buffer,
     pub primitives: Vec<Primitive>,
+    /// Immutable authored materials, indexed exactly by glTF material index.
+    materials: Vec<MaterialAsset>,
     pub skeleton: Skeleton,
     /// glTF node names indexed exactly like [`Self::skeleton`]. Procedural
     /// assets have no nodes, so this is empty for `from_geometry*` models.
@@ -490,6 +496,225 @@ fn semantic_material_matches(
     }
 }
 
+fn gltf_sampler(sampler: gltf::texture::Sampler<'_>) -> GltfSampler {
+    GltfSampler {
+        index: sampler.index(),
+        mag_filter: sampler.mag_filter().map(|filter| match filter {
+            gltf::texture::MagFilter::Nearest => GltfMagFilter::Nearest,
+            gltf::texture::MagFilter::Linear => GltfMagFilter::Linear,
+        }),
+        min_filter: sampler.min_filter().map(|filter| match filter {
+            gltf::texture::MinFilter::Nearest => GltfMinFilter::Nearest,
+            gltf::texture::MinFilter::Linear => GltfMinFilter::Linear,
+            gltf::texture::MinFilter::NearestMipmapNearest => GltfMinFilter::NearestMipmapNearest,
+            gltf::texture::MinFilter::LinearMipmapNearest => GltfMinFilter::LinearMipmapNearest,
+            gltf::texture::MinFilter::NearestMipmapLinear => GltfMinFilter::NearestMipmapLinear,
+            gltf::texture::MinFilter::LinearMipmapLinear => GltfMinFilter::LinearMipmapLinear,
+        }),
+        wrap_s: match sampler.wrap_s() {
+            gltf::texture::WrappingMode::ClampToEdge => GltfWrapMode::ClampToEdge,
+            gltf::texture::WrappingMode::MirroredRepeat => GltfWrapMode::MirroredRepeat,
+            gltf::texture::WrappingMode::Repeat => GltfWrapMode::Repeat,
+        },
+        wrap_t: match sampler.wrap_t() {
+            gltf::texture::WrappingMode::ClampToEdge => GltfWrapMode::ClampToEdge,
+            gltf::texture::WrappingMode::MirroredRepeat => GltfWrapMode::MirroredRepeat,
+            gltf::texture::WrappingMode::Repeat => GltfWrapMode::Repeat,
+        },
+    }
+}
+
+fn gltf_texture_info(info: gltf::texture::Info<'_>, role: TextureRole) -> TextureInfo {
+    let texture = info.texture();
+    let transform = info
+        .texture_transform()
+        .map(|transform| TextureTransform {
+            offset: transform.offset(),
+            rotation: transform.rotation(),
+            scale: transform.scale(),
+            tex_coord_override: transform.tex_coord(),
+        })
+        .unwrap_or_default();
+    TextureInfo {
+        texture_index: texture.index(),
+        image_index: texture.source().index(),
+        sampler: gltf_sampler(texture.sampler()),
+        tex_coord: info.tex_coord(),
+        transform,
+        role,
+        color_space: role.color_space(),
+    }
+}
+
+fn gltf_material_inputs(material: &gltf::Material<'_>) -> MaterialInputs {
+    let pbr = material.pbr_metallic_roughness();
+    MaterialInputs {
+        base_color_factor: pbr.base_color_factor(),
+        base_color_texture: pbr
+            .base_color_texture()
+            .map(|info| gltf_texture_info(info, TextureRole::BaseColor)),
+        normal_texture: material.normal_texture().map(|info| {
+            let texture = info.texture();
+            ScaledTextureInfo {
+                texture: TextureInfo {
+                    texture_index: texture.index(),
+                    image_index: texture.source().index(),
+                    sampler: gltf_sampler(texture.sampler()),
+                    tex_coord: info.tex_coord(),
+                    // gltf-rs does not expose KHR_texture_transform from the
+                    // specialized normalTexture wrapper. MToon descriptors
+                    // arrive from PocketVRM with the complete transform.
+                    transform: TextureTransform::default(),
+                    role: TextureRole::Normal,
+                    color_space: TextureColorSpace::Linear,
+                },
+                scale: info.scale(),
+            }
+        }),
+        emissive_factor: material.emissive_factor(),
+        emissive_texture: material
+            .emissive_texture()
+            .map(|info| gltf_texture_info(info, TextureRole::Emissive)),
+        alpha_mode: MaterialAlphaMode::from_gltf(material.alpha_mode()),
+        alpha_cutoff: material.alpha_cutoff().unwrap_or(0.5),
+        double_sided: material.double_sided(),
+    }
+}
+
+fn authored_materials(
+    doc: &gltf::Document,
+    mtoon_descriptors: &[MtoonMaterialDescriptor],
+    path: &Path,
+) -> Result<Vec<MaterialAsset>> {
+    let material_count = doc.materials().count();
+    let texture_count = doc.textures().count();
+    let image_count = doc.images().count();
+    let mut mtoon_by_index = HashMap::new();
+    for descriptor in mtoon_descriptors {
+        if descriptor.material_index >= material_count {
+            bail!(
+                "MToon descriptor material index {} exceeds material count {material_count} in {}",
+                descriptor.material_index,
+                path.display()
+            );
+        }
+        if mtoon_by_index
+            .insert(descriptor.material_index, descriptor)
+            .is_some()
+        {
+            bail!(
+                "duplicate MToon descriptor for material {} in {}",
+                descriptor.material_index,
+                path.display()
+            );
+        }
+        for texture in descriptor_textures(descriptor) {
+            if texture.texture_index >= texture_count || texture.image_index >= image_count {
+                bail!(
+                    "MToon material {} texture {:?} references texture {}/image {} outside glTF counts {texture_count}/{image_count} in {}",
+                    descriptor.material_index,
+                    texture.role,
+                    texture.texture_index,
+                    texture.image_index,
+                    path.display()
+                );
+            }
+            let tex_coord = texture.effective_tex_coord();
+            if tex_coord > 1 {
+                bail!(
+                    "MToon material {} texture {:?} selects TEXCOORD_{tex_coord}, but Pocket3D currently imports only TEXCOORD_0 and TEXCOORD_1 in {}",
+                    descriptor.material_index,
+                    texture.role,
+                    path.display()
+                );
+            }
+        }
+    }
+
+    doc.materials()
+        .map(|material| {
+            let index = material
+                .index()
+                .expect("document material iterator always has an index");
+            let name = material.name().map(str::to_owned);
+            if let Some(descriptor) = mtoon_by_index.get(&index) {
+                if !material.unlit() {
+                    bail!(
+                        "MToon material {index} lacks KHR_materials_unlit fallback in {}",
+                        path.display()
+                    );
+                }
+                if let Some(base) = descriptor.inputs.base_color_texture.as_ref() {
+                    let selected = base.effective_tex_coord();
+                    if !base.current_base_color_fallback_uv_supported() {
+                        bail!(
+                            "MToon material {index} baseColorTexture selects TEXCOORD_{selected}, but the current unlit fallback samples only TEXCOORD_0 in {}",
+                            path.display()
+                        );
+                    }
+                }
+                Ok(MaterialAsset {
+                    gltf_material_index: index,
+                    name,
+                    inputs: descriptor.inputs.clone(),
+                    model: MaterialModel::Mtoon(Box::new(descriptor.mtoon.clone())),
+                })
+            } else {
+                let inputs = gltf_material_inputs(&material);
+                if let Some(base) = inputs.base_color_texture.as_ref() {
+                    let selected = base.effective_tex_coord();
+                    if !base.current_base_color_fallback_uv_supported() {
+                        bail!(
+                            "glTF material {index} baseColorTexture selects TEXCOORD_{selected}, but the current PocketLit/Unlit shader samples only TEXCOORD_0 in {}",
+                            path.display()
+                        );
+                    }
+                }
+                Ok(MaterialAsset {
+                    gltf_material_index: index,
+                    name,
+                    inputs,
+                    model: if material.unlit() {
+                        MaterialModel::Unlit(UnlitMaterial)
+                    } else {
+                        MaterialModel::PocketLit(PocketLitMaterial)
+                    },
+                })
+            }
+        })
+        .collect()
+}
+
+fn descriptor_textures(descriptor: &MtoonMaterialDescriptor) -> Vec<&TextureInfo> {
+    let mut textures = Vec::new();
+    if let Some(texture) = descriptor.inputs.base_color_texture.as_ref() {
+        textures.push(texture);
+    }
+    if let Some(texture) = descriptor.inputs.normal_texture.as_ref() {
+        textures.push(&texture.texture);
+    }
+    if let Some(texture) = descriptor.inputs.emissive_texture.as_ref() {
+        textures.push(texture);
+    }
+    textures.extend(
+        [
+            descriptor.mtoon.shade_multiply_texture.as_ref(),
+            descriptor
+                .mtoon
+                .shading_shift_texture
+                .as_ref()
+                .map(|value| &value.texture),
+            descriptor.mtoon.matcap_texture.as_ref(),
+            descriptor.mtoon.rim_multiply_texture.as_ref(),
+            descriptor.mtoon.outline_width_multiply_texture.as_ref(),
+            descriptor.mtoon.uv_animation_mask_texture.as_ref(),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    textures
+}
+
 fn validate_normalized_texcoord0(
     texcoords: Option<&[[f32; 2]]>,
     vertex_count: usize,
@@ -551,6 +776,11 @@ fn validate_normalized_texcoord0(
 }
 
 impl ModelAsset {
+    /// Authored material data is shared by instances and cannot be mutated.
+    pub fn materials(&self) -> &[MaterialAsset] {
+        &self.materials
+    }
+
     /// Return the glTF node index for `name`.
     ///
     /// Node indices address [`Self::skeleton`] and can be sampled with
@@ -738,8 +968,11 @@ impl ModelAsset {
                 base_color_mode: MaterialBaseColorMode::Authored,
                 material_name: Some(label.to_owned()),
                 material_role: None,
+                material_index: Some(0),
+                render_phase: RenderPhase::Opaque,
                 material_buf,
             }],
+            materials: vec![MaterialAsset::pocket_lit(0, Some(label.to_owned()))],
             skeleton: Skeleton {
                 parents: Vec::new(),
                 rest: Vec::new(),
@@ -811,8 +1044,11 @@ impl ModelAsset {
                 base_color_mode: MaterialBaseColorMode::Authored,
                 material_name: Some(label.to_owned()),
                 material_role: None,
+                material_index: Some(0),
+                render_phase: RenderPhase::Opaque,
                 material_buf,
             }],
+            materials: vec![MaterialAsset::pocket_lit(0, Some(label.to_owned()))],
             skeleton: Skeleton {
                 parents: Vec::new(),
                 rest: Vec::new(),
@@ -896,6 +1132,36 @@ impl ModelAsset {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        Self::load_glb_bytes_opts_with_material_descriptors(
+            gpu,
+            layout,
+            samplers,
+            bytes,
+            label,
+            opts,
+            allowed_required_extensions,
+            &[],
+        )
+    }
+
+    /// Byte loading plus a typed, caller-validated MToon semantic handoff.
+    /// Descriptors are stored as authored materials, while rendering remains
+    /// on the glTF `KHR_materials_unlit` fallback until native MToon lands.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_glb_bytes_opts_with_material_descriptors<I, S>(
+        gpu: &Gpu,
+        layout: &wgpu::BindGroupLayout,
+        samplers: &Samplers,
+        bytes: &[u8],
+        label: &str,
+        opts: &ModelLoadOptions,
+        allowed_required_extensions: I,
+        mtoon_descriptors: &[MtoonMaterialDescriptor],
+    ) -> Result<Arc<Self>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         validate_load_options(opts)?;
         let allowed_required_extensions: Vec<String> = allowed_required_extensions
             .into_iter()
@@ -916,6 +1182,7 @@ impl ModelAsset {
             opts,
             &[],
             &mut cache,
+            mtoon_descriptors,
             imported,
         )
     }
@@ -1042,7 +1309,15 @@ impl ModelAsset {
             gltf::import(path).with_context(|| format!("importing {}", path.display()))?;
 
         Self::load_glb_imported(
-            gpu, layout, samplers, path, opts, overrides, cache, imported,
+            gpu,
+            layout,
+            samplers,
+            path,
+            opts,
+            overrides,
+            cache,
+            &[],
+            imported,
         )
     }
 
@@ -1055,10 +1330,12 @@ impl ModelAsset {
         opts: &ModelLoadOptions,
         overrides: &[MaterialTextureOverride<'_>],
         cache: &mut ModelTextureCache,
+        mtoon_descriptors: &[MtoonMaterialDescriptor],
         imported: ImportedGltf,
     ) -> Result<Arc<Self>> {
         let (doc, buffers, images) = imported;
         validate_model_input(&doc, &buffers, path)?;
+        let materials = authored_materials(&doc, mtoon_descriptors, path)?;
 
         // --- textures ------------------------------------------------------
         // Only upload images a material actually samples (some files carry
@@ -1103,7 +1380,14 @@ impl ModelAsset {
             }
             let (rgba, w, h) =
                 cap_texture_rgba(to_rgba8(img), img.width, img.height, opts.max_texture_dim);
-            textures.push(cache.get_or_upload(gpu, &format!("model img {i}"), w, h, rgba));
+            textures.push(cache.get_or_upload(
+                gpu,
+                &format!("model img {i}"),
+                w,
+                h,
+                rgba,
+                TextureColorSpace::Srgb,
+            ));
         }
 
         // --- nodes / skeleton ----------------------------------------------
@@ -1252,6 +1536,19 @@ impl ModelAsset {
                     }
                     None => None,
                 };
+                let texcoord1: Option<Vec<[f32; 2]>> = match reader.read_tex_coords(1) {
+                    Some(it) => {
+                        let texcoords: Vec<_> = it.into_f32().collect();
+                        validate_attribute_count(
+                            "TEXCOORD_1",
+                            positions.len(),
+                            texcoords.len(),
+                            path,
+                        )?;
+                        Some(texcoords)
+                    }
+                    None => None,
+                };
                 let joints: Vec<[u16; 4]> = match reader.read_joints(0) {
                     Some(it) => {
                         let joints: Vec<_> = it.into_u16().collect();
@@ -1331,6 +1628,11 @@ impl ModelAsset {
                             .and_then(|texcoords| texcoords.get(i))
                             .copied()
                             .unwrap_or([0.0, 0.0]),
+                        uv1: texcoord1
+                            .as_deref()
+                            .and_then(|texcoords| texcoords.get(i))
+                            .copied()
+                            .unwrap_or([0.0, 0.0]),
                         joints: j,
                         weights: w,
                     });
@@ -1355,6 +1657,29 @@ impl ModelAsset {
                 let count = indices.len() as u32 - first;
 
                 let material = prim.material();
+                let material_index = material.index();
+                if let Some(index) = material_index
+                    && matches!(materials[index].model, MaterialModel::Mtoon(_))
+                {
+                    for texture in materials[index].textures() {
+                        if texture.role == TextureRole::Matcap {
+                            continue;
+                        }
+                        let selected = texture.effective_tex_coord();
+                        let present = match selected {
+                            0 => texcoord0.is_some(),
+                            1 => texcoord1.is_some(),
+                            _ => false,
+                        };
+                        if !present {
+                            bail!(
+                                "MToon material {index} texture {:?} selects TEXCOORD_{selected}, but the primitive does not provide it in {}",
+                                texture.role,
+                                path.display()
+                            );
+                        }
+                    }
+                }
                 let pbr = material.pbr_metallic_roughness();
                 let image = pbr
                     .base_color_texture()
@@ -1494,6 +1819,7 @@ impl ModelAsset {
                     material_name,
                     material_role,
                     texture_override,
+                    material_index,
                 });
             }
         }
@@ -1667,6 +1993,8 @@ impl ModelAsset {
                     base_color_mode: meta.base_color_mode,
                     material_name: meta.material_name,
                     material_role: meta.material_role,
+                    material_index: meta.material_index,
+                    render_phase: RenderPhase::fallback(meta.alpha_mode),
                     material_buf,
                 }
             })
@@ -1677,6 +2005,7 @@ impl ModelAsset {
             vbuf,
             ibuf,
             primitives,
+            materials,
             skeleton,
             node_names,
             skins,
@@ -1821,6 +2150,10 @@ fn to_rgba8(img: &gltf::image::Data) -> Vec<u8> {
 /// A model placed in the scene.
 pub struct ModelInstance {
     pub asset: Arc<ModelAsset>,
+    /// Mutable material values owned by this instance and indexed by authored
+    /// glTF material index. Stage G can upload these lazily without mutating
+    /// the shared asset.
+    pub materials: MaterialStateSet,
     pub transform: Mat4,
     pub tint: [f32; 4],
     pub anim: AnimState,
@@ -1838,8 +2171,10 @@ pub struct ModelInstance {
 
 impl ModelInstance {
     pub fn new(asset: Arc<ModelAsset>) -> Self {
+        let materials = MaterialStateSet::from_assets(&asset.materials);
         Self {
             asset,
+            materials,
             transform: Mat4::IDENTITY,
             tint: [1.0; 4],
             anim: AnimState::default(),
@@ -1936,6 +2271,14 @@ fn validate_model_input(
                 if let Some(texcoords) = reader.read_tex_coords(0) {
                     validate_attribute_count(
                         "TEXCOORD_0",
+                        position_count,
+                        texcoords.into_f32().count(),
+                        path,
+                    )?;
+                }
+                if let Some(texcoords) = reader.read_tex_coords(1) {
+                    validate_attribute_count(
+                        "TEXCOORD_1",
                         position_count,
                         texcoords.into_f32().count(),
                         path,
@@ -2506,12 +2849,13 @@ mod tests {
 
     use crate::anim::{AnimState, Channel, ChannelPath, Clip, Interpolation, NodeTrs, Skeleton};
     use crate::gpu::Gpu;
+    use crate::material::TextureColorSpace;
     use crate::texture::Samplers;
 
     use super::{
         ByteImageBudget, MAX_BYTE_IMAGE_BYTES, MAX_BYTE_IMAGE_COUNT, MaterialBaseColorMode,
-        MaterialRaw, ModelAsset, ModelLoadOptions, ModelTextureCacheKey, cap_texture_rgba,
-        find_node_named, import_glb_slice, import_glb_slice_with_options,
+        MaterialRaw, ModelAsset, ModelLoadOptions, ModelTextureCacheKey, authored_materials,
+        cap_texture_rgba, find_node_named, import_glb_slice, import_glb_slice_with_options,
         pocket3d_base_color_mode_from_extras, pocket3d_role_from_extras, sample_node_transform,
         semantic_material_matches, to_rgba8, validate_joint_palette_count, validate_model_input,
         validate_normalized_texcoord0,
@@ -2821,6 +3165,34 @@ mod tests {
             }),
             &bin,
         )
+    }
+
+    #[test]
+    fn authored_base_color_uv1_fails_instead_of_sampling_uv0() {
+        for texture_info in [
+            json!({"index":0,"texCoord":1}),
+            json!({"index":0,"extensions":{"KHR_texture_transform":{"texCoord":1}}}),
+        ] {
+            let bytes = glb_from_json(
+                json!({
+                    "asset":{"version":"2.0"},
+                    "materials":[{"pbrMetallicRoughness":{"baseColorTexture":texture_info}}],
+                    "textures":[{"source":0}],
+                    "images":[{"uri":"data:image/png;base64,AA=="}]
+                }),
+                &[],
+            );
+            let doc = gltf::Gltf::from_slice_without_validation(&bytes)
+                .unwrap()
+                .document;
+            let error = authored_materials(&doc, &[], Path::new("uv1.glb"))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("material 0") && error.contains("TEXCOORD_1"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -3213,15 +3585,17 @@ mod tests {
 
     #[test]
     fn texture_cache_key_uses_exact_pixels_and_dimensions() {
-        let key = |width, height, rgba: &[u8]| ModelTextureCacheKey {
+        let key = |width, height, rgba: &[u8], color_space| ModelTextureCacheKey {
             width,
             height,
             rgba: rgba.into(),
+            color_space,
         };
-        let reference = key(2, 1, &[1, 2, 3, 4, 5, 6, 7, 8]);
-        assert!(reference == key(2, 1, &[1, 2, 3, 4, 5, 6, 7, 8]));
-        assert!(reference != key(1, 2, &[1, 2, 3, 4, 5, 6, 7, 8]));
-        assert!(reference != key(2, 1, &[1, 2, 3, 4, 5, 6, 7, 9]));
+        let reference = key(2, 1, &[1, 2, 3, 4, 5, 6, 7, 8], TextureColorSpace::Srgb);
+        assert!(reference == key(2, 1, &[1, 2, 3, 4, 5, 6, 7, 8], TextureColorSpace::Srgb));
+        assert!(reference != key(1, 2, &[1, 2, 3, 4, 5, 6, 7, 8], TextureColorSpace::Srgb));
+        assert!(reference != key(2, 1, &[1, 2, 3, 4, 5, 6, 7, 9], TextureColorSpace::Srgb));
+        assert!(reference != key(2, 1, &[1, 2, 3, 4, 5, 6, 7, 8], TextureColorSpace::Linear));
     }
 
     #[test]
