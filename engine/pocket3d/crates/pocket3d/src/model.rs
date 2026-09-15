@@ -16,12 +16,15 @@ use glam::{Mat4, Vec3};
 use crate::anim::{AnimState, Channel, ChannelPath, Clip, Interpolation, NodeTrs, Skeleton};
 use crate::gpu::Gpu;
 use crate::material::{
-    GltfMagFilter, GltfMinFilter, GltfSampler, GltfWrapMode, MaterialAsset, MaterialInputs,
-    MaterialModel, MaterialStateSet, MtoonMaterialDescriptor, PocketLitMaterial, RenderPhase,
-    ScaledTextureInfo, TextureColorSpace, TextureInfo, TextureRole, TextureTransform,
-    UnlitMaterial,
+    GltfMagFilter, GltfMinFilter, GltfSampler, GltfSamplerCache, GltfWrapMode, MaterialAsset,
+    MaterialInputs, MaterialModel, MaterialStateSet, MtoonMaterialDescriptor,
+    MtoonOutlineWidthMode, PocketLitMaterial, RenderPhase, ScaledTextureInfo, TextureColorSpace,
+    TextureInfo, TextureRole, TextureTransform, UnlitMaterial,
 };
-use crate::texture::{GpuTexture, Samplers, create_rgba_texture};
+use crate::texture::{
+    GpuTexture, MipSemantic, Samplers, create_rgba_texture, create_rgba_texture_with_semantic,
+    downsample_semantic,
+};
 
 pub use crate::material::MaterialAlphaMode;
 
@@ -138,6 +141,7 @@ struct ModelTextureCacheKey {
     height: u32,
     rgba: Box<[u8]>,
     color_space: TextureColorSpace,
+    mip_semantic: MipSemantic,
 }
 
 /// Explicit content-addressed cache for textures shared by multiple models.
@@ -180,11 +184,33 @@ impl ModelTextureCache {
         rgba: Vec<u8>,
         color_space: TextureColorSpace,
     ) -> Arc<GpuTexture> {
+        self.get_or_upload_semantic(
+            gpu,
+            label,
+            width,
+            height,
+            rgba,
+            color_space,
+            MipSemantic::Legacy,
+        )
+    }
+
+    fn get_or_upload_semantic(
+        &mut self,
+        gpu: &Gpu,
+        label: &str,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        color_space: TextureColorSpace,
+        mip_semantic: MipSemantic,
+    ) -> Arc<GpuTexture> {
         let key = ModelTextureCacheKey {
             width,
             height,
             rgba: rgba.into_boxed_slice(),
             color_space,
+            mip_semantic,
         };
         match self.entries.entry(key) {
             Entry::Occupied(entry) => {
@@ -193,7 +219,7 @@ impl ModelTextureCache {
             }
             Entry::Vacant(entry) => {
                 let key = entry.key();
-                let texture = Arc::new(create_rgba_texture(
+                let texture = Arc::new(create_rgba_texture_with_semantic(
                     gpu,
                     label,
                     key.width,
@@ -201,6 +227,7 @@ impl ModelTextureCache {
                     &key.rgba,
                     key.color_space == TextureColorSpace::Srgb,
                     true,
+                    key.mip_semantic,
                 ));
                 entry.insert(texture.clone());
                 texture
@@ -217,6 +244,119 @@ struct MaterialRaw {
     params: [f32; 4],
     /// x: monochrome base color, y/z/w reserved.
     style: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MtoonUvRaw {
+    scale_rotation: [f32; 4],
+    offset_set: [f32; 4],
+}
+
+impl MtoonUvRaw {
+    fn from_texture(texture: Option<&TextureInfo>) -> Self {
+        let transform = texture.map(|texture| texture.transform).unwrap_or_default();
+        Self {
+            scale_rotation: [
+                transform.scale[0],
+                transform.scale[1],
+                transform.rotation.cos(),
+                transform.rotation.sin(),
+            ],
+            offset_set: [
+                transform.offset[0],
+                transform.offset[1],
+                texture.map(TextureInfo::effective_tex_coord).unwrap_or(0) as f32,
+                0.0,
+            ],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MtoonRaw {
+    base_color_factor: [f32; 4],
+    shade_color_factor: [f32; 4],
+    surface: [f32; 4],
+    alpha: [f32; 4],
+    base_uv: MtoonUvRaw,
+    normal_uv: MtoonUvRaw,
+    shade_uv: MtoonUvRaw,
+    shift_uv: MtoonUvRaw,
+    texture_scales: [f32; 4],
+}
+
+impl MtoonRaw {
+    fn from_material(material: &MaterialAsset) -> Self {
+        let MaterialModel::Mtoon(mtoon) = &material.model else {
+            unreachable!("native MToon uniform requires an MToon material")
+        };
+        let inputs = &material.inputs;
+        Self {
+            base_color_factor: inputs.base_color_factor,
+            shade_color_factor: [
+                mtoon.shade_color_factor[0],
+                mtoon.shade_color_factor[1],
+                mtoon.shade_color_factor[2],
+                1.0,
+            ],
+            surface: [
+                mtoon.shading_shift_factor,
+                mtoon.shading_toony_factor,
+                mtoon.gi_equalization_factor,
+                inputs
+                    .normal_texture
+                    .as_ref()
+                    .map_or(0.0, |normal| normal.scale),
+            ],
+            alpha: [
+                (inputs.alpha_mode == MaterialAlphaMode::Mask) as u8 as f32,
+                inputs.alpha_cutoff,
+                inputs.double_sided as u8 as f32,
+                0.0,
+            ],
+            base_uv: MtoonUvRaw::from_texture(inputs.base_color_texture.as_ref()),
+            normal_uv: MtoonUvRaw::from_texture(
+                inputs.normal_texture.as_ref().map(|normal| &normal.texture),
+            ),
+            shade_uv: MtoonUvRaw::from_texture(mtoon.shade_multiply_texture.as_ref()),
+            shift_uv: MtoonUvRaw::from_texture(
+                mtoon
+                    .shading_shift_texture
+                    .as_ref()
+                    .map(|shift| &shift.texture),
+            ),
+            texture_scales: [
+                mtoon
+                    .shading_shift_texture
+                    .as_ref()
+                    .map_or(0.0, |shift| shift.scale),
+                0.0,
+                0.0,
+                0.0,
+            ],
+        }
+    }
+}
+
+fn native_stage_b_capable(material: &MaterialAsset) -> bool {
+    let MaterialModel::Mtoon(mtoon) = &material.model else {
+        return false;
+    };
+    material.inputs.alpha_mode != MaterialAlphaMode::Blend
+        && material.inputs.emissive_factor == [0.0; 3]
+        && material.inputs.emissive_texture.is_none()
+        && mtoon.matcap_texture.is_none()
+        && mtoon.parametric_rim_color_factor == [0.0; 3]
+        && mtoon.rim_multiply_texture.is_none()
+        && mtoon.outline_width_mode == MtoonOutlineWidthMode::None
+        && mtoon.outline_width_factor == 0.0
+        && mtoon.outline_width_multiply_texture.is_none()
+        && mtoon.uv_animation_scroll_x_speed_factor == 0.0
+        && mtoon.uv_animation_scroll_y_speed_factor == 0.0
+        && mtoon.uv_animation_rotation_speed_factor == 0.0
+        && mtoon.render_queue_offset_number == 0
 }
 
 struct PrimitiveUpload {
@@ -239,6 +379,8 @@ pub struct Primitive {
     pub first_index: u32,
     pub index_count: u32,
     pub bind_group: wgpu::BindGroup,
+    /// Shared by primitives referring to the same authored MToon material.
+    pub mtoon_bind_group: Option<Arc<wgpu::BindGroup>>,
     pub alpha_mode: MaterialAlphaMode,
     pub alpha_cutoff: f32,
     pub double_sided: bool,
@@ -406,6 +548,8 @@ pub struct ModelAsset {
     pub aabb: (Vec3, Vec3),
     #[allow(dead_code)]
     textures: Vec<Arc<GpuTexture>>,
+    #[allow(dead_code)]
+    mtoon_material_buffers: Vec<wgpu::Buffer>,
 }
 
 fn make_material_bind_group(
@@ -444,6 +588,85 @@ fn make_material_bind_group(
         ],
     });
     (bind_group, material_buf)
+}
+
+fn make_mtoon_bind_group(
+    gpu: &Gpu,
+    layout: &wgpu::BindGroupLayout,
+    label: &str,
+    textures: [&wgpu::TextureView; 4],
+    samplers: [&wgpu::Sampler; 4],
+    material: &MtoonRaw,
+) -> (Arc<wgpu::BindGroup>, wgpu::Buffer) {
+    use wgpu::util::DeviceExt;
+    let buffer = gpu
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&format!("{label} MToon params")),
+            contents: bytemuck::bytes_of(material),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+    let mut entries = Vec::with_capacity(9);
+    for slot in 0..4 {
+        entries.push(wgpu::BindGroupEntry {
+            binding: (slot * 2) as u32,
+            resource: wgpu::BindingResource::TextureView(textures[slot]),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: (slot * 2 + 1) as u32,
+            resource: wgpu::BindingResource::Sampler(samplers[slot]),
+        });
+    }
+    entries.push(wgpu::BindGroupEntry {
+        binding: 8,
+        resource: buffer.as_entire_binding(),
+    });
+    let group = Arc::new(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &entries,
+    }));
+    (group, buffer)
+}
+
+fn stage_b_texture_semantic(texture: &TextureInfo) -> MipSemantic {
+    match texture.role {
+        TextureRole::BaseColor | TextureRole::ShadeMultiply => MipSemantic::SrgbColor,
+        TextureRole::Normal => MipSemantic::TangentNormal,
+        TextureRole::ShadingShift => MipSemantic::LinearData,
+        _ => unreachable!("later-pass texture must not enter Stage B"),
+    }
+}
+
+fn stage_b_texture(
+    gpu: &Gpu,
+    cache: &mut ModelTextureCache,
+    images: &[gltf::image::Data],
+    opts: &ModelLoadOptions,
+    texture: Option<&TextureInfo>,
+    dummy: &Arc<GpuTexture>,
+) -> Arc<GpuTexture> {
+    let Some(texture) = texture else {
+        return dummy.clone();
+    };
+    let image = &images[texture.image_index];
+    let semantic = stage_b_texture_semantic(texture);
+    let (rgba, width, height) = cap_texture_rgba_semantic(
+        to_rgba8(image),
+        image.width,
+        image.height,
+        opts.max_texture_dim,
+        semantic,
+    );
+    cache.get_or_upload_semantic(
+        gpu,
+        &format!("MToon image {} {:?}", texture.image_index, texture.role),
+        width,
+        height,
+        rgba,
+        texture.color_space,
+        semantic,
+    )
 }
 
 fn pocket3d_material_role(material: &gltf::Material<'_>) -> Option<String> {
@@ -585,6 +808,7 @@ fn authored_materials(
     doc: &gltf::Document,
     mtoon_descriptors: &[MtoonMaterialDescriptor],
     path: &Path,
+    native_mtoon: bool,
 ) -> Result<Vec<MaterialAsset>> {
     let material_count = doc.materials().count();
     let texture_count = doc.textures().count();
@@ -609,6 +833,14 @@ fn authored_materials(
             );
         }
         for texture in descriptor_textures(descriptor) {
+            if texture.color_space != texture.role.color_space() {
+                bail!(
+                    "MToon material {} texture {:?} declares inconsistent color space in {}",
+                    descriptor.material_index,
+                    texture.role,
+                    path.display()
+                );
+            }
             if texture.texture_index >= texture_count || texture.image_index >= image_count {
                 bail!(
                     "MToon material {} texture {:?} references texture {}/image {} outside glTF counts {texture_count}/{image_count} in {}",
@@ -644,21 +876,24 @@ fn authored_materials(
                         path.display()
                     );
                 }
+                let authored = MaterialAsset {
+                    gltf_material_index: index,
+                    name,
+                    inputs: descriptor.inputs.clone(),
+                    model: MaterialModel::Mtoon(Box::new(descriptor.mtoon.clone())),
+                };
                 if let Some(base) = descriptor.inputs.base_color_texture.as_ref() {
                     let selected = base.effective_tex_coord();
-                    if !base.current_base_color_fallback_uv_supported() {
+                    if !base.current_base_color_fallback_uv_supported()
+                        && !(native_mtoon && native_stage_b_capable(&authored))
+                    {
                         bail!(
                             "MToon material {index} baseColorTexture selects TEXCOORD_{selected}, but the current unlit fallback samples only TEXCOORD_0 in {}",
                             path.display()
                         );
                     }
                 }
-                Ok(MaterialAsset {
-                    gltf_material_index: index,
-                    name,
-                    inputs: descriptor.inputs.clone(),
-                    model: MaterialModel::Mtoon(Box::new(descriptor.mtoon.clone())),
-                })
+                Ok(authored)
             } else {
                 let inputs = gltf_material_inputs(&material);
                 if let Some(base) = inputs.base_color_texture.as_ref() {
@@ -907,6 +1142,42 @@ impl ModelAsset {
             })
     }
 
+    /// Dedicated four-texture Stage B MToon material layout (group 1).
+    pub fn mtoon_material_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
+        let mut entries = Vec::with_capacity(9);
+        for binding in 0..8 {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: if binding % 2 == 0 {
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    }
+                } else {
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)
+                },
+                count: None,
+            });
+        }
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 8,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<MtoonRaw>() as u64),
+            },
+            count: None,
+        });
+        gpu.device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("MToon material"),
+                entries: &entries,
+            })
+    }
+
     /// Build an asset from raw geometry (procedural models). `image` is an
     /// optional RGBA8 texture; omit it for a plain white surface.
     pub fn from_geometry(
@@ -961,6 +1232,7 @@ impl ModelAsset {
                 first_index: 0,
                 index_count: indices.len() as u32,
                 bind_group,
+                mtoon_bind_group: None,
                 alpha_mode: MaterialAlphaMode::Opaque,
                 alpha_cutoff: 0.0,
                 double_sided: false,
@@ -985,6 +1257,7 @@ impl ModelAsset {
             prim_morph: vec![None],
             aabb,
             textures: vec![tex],
+            mtoon_material_buffers: Vec::new(),
         })
     }
 
@@ -1037,6 +1310,7 @@ impl ModelAsset {
                 first_index: 0,
                 index_count: indices.len() as u32,
                 bind_group,
+                mtoon_bind_group: None,
                 alpha_mode: MaterialAlphaMode::Opaque,
                 alpha_cutoff: 0.0,
                 double_sided: false,
@@ -1061,6 +1335,7 @@ impl ModelAsset {
             prim_morph: vec![None],
             aabb,
             textures: Vec::new(),
+            mtoon_material_buffers: Vec::new(),
         })
     }
 
@@ -1145,12 +1420,71 @@ impl ModelAsset {
     }
 
     /// Byte loading plus a typed, caller-validated MToon semantic handoff.
-    /// Descriptors are stored as authored materials, while rendering remains
-    /// on the glTF `KHR_materials_unlit` fallback until native MToon lands.
+    /// Descriptors are stored as authored materials. Without a native layout,
+    /// rendering retains the glTF `KHR_materials_unlit` fallback.
     #[allow(clippy::too_many_arguments)]
     pub fn load_glb_bytes_opts_with_material_descriptors<I, S>(
         gpu: &Gpu,
         layout: &wgpu::BindGroupLayout,
+        samplers: &Samplers,
+        bytes: &[u8],
+        label: &str,
+        opts: &ModelLoadOptions,
+        allowed_required_extensions: I,
+        mtoon_descriptors: &[MtoonMaterialDescriptor],
+    ) -> Result<Arc<Self>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self::load_glb_bytes_opts_with_material_descriptors_impl(
+            gpu,
+            layout,
+            None,
+            samplers,
+            bytes,
+            label,
+            opts,
+            allowed_required_extensions,
+            mtoon_descriptors,
+        )
+    }
+
+    /// Activate native Stage B surfaces when the authored material is eligible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_glb_bytes_opts_with_native_mtoon<I, S>(
+        gpu: &Gpu,
+        layout: &wgpu::BindGroupLayout,
+        mtoon_layout: &wgpu::BindGroupLayout,
+        samplers: &Samplers,
+        bytes: &[u8],
+        label: &str,
+        opts: &ModelLoadOptions,
+        allowed_required_extensions: I,
+        mtoon_descriptors: &[MtoonMaterialDescriptor],
+    ) -> Result<Arc<Self>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self::load_glb_bytes_opts_with_material_descriptors_impl(
+            gpu,
+            layout,
+            Some(mtoon_layout),
+            samplers,
+            bytes,
+            label,
+            opts,
+            allowed_required_extensions,
+            mtoon_descriptors,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn load_glb_bytes_opts_with_material_descriptors_impl<I, S>(
+        gpu: &Gpu,
+        layout: &wgpu::BindGroupLayout,
+        mtoon_layout: Option<&wgpu::BindGroupLayout>,
         samplers: &Samplers,
         bytes: &[u8],
         label: &str,
@@ -1167,11 +1501,16 @@ impl ModelAsset {
             .into_iter()
             .map(|extension| extension.as_ref().to_owned())
             .collect();
-        let imported = import_glb_slice_with_options(
+        let imported = import_glb_slice_with_mtoon_options(
             bytes,
             label,
             &allowed_required_extensions,
             opts.max_texture_dim,
+            if mtoon_layout.is_some() {
+                mtoon_descriptors
+            } else {
+                &[]
+            },
         )?;
         let mut cache = ModelTextureCache::new();
         Self::load_glb_imported(
@@ -1182,6 +1521,7 @@ impl ModelAsset {
             opts,
             &[],
             &mut cache,
+            mtoon_layout,
             mtoon_descriptors,
             imported,
         )
@@ -1316,6 +1656,7 @@ impl ModelAsset {
             opts,
             overrides,
             cache,
+            None,
             &[],
             imported,
         )
@@ -1330,12 +1671,13 @@ impl ModelAsset {
         opts: &ModelLoadOptions,
         overrides: &[MaterialTextureOverride<'_>],
         cache: &mut ModelTextureCache,
+        mtoon_layout: Option<&wgpu::BindGroupLayout>,
         mtoon_descriptors: &[MtoonMaterialDescriptor],
         imported: ImportedGltf,
     ) -> Result<Arc<Self>> {
         let (doc, buffers, images) = imported;
         validate_model_input(&doc, &buffers, path)?;
-        let materials = authored_materials(&doc, mtoon_descriptors, path)?;
+        let materials = authored_materials(&doc, mtoon_descriptors, path, mtoon_layout.is_some())?;
 
         // --- textures ------------------------------------------------------
         // Only upload images a material actually samples (some files carry
@@ -1388,6 +1730,94 @@ impl ModelAsset {
                 rgba,
                 TextureColorSpace::Srgb,
             ));
+        }
+
+        // One bind group per authored native-capable material, reused by all
+        // primitives that reference it. Optional maps use shared neutral data.
+        let mut mtoon_groups: HashMap<usize, Arc<wgpu::BindGroup>> = HashMap::new();
+        let mut mtoon_material_buffers = Vec::new();
+        let mut mtoon_textures = Vec::new();
+        if let Some(mtoon_layout) = mtoon_layout {
+            let flat_normal = Arc::new(create_rgba_texture(
+                gpu,
+                "MToon flat normal",
+                1,
+                1,
+                &[128, 128, 255, 255],
+                false,
+                false,
+            ));
+            let zero_shift = Arc::new(create_rgba_texture(
+                gpu,
+                "MToon zero shift",
+                1,
+                1,
+                &[0, 0, 0, 255],
+                false,
+                false,
+            ));
+            let mut authored_samplers = GltfSamplerCache::new();
+            for material in &materials {
+                if !native_stage_b_capable(material) {
+                    if material.kind() == crate::material::MaterialKind::Mtoon {
+                        log::info!(
+                            "MToon material {} uses KHR_materials_unlit fallback: BLEND or later-pass properties",
+                            material.gltf_material_index
+                        );
+                    }
+                    continue;
+                }
+                let MaterialModel::Mtoon(mtoon) = &material.model else {
+                    unreachable!()
+                };
+                let base_info = material.inputs.base_color_texture.as_ref();
+                let normal_info = material
+                    .inputs
+                    .normal_texture
+                    .as_ref()
+                    .map(|normal| &normal.texture);
+                let shade_info = mtoon.shade_multiply_texture.as_ref();
+                let shift_info = mtoon
+                    .shading_shift_texture
+                    .as_ref()
+                    .map(|shift| &shift.texture);
+                let infos = [base_info, normal_info, shade_info, shift_info];
+                let resources = [
+                    stage_b_texture(gpu, cache, &images, opts, base_info, &white),
+                    stage_b_texture(gpu, cache, &images, opts, normal_info, &flat_normal),
+                    stage_b_texture(gpu, cache, &images, opts, shade_info, &white),
+                    stage_b_texture(gpu, cache, &images, opts, shift_info, &zero_shift),
+                ];
+                let samplers: Vec<wgpu::Sampler> = infos
+                    .iter()
+                    .map(|info| {
+                        authored_samplers
+                            .get_or_create(
+                                &gpu.device,
+                                info.map_or_else(GltfSampler::default, |texture| texture.sampler),
+                            )
+                            .clone()
+                    })
+                    .collect();
+                let (group, buffer) = make_mtoon_bind_group(
+                    gpu,
+                    mtoon_layout,
+                    material.name.as_deref().unwrap_or("MToon material"),
+                    [
+                        &resources[0].view,
+                        &resources[1].view,
+                        &resources[2].view,
+                        &resources[3].view,
+                    ],
+                    [&samplers[0], &samplers[1], &samplers[2], &samplers[3]],
+                    &MtoonRaw::from_material(material),
+                );
+                mtoon_groups.insert(material.gltf_material_index, group);
+                mtoon_material_buffers.push(buffer);
+                mtoon_textures.extend(resources);
+            }
+            mtoon_textures.push(flat_normal);
+            mtoon_textures.push(zero_shift);
         }
 
         // --- nodes / skeleton ----------------------------------------------
@@ -1986,6 +2416,10 @@ impl ModelAsset {
                     first_index: meta.first_index,
                     index_count: meta.index_count,
                     bind_group,
+                    mtoon_bind_group: meta
+                        .material_index
+                        .and_then(|index| mtoon_groups.get(&index))
+                        .cloned(),
                     alpha_mode: meta.alpha_mode,
                     alpha_cutoff: meta.alpha_cutoff,
                     double_sided: meta.double_sided,
@@ -1994,13 +2428,27 @@ impl ModelAsset {
                     material_name: meta.material_name,
                     material_role: meta.material_role,
                     material_index: meta.material_index,
-                    render_phase: RenderPhase::fallback(meta.alpha_mode),
+                    render_phase: if meta
+                        .material_index
+                        .is_some_and(|index| mtoon_groups.contains_key(&index))
+                    {
+                        match meta.alpha_mode {
+                            MaterialAlphaMode::Opaque => RenderPhase::Opaque,
+                            MaterialAlphaMode::Mask => RenderPhase::Mask,
+                            MaterialAlphaMode::Blend => {
+                                unreachable!("BLEND is not Stage B capable")
+                            }
+                        }
+                    } else {
+                        RenderPhase::fallback(meta.alpha_mode)
+                    },
                     material_buf,
                 }
             })
             .collect();
 
         textures.push(white);
+        textures.extend(mtoon_textures);
         Ok(Arc::new(Self {
             vbuf,
             ibuf,
@@ -2014,6 +2462,7 @@ impl ModelAsset {
             prim_morph,
             aabb,
             textures,
+            mtoon_material_buffers,
         }))
     }
 }
@@ -2104,6 +2553,26 @@ fn cap_texture_rgba(
         rgba = downsample_rgba(&rgba, width, height);
         width = width.div_ceil(2);
         height = height.div_ceil(2);
+    }
+    (rgba, width, height)
+}
+
+fn cap_texture_rgba_semantic(
+    mut rgba: Vec<u8>,
+    mut width: u32,
+    mut height: u32,
+    max_texture_dim: Option<u32>,
+    semantic: MipSemantic,
+) -> (Vec<u8>, u32, u32) {
+    let Some(max) = max_texture_dim else {
+        return (rgba, width, height);
+    };
+    while width.max(height) > max {
+        let next_width = width.div_ceil(2);
+        let next_height = height.div_ceil(2);
+        rgba = downsample_semantic(&rgba, width, height, next_width, next_height, semantic);
+        width = next_width;
+        height = next_height;
     }
     (rgba, width, height)
 }
@@ -2728,6 +3197,7 @@ fn import_byte_images(
     buffers: &[gltf::buffer::Data],
     max_texture_dim: Option<u32>,
     label: &str,
+    mtoon_descriptors: &[MtoonMaterialDescriptor],
 ) -> Result<Vec<gltf::image::Data>> {
     let image_slot_count = doc.images().count();
     if image_slot_count > MAX_BYTE_IMAGE_COUNT {
@@ -2735,7 +3205,7 @@ fn import_byte_images(
             "byte-loaded GLB {label} declares {image_slot_count} images, exceeding the limit of {MAX_BYTE_IMAGE_COUNT}"
         );
     }
-    let used: HashSet<usize> = doc
+    let mut used: HashSet<usize> = doc
         .nodes()
         .filter_map(|node| node.mesh())
         .flat_map(|mesh| mesh.primitives())
@@ -2747,6 +3217,36 @@ fn import_byte_images(
                 .map(|texture| texture.texture().source().index())
         })
         .collect();
+    for descriptor in mtoon_descriptors {
+        let authored = MaterialAsset {
+            gltf_material_index: descriptor.material_index,
+            name: None,
+            inputs: descriptor.inputs.clone(),
+            model: MaterialModel::Mtoon(Box::new(descriptor.mtoon.clone())),
+        };
+        if !native_stage_b_capable(&authored) {
+            continue;
+        }
+        for texture in [
+            descriptor.inputs.base_color_texture.as_ref(),
+            descriptor
+                .inputs
+                .normal_texture
+                .as_ref()
+                .map(|normal| &normal.texture),
+            descriptor.mtoon.shade_multiply_texture.as_ref(),
+            descriptor
+                .mtoon
+                .shading_shift_texture
+                .as_ref()
+                .map(|shift| &shift.texture),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            used.insert(texture.image_index);
+        }
+    }
     let max_decode_dim = byte_image_decode_dim(max_texture_dim);
     let mut budget = ByteImageBudget::default();
     let fallback = gltf::image::Data {
@@ -2781,11 +3281,28 @@ fn import_glb_slice(
     import_glb_slice_with_options(bytes, label, allowed_required_extensions, None)
 }
 
+#[cfg(test)]
 fn import_glb_slice_with_options(
     bytes: &[u8],
     label: &str,
     allowed_required_extensions: &[String],
     max_texture_dim: Option<u32>,
+) -> Result<ImportedGltf> {
+    import_glb_slice_with_mtoon_options(
+        bytes,
+        label,
+        allowed_required_extensions,
+        max_texture_dim,
+        &[],
+    )
+}
+
+fn import_glb_slice_with_mtoon_options(
+    bytes: &[u8],
+    label: &str,
+    allowed_required_extensions: &[String],
+    max_texture_dim: Option<u32>,
+    mtoon_descriptors: &[MtoonMaterialDescriptor],
 ) -> Result<ImportedGltf> {
     let normalized = normalize_glb_container(bytes, label)?;
     let mut parsed = gltf::Gltf::from_slice_without_validation(&normalized)
@@ -2834,8 +3351,14 @@ fn import_glb_slice_with_options(
     validate_self_contained_resources(&document)?;
     let buffers = gltf::import_buffers(&document, None, parsed.blob.take())
         .with_context(|| format!("importing embedded GLB buffers {label}"))?;
-    let images = import_byte_images(&document, &buffers, max_texture_dim, label)
-        .with_context(|| format!("importing embedded GLB images {label}"))?;
+    let images = import_byte_images(
+        &document,
+        &buffers,
+        max_texture_dim,
+        label,
+        mtoon_descriptors,
+    )
+    .with_context(|| format!("importing embedded GLB images {label}"))?;
     Ok((document, buffers, images))
 }
 
@@ -2850,7 +3373,7 @@ mod tests {
     use crate::anim::{AnimState, Channel, ChannelPath, Clip, Interpolation, NodeTrs, Skeleton};
     use crate::gpu::Gpu;
     use crate::material::TextureColorSpace;
-    use crate::texture::Samplers;
+    use crate::texture::{MipSemantic, Samplers};
 
     use super::{
         ByteImageBudget, MAX_BYTE_IMAGE_BYTES, MAX_BYTE_IMAGE_COUNT, MaterialBaseColorMode,
@@ -3185,7 +3708,7 @@ mod tests {
             let doc = gltf::Gltf::from_slice_without_validation(&bytes)
                 .unwrap()
                 .document;
-            let error = authored_materials(&doc, &[], Path::new("uv1.glb"))
+            let error = authored_materials(&doc, &[], Path::new("uv1.glb"), false)
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -3590,12 +4113,37 @@ mod tests {
             height,
             rgba: rgba.into(),
             color_space,
+            mip_semantic: MipSemantic::Legacy,
         };
         let reference = key(2, 1, &[1, 2, 3, 4, 5, 6, 7, 8], TextureColorSpace::Srgb);
         assert!(reference == key(2, 1, &[1, 2, 3, 4, 5, 6, 7, 8], TextureColorSpace::Srgb));
         assert!(reference != key(1, 2, &[1, 2, 3, 4, 5, 6, 7, 8], TextureColorSpace::Srgb));
         assert!(reference != key(2, 1, &[1, 2, 3, 4, 5, 6, 7, 9], TextureColorSpace::Srgb));
         assert!(reference != key(2, 1, &[1, 2, 3, 4, 5, 6, 7, 8], TextureColorSpace::Linear));
+        let pixels: Box<[u8]> = [1, 2, 3, 4, 5, 6, 7, 8].into();
+        let color = ModelTextureCacheKey {
+            width: 2,
+            height: 1,
+            rgba: pixels.clone(),
+            color_space: TextureColorSpace::Srgb,
+            mip_semantic: MipSemantic::SrgbColor,
+        };
+        let normal = ModelTextureCacheKey {
+            width: 2,
+            height: 1,
+            rgba: pixels.clone(),
+            color_space: TextureColorSpace::Linear,
+            mip_semantic: MipSemantic::TangentNormal,
+        };
+        let shift = ModelTextureCacheKey {
+            width: 2,
+            height: 1,
+            rgba: pixels,
+            color_space: TextureColorSpace::Linear,
+            mip_semantic: MipSemantic::LinearData,
+        };
+        assert!(color != normal);
+        assert!(normal != shift);
     }
 
     #[test]

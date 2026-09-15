@@ -8,7 +8,7 @@ use glam::{Mat4, Vec3};
 use crate::camera::Camera;
 use crate::gpu::{DEPTH_FORMAT, DepthTarget, Gpu};
 use crate::hud::{ATLAS_H, ATLAS_W, Hud, HudVertex, build_font_atlas};
-use crate::material::RenderPassClass;
+use crate::material::{MaterialPipelineKey, PipelineShadingModel, RenderPassClass};
 use crate::model::{ModelAsset, ModelInstance, ModelVertex};
 use crate::scene::Scene;
 use crate::texture::{GpuTexture, Samplers, create_rgba_texture};
@@ -48,6 +48,7 @@ pub struct Renderer {
     pub samplers: Samplers,
     pub world_material_layout: wgpu::BindGroupLayout,
     pub model_material_layout: wgpu::BindGroupLayout,
+    pub mtoon_material_layout: wgpu::BindGroupLayout,
     depth: Option<DepthTarget>,
     msaa_color: Option<MsaaColorTarget>,
     smaa: Option<crate::smaa::SmaaPass>,
@@ -420,6 +421,7 @@ impl Renderer {
 
         let models = ModelPass::new(gpu, color_format, &globals_bgl, effective_sample_count);
         let model_material_layout = models.material_layout.clone();
+        let mtoon_material_layout = models.mtoon_material_layout.clone();
         let sprites = SpritePass::new(gpu, color_format, &globals_bgl, effective_sample_count);
         let smaa = smaa_enabled.then(|| crate::smaa::SmaaPass::new(gpu, color_format));
         if smaa.is_some() {
@@ -431,6 +433,7 @@ impl Renderer {
             samplers,
             world_material_layout,
             model_material_layout,
+            mtoon_material_layout,
             depth: None,
             msaa_color: None,
             smaa,
@@ -919,14 +922,22 @@ pub(crate) struct ModelDraw {
 }
 
 struct ModelPass {
+    sample_count: u32,
     opaque: wgpu::RenderPipeline,
     opaque_double_sided: wgpu::RenderPipeline,
     blend: wgpu::RenderPipeline,
     blend_double_sided: wgpu::RenderPipeline,
+    mtoon_opaque: wgpu::RenderPipeline,
+    mtoon_opaque_double_sided: wgpu::RenderPipeline,
+    mtoon_mask: wgpu::RenderPipeline,
+    mtoon_mask_double_sided: wgpu::RenderPipeline,
     material_layout: wgpu::BindGroupLayout,
+    mtoon_material_layout: wgpu::BindGroupLayout,
     object_layout: wgpu::BindGroupLayout,
     shader: wgpu::ShaderModule,
+    mtoon_shader: wgpu::ShaderModule,
     pipeline_layout: wgpu::PipelineLayout,
+    mtoon_pipeline_layout: wgpu::PipelineLayout,
     object_bg: wgpu::BindGroup,
     instance_buf: wgpu::Buffer,
     joints_buf: wgpu::Buffer,
@@ -943,6 +954,7 @@ impl ModelPass {
     ) -> Self {
         let device = &gpu.device;
         let material_layout = ModelAsset::material_layout(gpu);
+        let mtoon_material_layout = ModelAsset::mtoon_material_layout(gpu);
         let object_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("model object"),
             entries: &[
@@ -978,6 +990,24 @@ impl ModelPass {
             bind_group_layouts: &[globals_bgl, &material_layout, &object_layout],
             push_constant_ranges: &[],
         });
+        let mtoon_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mtoon.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/mtoon.wgsl").into()),
+        });
+        let mtoon_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("MToon surface layout"),
+                bind_group_layouts: &[globals_bgl, &mtoon_material_layout, &object_layout],
+                push_constant_ranges: &[],
+            });
+        let (mtoon_opaque, mtoon_opaque_double_sided, mtoon_mask, mtoon_mask_double_sided) =
+            Self::create_mtoon_pipelines(
+                device,
+                color_format,
+                &mtoon_shader,
+                &mtoon_pipeline_layout,
+                sample_count,
+            );
         let (opaque, opaque_double_sided, blend, blend_double_sided) =
             Self::create_pipelines(device, color_format, &shader, &layout, sample_count);
 
@@ -988,14 +1018,22 @@ impl ModelPass {
         let object_bg = Self::make_object_bg(device, &object_layout, &instance_buf, &joints_buf);
 
         Self {
+            sample_count,
             opaque,
             opaque_double_sided,
             blend,
             blend_double_sided,
+            mtoon_opaque,
+            mtoon_opaque_double_sided,
+            mtoon_mask,
+            mtoon_mask_double_sided,
             material_layout,
+            mtoon_material_layout,
             object_layout,
             shader,
+            mtoon_shader,
             pipeline_layout: layout,
+            mtoon_pipeline_layout,
             object_bg,
             instance_buf,
             joints_buf,
@@ -1074,6 +1112,67 @@ impl ModelPass {
         )
     }
 
+    fn create_mtoon_pipelines(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        shader: &wgpu::ShaderModule,
+        layout: &wgpu::PipelineLayout,
+        sample_count: u32,
+    ) -> (
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+    ) {
+        let make = |label: &str, double_sided: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[ModelVertex::LAYOUT],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: if double_sided {
+                        None
+                    } else {
+                        Some(wgpu::Face::Back)
+                    },
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: multisample_state(sample_count),
+                multiview: None,
+                cache: None,
+            })
+        };
+        (
+            make("MToon opaque", false),
+            make("MToon opaque double-sided", true),
+            make("MToon mask", false),
+            make("MToon mask double-sided", true),
+        )
+    }
+
     fn rebuild_pipelines(
         &mut self,
         device: &wgpu::Device,
@@ -1091,6 +1190,19 @@ impl ModelPass {
         self.opaque_double_sided = opaque_double_sided;
         self.blend = blend;
         self.blend_double_sided = blend_double_sided;
+        self.sample_count = sample_count;
+        (
+            self.mtoon_opaque,
+            self.mtoon_opaque_double_sided,
+            self.mtoon_mask,
+            self.mtoon_mask_double_sided,
+        ) = Self::create_mtoon_pipelines(
+            device,
+            color_format,
+            &self.mtoon_shader,
+            &self.mtoon_pipeline_layout,
+            sample_count,
+        );
     }
 
     fn make_instance_buf(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
@@ -1261,14 +1373,49 @@ impl ModelPass {
                 if prim.render_phase.pass_class() != pass_class {
                     continue;
                 }
-                let pipeline = match (pass_class, prim.double_sided) {
-                    (RenderPassClass::Solid, false) => &self.opaque,
-                    (RenderPassClass::Solid, true) => &self.opaque_double_sided,
-                    (RenderPassClass::Blend, false) => &self.blend,
-                    (RenderPassClass::Blend, true) => &self.blend_double_sided,
+                let pipeline_key = if prim.mtoon_bind_group.is_some() {
+                    MaterialPipelineKey::native_stage_b(
+                        prim.render_phase,
+                        prim.double_sided,
+                        self.sample_count,
+                    )
+                    .expect("native MToon only supports OPAQUE/MASK")
+                } else {
+                    MaterialPipelineKey::current_fallback(
+                        prim.unlit,
+                        prim.render_phase,
+                        prim.double_sided,
+                        self.sample_count,
+                    )
+                };
+                let pipeline = if pipeline_key.shading_model == PipelineShadingModel::Mtoon {
+                    match (prim.alpha_mode, prim.double_sided) {
+                        (crate::material::MaterialAlphaMode::Opaque, false) => &self.mtoon_opaque,
+                        (crate::material::MaterialAlphaMode::Opaque, true) => {
+                            &self.mtoon_opaque_double_sided
+                        }
+                        (crate::material::MaterialAlphaMode::Mask, false) => &self.mtoon_mask,
+                        (crate::material::MaterialAlphaMode::Mask, true) => {
+                            &self.mtoon_mask_double_sided
+                        }
+                        (crate::material::MaterialAlphaMode::Blend, _) => {
+                            unreachable!("BLEND cannot use Stage B native pipeline")
+                        }
+                    }
+                } else {
+                    match (pass_class, prim.double_sided) {
+                        (RenderPassClass::Solid, false) => &self.opaque,
+                        (RenderPassClass::Solid, true) => &self.opaque_double_sided,
+                        (RenderPassClass::Blend, false) => &self.blend,
+                        (RenderPassClass::Blend, true) => &self.blend_double_sided,
+                    }
                 };
                 pass.set_pipeline(pipeline);
-                pass.set_bind_group(1, &prim.bind_group, &[]);
+                pass.set_bind_group(
+                    1,
+                    prim.mtoon_bind_group.as_deref().unwrap_or(&prim.bind_group),
+                    &[],
+                );
                 // Morphing primitives read vertices from the instance's
                 // overlay buffer; base_vertex redirects the shared indices.
                 let morph = d

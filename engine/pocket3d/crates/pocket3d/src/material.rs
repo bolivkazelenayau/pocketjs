@@ -87,6 +87,19 @@ impl Default for TextureTransform {
     }
 }
 
+impl TextureTransform {
+    /// KHR_texture_transform: offset + rotation * (scale * selected UV).
+    pub fn apply_uv(self, uv: [f32; 2]) -> [f32; 2] {
+        let (s, c) = self.rotation.sin_cos();
+        let x = uv[0] * self.scale[0];
+        let y = uv[1] * self.scale[1];
+        [
+            self.offset[0] + c * x - s * y,
+            self.offset[1] + s * x + c * y,
+        ]
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum GltfMagFilter {
     Nearest,
@@ -135,6 +148,10 @@ impl Default for GltfSampler {
 
 impl GltfSampler {
     pub fn to_wgpu_descriptor(self) -> wgpu::SamplerDescriptor<'static> {
+        let uses_mipmaps = !matches!(
+            self.min_filter,
+            None | Some(GltfMinFilter::Nearest | GltfMinFilter::Linear)
+        );
         let (min_filter, mipmap_filter) = match self.min_filter {
             None | Some(GltfMinFilter::Linear) => {
                 (wgpu::FilterMode::Linear, wgpu::FilterMode::Nearest)
@@ -163,6 +180,7 @@ impl GltfSampler {
             },
             min_filter,
             mipmap_filter,
+            lod_max_clamp: if uses_mipmaps { 32.0 } else { 0.0 },
             ..Default::default()
         }
     }
@@ -190,6 +208,7 @@ struct GltfSamplerKey {
     mipmap_filter: wgpu::FilterMode,
     wrap_s: wgpu::AddressMode,
     wrap_t: wgpu::AddressMode,
+    uses_mipmaps: bool,
 }
 
 impl From<GltfSampler> for GltfSamplerKey {
@@ -201,6 +220,7 @@ impl From<GltfSampler> for GltfSamplerKey {
             mipmap_filter: descriptor.mipmap_filter,
             wrap_s: descriptor.address_mode_u,
             wrap_t: descriptor.address_mode_v,
+            uses_mipmaps: descriptor.lod_max_clamp > 0.0,
         }
     }
 }
@@ -577,6 +597,28 @@ pub struct MaterialPipelineKey {
 }
 
 impl MaterialPipelineKey {
+    /// Stage B has only depth-writing, unblended MToon surfaces.
+    pub const fn native_stage_b(
+        phase: RenderPhase,
+        double_sided: bool,
+        sample_count: u32,
+    ) -> Option<Self> {
+        match phase {
+            RenderPhase::Opaque | RenderPhase::Mask => Some(Self {
+                shading_model: PipelineShadingModel::Mtoon,
+                blend_depth_family: PipelineBlendDepthFamily::OpaqueOrMask,
+                cull_mode: if double_sided {
+                    PipelineCullMode::None
+                } else {
+                    PipelineCullMode::Back
+                },
+                render_pass: MaterialRenderPass::Surface,
+                sample_count,
+            }),
+            RenderPhase::MtoonBlendZWrite | RenderPhase::Blend => None,
+        }
+    }
+
     pub const fn current_fallback(
         unlit: bool,
         phase: RenderPhase,
@@ -867,5 +909,157 @@ mod tests {
             PipelineBlendDepthFamily::BlendNoDepthWrite
         );
         assert_eq!(key.render_pass, MaterialRenderPass::Surface);
+    }
+
+    #[test]
+    fn stage_b_pipeline_key_only_accepts_solid_mtoon_surfaces() {
+        for phase in [RenderPhase::Opaque, RenderPhase::Mask] {
+            for double_sided in [false, true] {
+                let key = MaterialPipelineKey::native_stage_b(phase, double_sided, 4).unwrap();
+                assert_eq!(key.shading_model, PipelineShadingModel::Mtoon);
+                assert_eq!(
+                    key.blend_depth_family,
+                    PipelineBlendDepthFamily::OpaqueOrMask
+                );
+                assert_eq!(key.sample_count, 4);
+                assert_eq!(
+                    key.cull_mode,
+                    if double_sided {
+                        PipelineCullMode::None
+                    } else {
+                        PipelineCullMode::Back
+                    }
+                );
+            }
+        }
+        assert!(MaterialPipelineKey::native_stage_b(RenderPhase::Blend, false, 4).is_none());
+        assert!(
+            MaterialPipelineKey::native_stage_b(RenderPhase::MtoonBlendZWrite, true, 4).is_none()
+        );
+        assert_eq!(
+            MaterialPipelineKey::current_fallback(false, RenderPhase::Opaque, false, 4)
+                .shading_model,
+            PipelineShadingModel::PocketLit,
+        );
+        assert_eq!(
+            MaterialPipelineKey::current_fallback(true, RenderPhase::Opaque, false, 4)
+                .shading_model,
+            PipelineShadingModel::Unlit,
+        );
+    }
+
+    #[test]
+    fn non_mipmap_min_filters_clamp_to_base_level() {
+        for filter in [
+            None,
+            Some(GltfMinFilter::Nearest),
+            Some(GltfMinFilter::Linear),
+        ] {
+            assert_eq!(
+                GltfSampler {
+                    min_filter: filter,
+                    ..Default::default()
+                }
+                .to_wgpu_descriptor()
+                .lod_max_clamp,
+                0.0,
+            );
+        }
+        assert!(
+            GltfSampler {
+                min_filter: Some(GltfMinFilter::LinearMipmapLinear),
+                ..Default::default()
+            }
+            .to_wgpu_descriptor()
+            .lod_max_clamp
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn stage_b_uv_selection_and_khr_transform_order() {
+        let transform = TextureTransform {
+            offset: [0.1, 0.2],
+            rotation: std::f32::consts::FRAC_PI_2,
+            scale: [2.0, 3.0],
+            tex_coord_override: None,
+        };
+        let make = |role, tex_coord, override_set| TextureInfo {
+            texture_index: 0,
+            image_index: 0,
+            sampler: GltfSampler::default(),
+            tex_coord,
+            transform: TextureTransform {
+                tex_coord_override: override_set,
+                ..transform
+            },
+            role,
+            color_space: role.color_space(),
+        };
+        let uv0 = [0.25, 0.5];
+        let uv1 = [0.5, 0.25];
+        let selected = |info: &TextureInfo| {
+            info.transform.apply_uv(if info.effective_tex_coord() == 0 {
+                uv0
+            } else {
+                uv1
+            })
+        };
+        let base = make(TextureRole::BaseColor, 0, None);
+        let normal = make(TextureRole::Normal, 1, None);
+        let shift = make(TextureRole::ShadingShift, 0, Some(1));
+        let base_uv = selected(&base);
+        let normal_uv = selected(&normal);
+        let shift_uv = selected(&shift);
+        assert!((base_uv[0] + 1.4).abs() < 1e-6);
+        assert!((base_uv[1] - 0.7).abs() < 1e-6);
+        assert!((normal_uv[0] + 0.65).abs() < 1e-6);
+        assert!((normal_uv[1] - 1.2).abs() < 1e-6);
+        assert_eq!(normal_uv, shift_uv);
+    }
+
+    fn reference_toon(shading: f32, toony: f32) -> f32 {
+        let toony = toony.clamp(0.0, 1.0);
+        if toony >= 1.0 {
+            return f32::from(shading >= 0.0);
+        }
+        let a = -1.0 + toony;
+        let b = 1.0 - toony;
+        ((shading - a) / (b - a)).clamp(0.0, 1.0)
+    }
+
+    #[test]
+    fn stage_b_shift_toony_gi_and_mask_reference_math() {
+        let shift = |factor: f32, texture_r: Option<f32>, scale: f32| {
+            factor + texture_r.unwrap_or(0.0) * scale
+        };
+        assert_eq!(shift(0.0, None, 7.0), 0.0);
+        assert_eq!(shift(0.25, Some(0.5), 2.0), 1.25);
+        assert_eq!(shift(-0.5, Some(0.25), -2.0), -1.0);
+        assert_eq!(reference_toon(-1.0, 0.0), 0.0);
+        assert_eq!(reference_toon(0.0, 0.0), 0.5);
+        assert_eq!(reference_toon(1.0, 0.0), 1.0);
+        assert_eq!(reference_toon(-0.5, 0.5), 0.0);
+        assert_eq!(reference_toon(0.0, 0.5), 0.5);
+        assert_eq!(reference_toon(0.5, 0.5), 1.0);
+        assert!(reference_toon(1e-5, 0.9999).is_finite());
+        assert_eq!(reference_toon(-1e-5, 1.0), 0.0);
+        assert_eq!(reference_toon(0.0, 1.0), 1.0);
+        let shade = [0.2, 0.3, 0.4];
+        let lit = [0.8, 0.7, 0.6];
+        let toon = reference_toon(0.0, 0.5);
+        let mixed: Vec<f32> = shade
+            .iter()
+            .zip(lit)
+            .map(|(a, b)| a * (1.0 - toon) + b * toon)
+            .collect();
+        assert_eq!(mixed, [0.5, 0.5, 0.5]);
+        let raw_gi = 0.8;
+        let uniform_gi = 0.5;
+        assert_eq!(raw_gi * (1.0 - 0.0) + uniform_gi * 0.0, raw_gi);
+        assert_eq!(raw_gi * (1.0 - 1.0) + uniform_gi * 1.0, uniform_gi);
+        let alpha = 0.6 * 0.7;
+        assert!(alpha < 0.5);
+        assert!(alpha >= 0.4);
     }
 }
