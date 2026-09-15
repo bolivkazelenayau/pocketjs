@@ -27,6 +27,7 @@ use crate::texture::{
 };
 
 pub use crate::material::MaterialAlphaMode;
+pub use pocket3d_mesh::Skin;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -401,12 +402,6 @@ pub struct ModelLoadOptions {
     /// Character/prop authoring resolutions routinely exceed what small
     /// windows can display; this is the biggest single memory lever.
     pub max_texture_dim: Option<u32>,
-}
-
-pub struct Skin {
-    /// Node index per joint.
-    pub joints: Vec<usize>,
-    pub inverse_bind: Vec<Mat4>,
 }
 
 /// One morph target of a primitive, stored sparse: only vertices the target
@@ -1059,9 +1054,7 @@ impl ModelAsset {
     pub fn palette_from_globals(&self, globals: &[Mat4], out: &mut Vec<Mat4>) {
         out.clear();
         for skin in &self.skins {
-            for (i, &node) in skin.joints.iter().enumerate() {
-                out.push(globals[node] * skin.inverse_bind[i]);
-            }
+            out.extend(skin.matrices(globals, None));
         }
         if out.is_empty() {
             out.push(Mat4::IDENTITY);
@@ -1927,14 +1920,7 @@ impl ModelAsset {
             // vertices can live in an arbitrary rig space (cm, Z-up); only
             // the skinned result is in object space.
             let rest_palette: Vec<Mat4> = node_skin
-                .map(|si| {
-                    let s = &skins[si];
-                    s.joints
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &n)| rest_globals[n] * s.inverse_bind[i])
-                        .collect()
-                })
+                .map(|si| skins[si].matrices(&rest_globals, None).collect())
                 .unwrap_or_default();
 
             for prim in mesh.primitives() {
