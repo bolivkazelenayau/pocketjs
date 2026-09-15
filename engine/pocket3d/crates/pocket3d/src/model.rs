@@ -3584,6 +3584,75 @@ mod tests {
         )
     }
 
+    fn two_skin_fixture(inverse_bind_count: Option<usize>, invalid_joint: bool) -> Vec<u8> {
+        let mut bin = Vec::new();
+        let mut views = Vec::new();
+        let mut accessors = Vec::new();
+        for position in [
+            [-0.25_f32, -0.25, 0.0],
+            [0.25, -0.25, 0.0],
+            [0.0, 0.25, 0.0],
+        ] {
+            for component in position {
+                bin.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        views.push(json!({"buffer": 0, "byteOffset": 0, "byteLength": bin.len(), "target": 34962}));
+        accessors.push(json!({
+            "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+            "min": [-0.25, -0.25, 0.0], "max": [0.25, 0.25, 0.0]
+        }));
+        let joint_offset = bin.len();
+        let joints = append_u16_vec4_accessor(&mut bin, &mut views, &mut accessors, 3);
+        if invalid_joint {
+            bin[joint_offset..joint_offset + 2].copy_from_slice(&1_u16.to_le_bytes());
+        }
+        let weight_offset = bin.len();
+        let weights = append_f32_accessor(&mut bin, &mut views, &mut accessors, 3, 4);
+        for vertex in 0..3 {
+            let offset = weight_offset + vertex * 16;
+            bin[offset..offset + 4].copy_from_slice(&1.0_f32.to_le_bytes());
+        }
+        let mut skins = json!([{"joints": [2]}, {"joints": [3]}]);
+        if let Some(count) = inverse_bind_count {
+            let offset = bin.len();
+            bin.resize(offset + count * 64, 0);
+            let view = views.len();
+            views.push(json!({"buffer": 0, "byteOffset": offset, "byteLength": count * 64}));
+            let accessor = accessors.len();
+            accessors.push(json!({
+                "bufferView": view, "componentType": 5126, "count": count, "type": "MAT4"
+            }));
+            skins[0]["inverseBindMatrices"] = json!(accessor);
+        }
+        glb_from_json(
+            json!({
+                "asset": {"version": "2.0"},
+                "scene": 0,
+                "scenes": [{"nodes": [0, 1, 2, 3]}],
+                "nodes": [
+                    {"mesh": 0, "skin": 0},
+                    {"mesh": 1, "skin": 1},
+                    {"translation": [-1.0, 0.0, 0.0]},
+                    {"translation": [1.0, 0.0, 0.0]}
+                ],
+                "skins": skins,
+                "meshes": [
+                    {"primitives": [{"attributes": {
+                        "POSITION": 0, "JOINTS_0": joints, "WEIGHTS_0": weights
+                    }}]},
+                    {"primitives": [{"attributes": {
+                        "POSITION": 0, "JOINTS_0": joints, "WEIGHTS_0": weights
+                    }}]}
+                ],
+                "buffers": [{"byteLength": bin.len()}],
+                "bufferViews": views,
+                "accessors": accessors
+            }),
+            &bin,
+        )
+    }
+
     fn animation_fixture(
         input_count: usize,
         output_count: usize,
@@ -3819,6 +3888,89 @@ mod tests {
         let err = validate_joint_palette_count(513, Path::new("oversized-rig.glb")).unwrap_err();
         assert!(format!("{err:#}").contains("combined skin joint count 513"));
         assert!(format!("{err:#}").contains("limit 512"));
+    }
+
+    #[test]
+    fn wrong_inverse_bind_count_and_invalid_joint_index_remain_loader_errors() {
+        let wrong_bind = validate_fixture(&two_skin_fixture(Some(2), false));
+        assert!(
+            format!("{wrong_bind:#}")
+                .contains("inverse bind matrix count 2 does not match skin joint count 1")
+        );
+        let invalid_joint = validate_fixture(&two_skin_fixture(None, true));
+        assert!(
+            format!("{invalid_joint:#}")
+                .contains("JOINTS_0 vertex 0 index 1 at slot 0 exceeds skin joint count 1")
+        );
+    }
+
+    #[test]
+    fn desktop_two_skin_palette_and_render_keep_per_skin_joint_remapping() {
+        use crate::camera::Camera;
+        use crate::gpu::{OFFSCREEN_FORMAT, OffscreenTarget};
+        use crate::hud::Hud;
+        use crate::renderer::Renderer;
+        use crate::scene::Scene;
+
+        let gpu = Gpu::new_headless().expect("headless GPU required for multi-skin regression");
+        let mut renderer = Renderer::new(&gpu, OFFSCREEN_FORMAT).unwrap();
+        let asset = ModelAsset::load_glb_bytes(
+            &gpu,
+            &renderer.model_material_layout,
+            &renderer.samplers,
+            &two_skin_fixture(None, false),
+            "two-skin regression",
+        )
+        .unwrap();
+        assert_eq!(asset.skins.len(), 2);
+        assert_eq!(asset.skins[0].joints, [2]);
+        assert_eq!(asset.skins[1].joints, [3]);
+        let mut globals = Vec::new();
+        asset
+            .skeleton
+            .global_transforms(None, 0.0, false, &mut globals);
+        let mut palette = Vec::new();
+        asset.palette_from_globals(&globals, &mut palette);
+        assert_eq!(palette.len(), 2);
+        assert_eq!(palette[0].w_axis.truncate(), Vec3::new(-1.0, 0.0, 0.0));
+        assert_eq!(palette[1].w_axis.truncate(), Vec3::new(1.0, 0.0, 0.0));
+
+        let target = OffscreenTarget::new(&gpu, 96, 64);
+        let camera = Camera {
+            pos: Vec3::new(0.0, 0.0, 3.0),
+            znear: 0.01,
+            ..Camera::default()
+        };
+        let scene = Scene {
+            transparent_clear: true,
+            models: vec![super::ModelInstance::new(asset)],
+            ..Scene::default()
+        };
+        renderer.render(
+            &gpu,
+            &target.view,
+            target.size,
+            &scene,
+            &camera,
+            &Hud::default(),
+        );
+        let rgba = target.read_rgba(&gpu).unwrap();
+        let mut left = 0;
+        let mut right = 0;
+        for (index, pixel) in rgba.as_chunks::<4>().0.iter().enumerate() {
+            if pixel[3] != 0 {
+                if index % 96 < 48 {
+                    left += 1;
+                } else {
+                    right += 1;
+                }
+            }
+        }
+        assert!(left > 0, "first skin must draw in the left half");
+        assert!(
+            right > 0,
+            "second skin's remapped joint must draw in the right half"
+        );
     }
 
     #[test]
