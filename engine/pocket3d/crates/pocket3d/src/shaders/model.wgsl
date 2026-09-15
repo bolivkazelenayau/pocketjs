@@ -132,9 +132,9 @@ fn distance_fog(world_pos: vec3f) -> f32 {
 
 @fragment
 fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4f {
-    var albedo = textureSample(t_albedo, s_albedo, in.uv)
-        * material.base_color_factor
-        * instance.tint;
+    let material_albedo = textureSample(t_albedo, s_albedo, in.uv)
+        * material.base_color_factor;
+    var albedo = material_albedo * instance.tint;
     if material.style.x > 0.5 {
         // Texture samples are already linearized by the sRGB texture view.
         // Rec. 709 luminance removes hue without changing transparency.
@@ -142,7 +142,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0)
         albedo = vec4f(vec3f(luminance), albedo.a);
     }
     let alpha_cutoff = max(instance.params.y, material.params.y);
-    if alpha_cutoff > 0.0 && albedo.a < alpha_cutoff {
+    if alpha_cutoff > 0.0 && material_albedo.a < alpha_cutoff {
         discard;
     }
     var n = normalize(in.normal);
