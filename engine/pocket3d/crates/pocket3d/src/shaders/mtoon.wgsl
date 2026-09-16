@@ -1,4 +1,4 @@
-// Native VRMC_materials_mtoon 1.0 Stage B-E surface and outline.
+// Native VRMC_materials_mtoon 1.0 Stage B-F surface and outline.
 struct Globals {
     view_proj: mat4x4f,
     inverse_view_proj: mat4x4f,
@@ -53,8 +53,11 @@ struct MtoonMaterial {
     emissive_uv: UvDesc,
     rim_uv: UvDesc,
     outline_uv: UvDesc,
+    uv_animation_mask_uv: UvDesc,
     // x: shading shift texture scale
     texture_scales: vec4f,
+    // xy: scroll UV/second, z: rotation radians/second
+    uv_animation: vec4f,
 }
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(1) @binding(0) var t_base: texture_2d<f32>;
@@ -74,6 +77,8 @@ struct MtoonMaterial {
 @group(1) @binding(14) var<uniform> material: MtoonMaterial;
 @group(1) @binding(15) var t_outline_width: texture_2d<f32>;
 @group(1) @binding(16) var s_outline_width: sampler;
+@group(1) @binding(17) var t_uv_animation_mask: texture_2d<f32>;
+@group(1) @binding(18) var s_uv_animation_mask: sampler;
 @group(2) @binding(0) var<uniform> instance: Instance;
 @group(2) @binding(1) var<storage, read> joints: array<mat4x4f>;
 
@@ -136,13 +141,43 @@ fn vertex_varyings(in: VsIn, deformed: DeformedVertex) -> VsOut {
     out.world_pos = deformed.world_pos;
     return out;
 }
-fn transformed_uv(in: VsOut, desc: UvDesc) -> vec2f {
-    let uv = select(in.uv0, in.uv1, desc.offset_set.z > 0.5);
+fn selected_uv(in: VsOut, desc: UvDesc) -> vec2f {
+    return select(in.uv0, in.uv1, desc.offset_set.z > 0.5);
+}
+fn apply_khr_texture_transform(uv: vec2f, desc: UvDesc) -> vec2f {
     let scaled = uv * desc.scale_rotation.xy;
     let c = desc.scale_rotation.z;
     let s = desc.scale_rotation.w;
     return vec2f(c * scaled.x - s * scaled.y, s * scaled.x + c * scaled.y)
         + desc.offset_set.xy;
+}
+fn static_transformed_uv(in: VsOut, desc: UvDesc) -> vec2f {
+    return apply_khr_texture_transform(selected_uv(in, desc), desc);
+}
+fn animated_uv(uv: vec2f, mask: f32) -> vec2f {
+    let time = globals.cam_pos.w;
+    let angle = material.uv_animation.z * time * mask;
+    let c = cos(angle);
+    let s = sin(angle);
+    let centered = uv - vec2f(0.5);
+    let rotated = vec2f(
+        c * centered.x - s * centered.y,
+        s * centered.x + c * centered.y,
+    ) + vec2f(0.5);
+    return rotated + material.uv_animation.xy * time * mask;
+}
+fn animated_transformed_uv(in: VsOut, desc: UvDesc, mask: f32) -> vec2f {
+    // MToon animation is applied to the target's selected source UV before
+    // that target's independent authored KHR_texture_transform.
+    return apply_khr_texture_transform(animated_uv(selected_uv(in, desc), mask), desc);
+}
+fn fragment_uv_animation_mask(in: VsOut) -> f32 {
+    // The mask has its own static TextureInfo and is never animated itself.
+    return textureSample(
+        t_uv_animation_mask,
+        s_uv_animation_mask,
+        static_transformed_uv(in, material.uv_animation_mask_uv),
+    ).b;
 }
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
@@ -152,10 +187,16 @@ fn vs_main(in: VsIn) -> VsOut {
 fn vs_outline(in: VsIn) -> VsOut {
     let deformed = deform_vertex(in);
     var out = vertex_varyings(in, deformed);
+    let uv_animation_mask = textureSampleLevel(
+        t_uv_animation_mask,
+        s_uv_animation_mask,
+        static_transformed_uv(out, material.uv_animation_mask_uv),
+        0.0,
+    ).b;
     let width_mask = textureSampleLevel(
         t_outline_width,
         s_outline_width,
-        transformed_uv(out, material.outline_uv),
+        animated_transformed_uv(out, material.outline_uv, uv_animation_mask),
         0.0,
     ).g;
     let width = material.outline.y * width_mask;
@@ -238,22 +279,39 @@ fn matcap_uv(n: vec3f, view: vec3f) -> vec2f {
     let view_y = cross(view, view_x);
     return vec2f(dot(view_x, n), dot(view_y, n)) * 0.495 + vec2f(0.5);
 }
-fn sample_base(in: VsOut) -> vec4f {
-    return textureSample(t_base, s_base, transformed_uv(in, material.base_uv))
+fn sample_base(in: VsOut, uv_animation_mask: f32) -> vec4f {
+    return textureSample(
+        t_base,
+        s_base,
+        animated_transformed_uv(in, material.base_uv, uv_animation_mask),
+    )
         * material.base_color_factor;
 }
-fn surface_color(in: VsOut, geometric: vec3f, base: vec4f) -> vec3f {
-    let normal_uv = transformed_uv(in, material.normal_uv);
+fn surface_color(
+    in: VsOut,
+    geometric: vec3f,
+    base: vec4f,
+    uv_animation_mask: f32,
+) -> vec3f {
+    let normal_uv = animated_transformed_uv(in, material.normal_uv, uv_animation_mask);
     let n = shading_normal(
         in, geometric, normal_uv, textureSample(t_normal, s_normal, normal_uv).xyz,
     );
     let shift = material.surface.x
-        + textureSample(t_shift, s_shift, transformed_uv(in, material.shift_uv)).r
+        + textureSample(
+            t_shift,
+            s_shift,
+            animated_transformed_uv(in, material.shift_uv, uv_animation_mask),
+        ).r
             * material.texture_scales.x;
     let light_dir = safe_normalize(globals.model_sun_dir.xyz);
     let toon = toon_factor(dot(n, light_dir) + shift, material.surface.y);
     let shade = material.shade_color_factor.rgb
-        * textureSample(t_shade, s_shade, transformed_uv(in, material.shade_uv)).rgb;
+        * textureSample(
+            t_shade,
+            s_shade,
+            animated_transformed_uv(in, material.shade_uv, uv_animation_mask),
+        ).rgb;
     let direct = mix(shade, base.rgb, toon) * globals.model_sun_color.rgb;
     let uniform_gi = (raw_gi(vec3f(0.0, 1.0, 0.0))
         + raw_gi(vec3f(0.0, -1.0, 0.0))) * 0.5;
@@ -261,7 +319,11 @@ fn surface_color(in: VsOut, geometric: vec3f, base: vec4f) -> vec3f {
     // V is surface-to-camera in world space, consistent with the world normal.
     let view = safe_normalize(globals.cam_pos.xyz - in.world_pos);
     let emission = material.emissive_factor.rgb
-        * textureSample(t_emissive, s_emissive, transformed_uv(in, material.emissive_uv)).rgb;
+        * textureSample(
+            t_emissive,
+            s_emissive,
+            animated_transformed_uv(in, material.emissive_uv, uv_animation_mask),
+        ).rgb;
     let matcap = material.matcap_factor.rgb
         * textureSample(t_matcap, s_matcap, matcap_uv(n, view)).rgb;
     let rim_shape = pow(
@@ -269,7 +331,11 @@ fn surface_color(in: VsOut, geometric: vec3f, base: vec4f) -> vec3f {
         max(material.rim_params.x, 0.00001),
     );
     var rim = matcap + rim_shape * material.rim_color_factor.rgb;
-    rim *= textureSample(t_rim, s_rim, transformed_uv(in, material.rim_uv)).rgb;
+    rim *= textureSample(
+        t_rim,
+        s_rim,
+        animated_transformed_uv(in, material.rim_uv, uv_animation_mask),
+    ).rgb;
     // Pocket3D has one unattenuated direct sun and equalized hemisphere GI.
     // Their RGB lighting sum influences rim independently of base/shade/toon.
     let lighting = globals.model_sun_color.rgb + gi;
@@ -282,7 +348,8 @@ fn output_alpha(base: vec4f) -> f32 {
 }
 @fragment
 fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4f {
-    let base = sample_base(in);
+    let uv_animation_mask = fragment_uv_animation_mask(in);
+    let base = sample_base(in, uv_animation_mask);
     if material.alpha.x > 0.5 && base.a < material.alpha.y {
         discard;
     }
@@ -290,19 +357,20 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0)
     if material.alpha.z > 0.5 && !front_facing {
         geometric = -geometric;
     }
-    let color = surface_color(in, geometric, base) * instance.tint.rgb;
+    let color = surface_color(in, geometric, base, uv_animation_mask) * instance.tint.rgb;
     return vec4f(color, output_alpha(base));
 }
 @fragment
 fn fs_outline(in: VsOut) -> @location(0) vec4f {
-    let base = sample_base(in);
+    let uv_animation_mask = fragment_uv_animation_mask(in);
+    let base = sample_base(in, uv_animation_mask);
     if material.alpha.x > 0.5 && base.a < material.alpha.y {
         discard;
     }
     // The lit endpoint is the same complete MToon surface result used above:
     // direct lighting + GI + emission + rim/MatCap. Normal maps may influence
     // its color, but never the geometric extrusion performed in vs_outline.
-    let lit = surface_color(in, safe_normalize(in.normal), base);
+    let lit = surface_color(in, safe_normalize(in.normal), base, uv_animation_mask);
     let lighting_mix = mix(
         vec3f(1.0),
         lit,

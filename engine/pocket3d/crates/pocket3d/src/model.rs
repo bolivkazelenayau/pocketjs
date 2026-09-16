@@ -297,7 +297,10 @@ struct MtoonRaw {
     emissive_uv: MtoonUvRaw,
     rim_uv: MtoonUvRaw,
     outline_uv: MtoonUvRaw,
+    uv_animation_mask_uv: MtoonUvRaw,
     texture_scales: [f32; 4],
+    /// xy: scroll speed in UV units/second, z: rotation speed in radians/second.
+    uv_animation: [f32; 4],
 }
 
 impl MtoonRaw {
@@ -383,6 +386,9 @@ impl MtoonRaw {
             emissive_uv: MtoonUvRaw::from_texture(inputs.emissive_texture.as_ref()),
             rim_uv: MtoonUvRaw::from_texture(mtoon.rim_multiply_texture.as_ref()),
             outline_uv: MtoonUvRaw::from_texture(mtoon.outline_width_multiply_texture.as_ref()),
+            uv_animation_mask_uv: MtoonUvRaw::from_texture(
+                mtoon.uv_animation_mask_texture.as_ref(),
+            ),
             texture_scales: [
                 mtoon
                     .shading_shift_texture
@@ -392,17 +398,18 @@ impl MtoonRaw {
                 0.0,
                 0.0,
             ],
+            uv_animation: [
+                mtoon.uv_animation_scroll_x_speed_factor,
+                mtoon.uv_animation_scroll_y_speed_factor,
+                mtoon.uv_animation_rotation_speed_factor,
+                0.0,
+            ],
         }
     }
 }
 
-fn native_stage_e_capable(material: &MaterialAsset) -> bool {
-    let MaterialModel::Mtoon(mtoon) = &material.model else {
-        return false;
-    };
-    mtoon.uv_animation_scroll_x_speed_factor == 0.0
-        && mtoon.uv_animation_scroll_y_speed_factor == 0.0
-        && mtoon.uv_animation_rotation_speed_factor == 0.0
+fn native_stage_f_capable(material: &MaterialAsset) -> bool {
+    matches!(material.model, MaterialModel::Mtoon(_))
 }
 
 fn mtoon_outline_enabled(material: &MaterialAsset) -> bool {
@@ -689,8 +696,8 @@ fn make_mtoon_bind_group(
     gpu: &Gpu,
     layout: &wgpu::BindGroupLayout,
     label: &str,
-    textures: [&wgpu::TextureView; 8],
-    samplers: [&wgpu::Sampler; 8],
+    textures: [&wgpu::TextureView; 9],
+    samplers: [&wgpu::Sampler; 9],
     material: &MtoonRaw,
 ) -> (Arc<wgpu::BindGroup>, wgpu::Buffer) {
     use wgpu::util::DeviceExt;
@@ -701,7 +708,7 @@ fn make_mtoon_bind_group(
             contents: bytemuck::bytes_of(material),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-    let mut entries = Vec::with_capacity(17);
+    let mut entries = Vec::with_capacity(19);
     for slot in 0..7 {
         entries.push(wgpu::BindGroupEntry {
             binding: (slot * 2) as u32,
@@ -724,6 +731,14 @@ fn make_mtoon_bind_group(
         binding: 16,
         resource: wgpu::BindingResource::Sampler(samplers[7]),
     });
+    entries.push(wgpu::BindGroupEntry {
+        binding: 17,
+        resource: wgpu::BindingResource::TextureView(textures[8]),
+    });
+    entries.push(wgpu::BindGroupEntry {
+        binding: 18,
+        resource: wgpu::BindingResource::Sampler(samplers[8]),
+    });
     let group = Arc::new(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some(label),
         layout,
@@ -740,8 +755,9 @@ fn mtoon_texture_semantic(texture: &TextureInfo) -> MipSemantic {
         | TextureRole::Matcap
         | TextureRole::RimMultiply => MipSemantic::SrgbColor,
         TextureRole::Normal => MipSemantic::TangentNormal,
-        TextureRole::ShadingShift | TextureRole::OutlineWidth => MipSemantic::LinearData,
-        _ => unreachable!("unsupported texture must not enter native MToon"),
+        TextureRole::ShadingShift | TextureRole::OutlineWidth | TextureRole::UvAnimationMask => {
+            MipSemantic::LinearData
+        }
     }
 }
 
@@ -992,7 +1008,7 @@ fn authored_materials(
                 if let Some(base) = descriptor.inputs.base_color_texture.as_ref() {
                     let selected = base.effective_tex_coord();
                     if !base.current_base_color_fallback_uv_supported()
-                        && !(native_mtoon && native_stage_e_capable(&authored))
+                        && !(native_mtoon && native_stage_f_capable(&authored))
                     {
                         bail!(
                             "MToon material {index} baseColorTexture selects TEXCOORD_{selected}, but the current unlit fallback samples only TEXCOORD_0 in {}",
@@ -1247,12 +1263,12 @@ impl ModelAsset {
             })
     }
 
-    /// Dedicated eight-texture Stage E MToon material layout (group 1).
+    /// Dedicated nine-texture Stage F MToon material layout (group 1).
     pub fn mtoon_material_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
         let limits = gpu.device.limits();
         assert!(limits.max_sampled_textures_per_shader_stage >= 8);
         assert!(limits.max_samplers_per_shader_stage >= 8);
-        let mut entries = Vec::with_capacity(17);
+        let mut entries = Vec::with_capacity(19);
         for binding in 0..14 {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding,
@@ -1295,6 +1311,22 @@ impl ModelAsset {
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
             count: None,
         });
+        for binding in 17..=18 {
+            entries.push(wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: if binding == 17 {
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    }
+                } else {
+                    wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)
+                },
+                count: None,
+            });
+        }
         gpu.device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("MToon material"),
@@ -1906,7 +1938,7 @@ impl ModelAsset {
             ));
             let mut authored_samplers = GltfSamplerCache::new();
             for material in &materials {
-                if !native_stage_e_capable(material) {
+                if !native_stage_f_capable(material) {
                     if material.kind() == crate::material::MaterialKind::Mtoon {
                         log::info!(
                             "MToon material {} uses KHR_materials_unlit fallback: unsupported later-stage properties",
@@ -1933,6 +1965,7 @@ impl ModelAsset {
                 let matcap_info = mtoon.matcap_texture.as_ref();
                 let rim_info = mtoon.rim_multiply_texture.as_ref();
                 let outline_info = mtoon.outline_width_multiply_texture.as_ref();
+                let uv_animation_mask_info = mtoon.uv_animation_mask_texture.as_ref();
                 let infos = [
                     base_info,
                     normal_info,
@@ -1942,6 +1975,7 @@ impl ModelAsset {
                     matcap_info,
                     rim_info,
                     outline_info,
+                    uv_animation_mask_info,
                 ];
                 let resources = [
                     mtoon_texture(gpu, cache, &images, opts, base_info, &white),
@@ -1953,6 +1987,14 @@ impl ModelAsset {
                     mtoon_texture(gpu, cache, &images, opts, matcap_info, &black),
                     mtoon_texture(gpu, cache, &images, opts, rim_info, &white),
                     mtoon_texture(gpu, cache, &images, opts, outline_info, &white_data),
+                    mtoon_texture(
+                        gpu,
+                        cache,
+                        &images,
+                        opts,
+                        uv_animation_mask_info,
+                        &white_data,
+                    ),
                 ];
                 let samplers: Vec<wgpu::Sampler> = infos
                     .iter()
@@ -1978,6 +2020,7 @@ impl ModelAsset {
                         &resources[5].view,
                         &resources[6].view,
                         &resources[7].view,
+                        &resources[8].view,
                     ],
                     [
                         &samplers[0],
@@ -1988,6 +2031,7 @@ impl ModelAsset {
                         &samplers[5],
                         &samplers[6],
                         &samplers[7],
+                        &samplers[8],
                     ],
                     &MtoonRaw::from_material(material),
                 );
@@ -3401,7 +3445,7 @@ fn import_byte_images(
             inputs: descriptor.inputs.clone(),
             model: MaterialModel::Mtoon(Box::new(descriptor.mtoon.clone())),
         };
-        if !native_stage_e_capable(&authored) {
+        if !native_stage_f_capable(&authored) {
             continue;
         }
         for texture in [
@@ -3421,6 +3465,7 @@ fn import_byte_images(
             descriptor.mtoon.matcap_texture.as_ref(),
             descriptor.mtoon.rim_multiply_texture.as_ref(),
             descriptor.mtoon.outline_width_multiply_texture.as_ref(),
+            descriptor.mtoon.uv_animation_mask_texture.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -3566,7 +3611,7 @@ mod tests {
         MaterialRaw, ModelAsset, ModelLoadOptions, ModelTextureCacheKey, authored_materials,
         authored_render_phase, authored_render_queue_offset, cap_texture_rgba, find_node_named,
         import_glb_slice, import_glb_slice_with_options, mtoon_outline_enabled,
-        mtoon_texture_semantic, native_stage_e_capable, pocket3d_base_color_mode_from_extras,
+        mtoon_texture_semantic, native_stage_f_capable, pocket3d_base_color_mode_from_extras,
         pocket3d_role_from_extras, sample_node_transform, semantic_material_matches, to_rgba8,
         validate_joint_palette_count, validate_model_input, validate_normalized_texcoord0,
     };
@@ -3729,6 +3774,24 @@ mod tests {
         descriptor
     }
 
+    fn reference_stage_f_uv(
+        source_uv: [f32; 2],
+        mask: f32,
+        scroll_speed: [f32; 2],
+        rotation_speed: f32,
+        time_seconds: f32,
+        target_transform: TextureTransform,
+    ) -> [f32; 2] {
+        let angle = rotation_speed * time_seconds * mask;
+        let (sin, cos) = angle.sin_cos();
+        let centered = [source_uv[0] - 0.5, source_uv[1] - 0.5];
+        let animated = [
+            cos * centered[0] - sin * centered[1] + 0.5 + scroll_speed[0] * time_seconds * mask,
+            sin * centered[0] + cos * centered[1] + 0.5 + scroll_speed[1] * time_seconds * mask,
+        ];
+        target_transform.apply_uv(animated)
+    }
+
     fn linear_srgb_byte(value: f32) -> u8 {
         let encoded = if value <= 0.003_130_8 {
             value * 12.92
@@ -3825,6 +3888,15 @@ mod tests {
             ),
             image(2, 1, &[255, 255, 255, 255, 0, 0, 0, 255]),
             image(1, 1, &[0, 128, 128, 255]),
+            image(1, 1, &[255, 255, 0, 255]),
+            image(1, 1, &[0, 0, 128, 255]),
+            image(
+                2,
+                2,
+                &[
+                    255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+                ],
+            ),
         ];
         glb_from_json(
             json!({
@@ -3839,7 +3911,10 @@ mod tests {
                 }}],
                 "extensionsUsed":["KHR_materials_unlit","VRMC_materials_mtoon"],
                 "images":images.iter().map(|uri| json!({"uri":uri})).collect::<Vec<_>>(),
-                "textures":[{"source":0},{"source":1},{"source":2},{"source":3}],
+                "textures":[
+                    {"source":0},{"source":1},{"source":2},{"source":3},
+                    {"source":4},{"source":5},{"source":6}
+                ],
                 "buffers":[{"byteLength":bin.len()}],"bufferViews":views,"accessors":accessors
             }),
             &bin,
@@ -4703,7 +4778,7 @@ mod tests {
     }
 
     #[test]
-    fn stage_e_roles_and_capability_gate_accept_outlines_but_not_uv_animation() {
+    fn stage_f_roles_and_capability_gate_accept_uv_animation() {
         let pixels = [
             0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
         ];
@@ -4728,30 +4803,30 @@ mod tests {
             inputs: descriptor.inputs,
             model: MaterialModel::Mtoon(Box::new(descriptor.mtoon)),
         };
-        assert!(native_stage_e_capable(&material));
+        assert!(native_stage_f_capable(&material));
         material.inputs.emissive_factor = [1.0, 0.0, 0.0];
-        assert!(native_stage_e_capable(&material));
+        assert!(native_stage_f_capable(&material));
         let MaterialModel::Mtoon(mtoon) = &mut material.model else {
             unreachable!()
         };
         mtoon.matcap_texture = Some(stage_c_texture(TextureRole::Matcap, 1));
         mtoon.parametric_rim_color_factor = [1.0; 3];
         mtoon.rim_multiply_texture = Some(stage_c_texture(TextureRole::RimMultiply, 2));
-        assert!(native_stage_e_capable(&material));
+        assert!(native_stage_f_capable(&material));
         material.inputs.alpha_mode = MaterialAlphaMode::Blend;
         let MaterialModel::Mtoon(mtoon) = &mut material.model else {
             unreachable!()
         };
         mtoon.transparent_with_z_write = true;
         mtoon.render_queue_offset_number = 4;
-        assert!(native_stage_e_capable(&material));
+        assert!(native_stage_f_capable(&material));
         let MaterialModel::Mtoon(mtoon) = &mut material.model else {
             unreachable!()
         };
         mtoon.outline_width_mode = MtoonOutlineWidthMode::WorldCoordinates;
         mtoon.outline_width_factor = 0.01;
         mtoon.outline_width_multiply_texture = Some(stage_c_texture(TextureRole::OutlineWidth, 3));
-        assert!(native_stage_e_capable(&material));
+        assert!(native_stage_f_capable(&material));
         assert!(mtoon_outline_enabled(&material));
         assert_eq!(
             mtoon_texture_semantic(match &material.model {
@@ -4766,7 +4841,351 @@ mod tests {
             unreachable!()
         };
         mtoon.uv_animation_scroll_x_speed_factor = 0.01;
-        assert!(!native_stage_e_capable(&material));
+        mtoon.uv_animation_scroll_y_speed_factor = -0.02;
+        mtoon.uv_animation_rotation_speed_factor = 0.03;
+        mtoon.uv_animation_mask_texture = Some(stage_c_texture(TextureRole::UvAnimationMask, 4));
+        assert!(native_stage_f_capable(&material));
+        assert_eq!(
+            mtoon_texture_semantic(match &material.model {
+                MaterialModel::Mtoon(mtoon) => mtoon.uv_animation_mask_texture.as_ref().unwrap(),
+                _ => unreachable!(),
+            }),
+            MipSemantic::LinearData
+        );
+
+        // Linear/data mip generation must preserve the normative B mask
+        // channel without sRGB conversion; R and G are unrelated packed data.
+        let packed_masks = [255, 0, 0, 255, 0, 255, 255, 255];
+        let (filtered, width, height) = super::cap_texture_rgba_semantic(
+            packed_masks.to_vec(),
+            2,
+            1,
+            Some(1),
+            MipSemantic::LinearData,
+        );
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(filtered, [128, 128, 128, 255]);
+    }
+
+    #[test]
+    fn stage_f_absolute_uv_math_locks_units_direction_order_and_mask() {
+        let identity = TextureTransform::default();
+        let source = [1.0, 0.5];
+
+        // One UV unit/second and radians/second, with the same positive
+        // rotation matrix as KHR_texture_transform around (0.5, 0.5).
+        assert_eq!(
+            reference_stage_f_uv(source, 1.0, [1.0, -1.0], 0.0, 0.5, identity),
+            [1.5, 0.0]
+        );
+        let quarter_turn = reference_stage_f_uv(
+            source,
+            1.0,
+            [0.0; 2],
+            1.0,
+            std::f32::consts::FRAC_PI_2,
+            identity,
+        );
+        assert!((quarter_turn[0] - 0.5).abs() < 1e-6);
+        assert!((quarter_turn[1] - 1.0).abs() < 1e-6);
+
+        // Only the sampled B scalar reaches this math: 0/0.5/1 scale both
+        // rotation and scroll, while arbitrary packed R/G values cannot.
+        assert_eq!(
+            reference_stage_f_uv(source, 0.0, [2.0, 3.0], 4.0, 1.0, identity),
+            source
+        );
+        let half = reference_stage_f_uv(source, 0.5, [0.4, -0.2], 0.6, 2.0, identity);
+        let full = reference_stage_f_uv(source, 1.0, [0.4, -0.2], 0.6, 2.0, identity);
+        assert_ne!(half, full);
+
+        // The pure absolute-time function is history independent. Rotation
+        // happens before translation, so rotating an already-scrolled UV is a
+        // deliberately different result.
+        let at_two = reference_stage_f_uv(source, 0.75, [0.3, -0.2], 0.7, 2.0, identity);
+        for previous in [0.0, 0.5, 1.0, 1000.0] {
+            let _ = reference_stage_f_uv(source, 0.75, [0.3, -0.2], 0.7, previous, identity);
+        }
+        assert_eq!(
+            at_two,
+            reference_stage_f_uv(source, 0.75, [0.3, -0.2], 0.7, 2.0, identity)
+        );
+        let scrolled_first = {
+            let uv = [source[0] + 0.45, source[1] - 0.3];
+            reference_stage_f_uv(uv, 0.75, [0.0; 2], 0.7, 2.0, identity)
+        };
+        assert_ne!(at_two, scrolled_first);
+
+        // Target KHR_texture_transform is last and therefore does not commute
+        // with the automatic animation. Values remain outside [0, 1].
+        let khr = TextureTransform {
+            offset: [0.2, -0.1],
+            rotation: 0.4,
+            scale: [2.0, 0.5],
+            tex_coord_override: Some(1),
+        };
+        let correct = reference_stage_f_uv(source, 1.0, [0.3, 0.2], 0.8, 1.0, khr);
+        let transformed_source = khr.apply_uv(source);
+        let wrong = reference_stage_f_uv(transformed_source, 1.0, [0.3, 0.2], 0.8, 1.0, identity);
+        assert_ne!(correct, wrong);
+        let long_time = reference_stage_f_uv(source, 1.0, [1.0, -1.0], 0.3, 1000.0, identity);
+        assert!(long_time.into_iter().all(f32::is_finite));
+        assert!(long_time[0] > 100.0 && long_time[1] < -100.0);
+    }
+
+    #[test]
+    fn stage_f_shader_covers_all_normative_targets_once_per_stage() {
+        let shader = include_str!("shaders/mtoon.wgsl");
+        assert!(shader.contains("@group(1) @binding(17) var t_uv_animation_mask"));
+        assert!(shader.contains("@group(1) @binding(18) var s_uv_animation_mask"));
+        assert!(shader.contains("static_transformed_uv(in, material.uv_animation_mask_uv)"));
+        assert!(shader.contains(").b;"));
+        assert!(shader.contains("let uv_animation_mask = textureSampleLevel("));
+        for target in [
+            "material.base_uv",
+            "material.normal_uv",
+            "material.shade_uv",
+            "material.shift_uv",
+            "material.emissive_uv",
+            "material.rim_uv",
+            "material.outline_uv",
+        ] {
+            assert!(
+                shader.contains(&format!(
+                    "animated_transformed_uv(in, {target}, uv_animation_mask)"
+                )) || shader.contains(&format!(
+                    "animated_transformed_uv(out, {target}, uv_animation_mask)"
+                )),
+                "missing Stage F target {target}"
+            );
+        }
+        assert!(shader.contains("textureSample(t_matcap, s_matcap, matcap_uv(n, view))"));
+        assert!(!shader.contains("animated_transformed_uv(in, material.matcap"));
+        assert!(!shader.contains("clamp(animated_uv"));
+        assert!(!shader.contains("fract(animated_uv"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stage_f_gpu_is_fixed_time_masked_khr_ordered_and_leaves_matcap_static() {
+        use crate::camera::Camera;
+        use crate::gpu::{OFFSCREEN_FORMAT, OffscreenTarget};
+        use crate::hud::Hud;
+        use crate::model::ModelInstance;
+        use crate::renderer::Renderer;
+        use crate::scene::Scene;
+
+        let gpu = Gpu::new_headless().expect("headless GPU is required for Stage F fixtures");
+        let limits = gpu.device.limits();
+        eprintln!(
+            "Stage F device limits: sampled textures/stage={}, samplers/stage={}",
+            limits.max_sampled_textures_per_shader_stage, limits.max_samplers_per_shader_stage
+        );
+        assert!(limits.max_sampled_textures_per_shader_stage >= 8);
+        assert!(limits.max_samplers_per_shader_stage >= 8);
+        let mut renderer = Renderer::new(&gpu, OFFSCREEN_FORMAT).unwrap();
+        // Back-facing geometry keeps the front-face-culled outline pass visible;
+        // all descriptors are double-sided, so the surface paths remain valid.
+        let bytes = stage_c_quad(true);
+        let camera = Camera {
+            pos: Vec3::new(0.0, 0.0, 3.0),
+            znear: 0.1,
+            zfar: 10.0,
+            ..Default::default()
+        };
+        let mut render = |descriptor: &MtoonMaterialDescriptor, times: &[f32]| {
+            let asset = ModelAsset::load_glb_bytes_opts_with_native_mtoon(
+                &gpu,
+                &renderer.model_material_layout,
+                &renderer.mtoon_material_layout,
+                &renderer.samplers,
+                &bytes,
+                "stage-f-uv-animation.glb",
+                &ModelLoadOptions::default(),
+                std::iter::empty::<&str>(),
+                std::slice::from_ref(descriptor),
+            )
+            .unwrap();
+            assert!(asset.primitives[0].mtoon_bind_group.is_some());
+            let mut scene = Scene::default();
+            scene.sky.zenith = Vec3::ZERO;
+            scene.sky.horizon = Vec3::ZERO;
+            scene.lighting.sun_dir = Vec3::new(-0.6, 0.0, -0.8);
+            scene.lighting.sun_color = Vec3::splat(0.8);
+            scene.lighting.ambient = Vec3::splat(0.2);
+            scene.models.push(ModelInstance::new(asset));
+            let target = OffscreenTarget::new(&gpu, 64, 64);
+            times
+                .iter()
+                .map(|&time| {
+                    scene.time = time;
+                    renderer.render(
+                        &gpu,
+                        &target.view,
+                        target.size,
+                        &scene,
+                        &camera,
+                        &Hud::default(),
+                    );
+                    target.read_rgba(&gpu).unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let changed_pixels = |a: &[u8], b: &[u8]| {
+            a.as_chunks::<4>()
+                .0
+                .iter()
+                .zip(b.as_chunks::<4>().0)
+                .filter(|(a, b)| a != b)
+                .count()
+        };
+
+        let mut animated = stage_c_descriptor();
+        animated.inputs.base_color_factor = [0.0, 0.0, 0.0, 1.0];
+        animated.inputs.emissive_factor = [1.0; 3];
+        animated.inputs.emissive_texture = Some(stage_c_texture(TextureRole::Emissive, 0));
+        animated.mtoon.uv_animation_scroll_x_speed_factor = 0.5;
+        let frames = render(&animated, &[0.0, 0.5, 1.0]);
+        assert!(changed_pixels(&frames[0], &frames[1]) > 100);
+        assert!(changed_pixels(&frames[1], &frames[2]) > 100);
+
+        let mut base = stage_c_descriptor();
+        base.inputs.base_color_factor = [1.0; 4];
+        base.inputs.base_color_texture = Some(stage_c_texture(TextureRole::BaseColor, 0));
+        base.mtoon.uv_animation_scroll_x_speed_factor = 0.5;
+        let base_frames = render(&base, &[0.0, 1.0]);
+        assert!(changed_pixels(&base_frames[0], &base_frames[1]) > 100);
+
+        let mut shade = stage_c_descriptor();
+        shade.mtoon.shade_color_factor = [1.0; 3];
+        shade.mtoon.shading_shift_factor = -2.0;
+        shade.mtoon.shade_multiply_texture = Some(stage_c_texture(TextureRole::ShadeMultiply, 0));
+        shade.mtoon.uv_animation_scroll_x_speed_factor = 0.5;
+        let shade_frames = render(&shade, &[0.0, 1.0]);
+        assert!(changed_pixels(&shade_frames[0], &shade_frames[1]) > 100);
+
+        let mut shift = stage_c_descriptor();
+        shift.inputs.base_color_factor = [1.0; 4];
+        shift.mtoon.shade_color_factor = [0.0; 3];
+        shift.mtoon.shading_toony_factor = 1.0;
+        shift.mtoon.shading_shift_factor = -1.5;
+        shift.mtoon.shading_shift_texture = Some(ScaledTextureInfo {
+            texture: stage_c_texture(TextureRole::ShadingShift, 0),
+            scale: 2.0,
+        });
+        shift.mtoon.uv_animation_scroll_x_speed_factor = 0.5;
+        let shift_frames = render(&shift, &[0.0, 1.0]);
+        assert!(changed_pixels(&shift_frames[0], &shift_frames[1]) > 100);
+
+        let mut normal = stage_c_descriptor();
+        normal.inputs.normal_texture = Some(ScaledTextureInfo {
+            texture: stage_c_texture(TextureRole::Normal, 1),
+            scale: 1.0,
+        });
+        normal.mtoon.matcap_texture = Some(stage_c_texture(TextureRole::Matcap, 6));
+        normal.mtoon.rim_lighting_mix_factor = 0.0;
+        normal.mtoon.uv_animation_scroll_x_speed_factor = 0.5;
+        let normal_frames = render(&normal, &[0.0, 1.0]);
+        assert!(changed_pixels(&normal_frames[0], &normal_frames[1]) > 100);
+
+        let mut rim = stage_c_descriptor();
+        rim.mtoon.parametric_rim_color_factor = [1.0; 3];
+        rim.mtoon.parametric_rim_fresnel_power_factor = 1.0;
+        rim.mtoon.parametric_rim_lift_factor = 1.0;
+        rim.mtoon.rim_lighting_mix_factor = 0.0;
+        rim.mtoon.rim_multiply_texture = Some(stage_c_texture(TextureRole::RimMultiply, 0));
+        rim.mtoon.uv_animation_scroll_x_speed_factor = 0.5;
+        let rim_frames = render(&rim, &[0.0, 1.0]);
+        assert!(changed_pixels(&rim_frames[0], &rim_frames[1]) > 100);
+
+        let mut outline = stage_e_descriptor(MtoonOutlineWidthMode::ScreenCoordinates, 0.12);
+        let mut outline_width = stage_c_texture(TextureRole::OutlineWidth, 2);
+        outline_width.tex_coord = 1;
+        outline.mtoon.outline_width_multiply_texture = Some(outline_width);
+        outline.mtoon.uv_animation_scroll_x_speed_factor = 0.5;
+        let outline_frames = render(&outline, &[0.0, 1.0]);
+        assert!(changed_pixels(&outline_frames[0], &outline_frames[1]) > 20);
+
+        // Direct t=1 and t=1000 renders equal renders reached after arbitrary
+        // earlier times: no delta accumulation or material mutation exists.
+        let direct_one = render(&animated, &[1.0]).pop().unwrap();
+        let history_one = render(&animated, &[0.0, 0.5, 1000.0, 1.0]).pop().unwrap();
+        assert_eq!(direct_one, history_one);
+        let direct_long = render(&animated, &[1000.0]).pop().unwrap();
+        let repeated_long = render(&animated, &[2.0, 1000.0]).pop().unwrap();
+        assert_eq!(direct_long, repeated_long);
+
+        let mut static_texture = animated.clone();
+        static_texture.mtoon.uv_animation_scroll_x_speed_factor = 0.0;
+        let static_frames = render(&static_texture, &[0.0, 1.0, 1000.0]);
+        assert_eq!(static_frames[0], static_frames[1]);
+        assert_eq!(static_frames[1], static_frames[2]);
+
+        // Packed R/G=1 with B=0 freezes animation, while B=0.5 permits a
+        // proportional partial move. The mask's own KHR transform and UV1
+        // selection are independent from the emissive target's UV0.
+        let mut zero_mask = animated.clone();
+        zero_mask.mtoon.uv_animation_mask_texture =
+            Some(stage_c_texture(TextureRole::UvAnimationMask, 4));
+        let zero_frames = render(&zero_mask, &[0.0, 1.0]);
+        assert_eq!(zero_frames[0], zero_frames[1]);
+
+        let mut half_mask = animated.clone();
+        half_mask.mtoon.uv_animation_mask_texture =
+            Some(stage_c_texture(TextureRole::UvAnimationMask, 5));
+        let half_frames = render(&half_mask, &[0.0, 1.0]);
+        assert!(changed_pixels(&half_frames[0], &half_frames[1]) > 100);
+        assert_ne!(half_frames[1], frames[2]);
+
+        let mut mixed_uv = animated.clone();
+        let mut mask = stage_c_texture(TextureRole::UvAnimationMask, 2);
+        mask.tex_coord = 0;
+        mask.transform.tex_coord_override = Some(1);
+        mixed_uv.mtoon.uv_animation_mask_texture = Some(mask.clone());
+        assert_eq!(render(&mixed_uv, &[1.0])[0], direct_one);
+        mask.transform.offset = [0.5, 0.0];
+        mixed_uv.mtoon.uv_animation_mask_texture = Some(mask);
+        assert_eq!(
+            render(&mixed_uv, &[0.0, 1.0])[0],
+            render(&mixed_uv, &[0.0, 1.0])[1]
+        );
+
+        // Non-commutative GPU proof: automatic +0.5 occurs before a target
+        // scale of 0.5, exactly matching a static authored +0.25 offset.
+        let mut khr_animated = animated.clone();
+        khr_animated
+            .inputs
+            .emissive_texture
+            .as_mut()
+            .unwrap()
+            .transform
+            .scale = [0.5, 1.0];
+        let mut khr_reference = static_texture.clone();
+        let reference_transform = &mut khr_reference
+            .inputs
+            .emissive_texture
+            .as_mut()
+            .unwrap()
+            .transform;
+        reference_transform.scale = [0.5, 1.0];
+        reference_transform.offset = [0.25, 0.0];
+        assert_eq!(
+            render(&khr_animated, &[1.0])[0],
+            render(&khr_reference, &[0.0])[0]
+        );
+
+        // MatCap uses its view/normal basis and remains invariant when mesh UV
+        // animation changes but the geometric/shading normal is static.
+        let mut matcap = stage_c_descriptor();
+        matcap.inputs.base_color_factor = [0.0, 0.0, 0.0, 1.0];
+        matcap.mtoon.matcap_texture = Some(stage_c_texture(TextureRole::Matcap, 6));
+        matcap.mtoon.rim_lighting_mix_factor = 0.0;
+        matcap.mtoon.uv_animation_scroll_x_speed_factor = 4.0;
+        matcap.mtoon.uv_animation_scroll_y_speed_factor = -3.0;
+        matcap.mtoon.uv_animation_rotation_speed_factor = 2.0;
+        let matcap_frames = render(&matcap, &[0.0, 0.5, 1.0]);
+        assert_eq!(matcap_frames[0], matcap_frames[1]);
+        assert_eq!(matcap_frames[1], matcap_frames[2]);
     }
 
     #[test]
@@ -4789,17 +5208,27 @@ mod tests {
         descriptor.mtoon.outline_width_multiply_texture = Some(mask);
         descriptor.mtoon.outline_color_factor = [0.2, 0.4, 0.6];
         descriptor.mtoon.outline_lighting_mix_factor = 0.75;
+        let mut uv_mask = stage_c_texture(TextureRole::UvAnimationMask, 2);
+        uv_mask.tex_coord = 0;
+        uv_mask.transform.tex_coord_override = Some(1);
+        uv_mask.transform.offset = [-0.25, 0.5];
+        descriptor.mtoon.uv_animation_mask_texture = Some(uv_mask);
+        descriptor.mtoon.uv_animation_scroll_x_speed_factor = 1.0;
+        descriptor.mtoon.uv_animation_scroll_y_speed_factor = -2.0;
+        descriptor.mtoon.uv_animation_rotation_speed_factor = 3.0;
         let raw = super::MtoonRaw::from_material(&MaterialAsset {
             gltf_material_index: 0,
             name: None,
             inputs: descriptor.inputs,
             model: MaterialModel::Mtoon(Box::new(descriptor.mtoon)),
         });
-        assert_eq!(std::mem::size_of::<super::MtoonRaw>(), 400);
+        assert_eq!(std::mem::size_of::<super::MtoonRaw>(), 448);
         assert_eq!(raw.outline_color_factor, [0.2, 0.4, 0.6, 0.0]);
         assert_eq!(raw.outline, [2.0, 0.125, 0.75, 0.0]);
         assert_eq!(raw.outline_uv.scale_rotation[..2], [2.0, 3.0]);
         assert_eq!(raw.outline_uv.offset_set, [0.25, -0.5, 1.0, 0.0]);
+        assert_eq!(raw.uv_animation_mask_uv.offset_set, [-0.25, 0.5, 1.0, 0.0]);
+        assert_eq!(raw.uv_animation, [1.0, -2.0, 3.0, 0.0]);
     }
 
     #[test]
