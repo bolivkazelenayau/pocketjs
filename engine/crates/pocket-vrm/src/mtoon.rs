@@ -998,7 +998,7 @@ mod tests {
             "rimLightingMixFactor":0.6,
             "outlineWidthMode":"worldCoordinates",
             "outlineWidthFactor":0.01,
-            "outlineWidthMultiplyTexture":{"index":0},
+            "outlineWidthMultiplyTexture":{"index":0,"texCoord":0,"extensions":{"KHR_texture_transform":{"offset":[-0.1,0.25],"rotation":0.2,"scale":[0.75,1.25],"texCoord":1}}},
             "outlineColorFactor":[0.4,0.5,0.6],
             "outlineLightingMixFactor":0.5,
             "uvAnimationMaskTexture":{"index":0},
@@ -1046,6 +1046,19 @@ mod tests {
             material.outline_width_mode,
             Vrm1MtoonOutlineWidthMode::WorldCoordinates
         );
+        assert_eq!(material.outline_width_factor, 0.01);
+        assert_eq!(material.outline_color_factor, [0.4, 0.5, 0.6]);
+        assert_eq!(material.outline_lighting_mix_factor, 0.5);
+        let outline = material.outline_width_multiply_texture.as_ref().unwrap();
+        assert_eq!(outline.effective_tex_coord(), 1);
+        assert_eq!(outline.transform.offset, [-0.1, 0.25]);
+        assert_eq!(outline.transform.rotation, 0.2);
+        assert_eq!(outline.transform.scale, [0.75, 1.25]);
+        assert_eq!(outline.sampler.mag_filter, Some(Vrm1MagFilter::Nearest));
+        assert_eq!(
+            outline.sampler.min_filter,
+            Some(Vrm1MinFilter::LinearMipmapLinear)
+        );
         assert_eq!(material.uv_animation_scroll_y_speed_factor, -2.0);
 
         let descriptor = material.to_pocket3d_descriptor();
@@ -1053,6 +1066,15 @@ mod tests {
             descriptor.mtoon.shade_multiply_texture.unwrap().color_space,
             render::TextureColorSpace::Srgb
         );
+        let outline = descriptor
+            .mtoon
+            .outline_width_multiply_texture
+            .as_ref()
+            .unwrap();
+        assert_eq!(outline.role, render::TextureRole::OutlineWidth);
+        assert_eq!(outline.color_space, render::TextureColorSpace::Linear);
+        assert_eq!(outline.effective_tex_coord(), 1);
+        assert_eq!(outline.transform.offset, [-0.1, 0.25]);
         assert_eq!(
             descriptor
                 .mtoon

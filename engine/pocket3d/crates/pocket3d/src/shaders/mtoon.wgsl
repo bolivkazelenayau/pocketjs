@@ -1,4 +1,4 @@
-// Native VRMC_materials_mtoon 1.0 Stage B-D surface.
+// Native VRMC_materials_mtoon 1.0 Stage B-E surface and outline.
 struct Globals {
     view_proj: mat4x4f,
     inverse_view_proj: mat4x4f,
@@ -15,6 +15,8 @@ struct Globals {
     rim_params: vec4f,
     fog_color: vec4f,
     fog_params: vec4f,
+    // xy: viewport dimensions, zw: reciprocal dimensions
+    viewport: vec4f,
 }
 struct Instance {
     model: mat4x4f,
@@ -40,12 +42,17 @@ struct MtoonMaterial {
     surface: vec4f,
     // x: MASK, y: authored cutoff, z: double sided, w: authored BLEND
     alpha: vec4f,
+    outline_color_factor: vec4f,
+    // x: width mode (0 none, 1 world, 2 screen), y: width factor,
+    // z: lighting mix
+    outline: vec4f,
     base_uv: UvDesc,
     normal_uv: UvDesc,
     shade_uv: UvDesc,
     shift_uv: UvDesc,
     emissive_uv: UvDesc,
     rim_uv: UvDesc,
+    outline_uv: UvDesc,
     // x: shading shift texture scale
     texture_scales: vec4f,
 }
@@ -65,6 +72,8 @@ struct MtoonMaterial {
 @group(1) @binding(12) var t_rim: texture_2d<f32>;
 @group(1) @binding(13) var s_rim: sampler;
 @group(1) @binding(14) var<uniform> material: MtoonMaterial;
+@group(1) @binding(15) var t_outline_width: texture_2d<f32>;
+@group(1) @binding(16) var s_outline_width: sampler;
 @group(2) @binding(0) var<uniform> instance: Instance;
 @group(2) @binding(1) var<storage, read> joints: array<mat4x4f>;
 
@@ -90,8 +99,11 @@ fn safe_normalize(v: vec3f) -> vec3f {
     }
     return vec3f(0.0, 0.0, 1.0);
 }
-@vertex
-fn vs_main(in: VsIn) -> VsOut {
+struct DeformedVertex {
+    world_pos: vec3f,
+    world_normal: vec3f,
+}
+fn deform_vertex(in: VsIn) -> DeformedVertex {
     var skin = mat4x4f(
         vec4f(1.0, 0.0, 0.0, 0.0),
         vec4f(0.0, 1.0, 0.0, 0.0),
@@ -108,14 +120,20 @@ fn vs_main(in: VsIn) -> VsOut {
     let skinned_pos = skin * vec4f(in.pos, 1.0);
     let skinned_normal = (skin * vec4f(in.normal, 0.0)).xyz;
     let wp = instance.model * skinned_pos;
-    var out: VsOut;
-    out.clip = globals.view_proj * wp;
-    out.uv0 = in.uv;
-    out.uv1 = in.uv1;
-    out.normal = safe_normalize(
+    var out: DeformedVertex;
+    out.world_pos = wp.xyz;
+    out.world_normal = safe_normalize(
         (instance.normal_model * vec4f(skinned_normal, 0.0)).xyz,
     );
-    out.world_pos = wp.xyz;
+    return out;
+}
+fn vertex_varyings(in: VsIn, deformed: DeformedVertex) -> VsOut {
+    var out: VsOut;
+    out.clip = globals.view_proj * vec4f(deformed.world_pos, 1.0);
+    out.uv0 = in.uv;
+    out.uv1 = in.uv1;
+    out.normal = deformed.world_normal;
+    out.world_pos = deformed.world_pos;
     return out;
 }
 fn transformed_uv(in: VsOut, desc: UvDesc) -> vec2f {
@@ -125,6 +143,50 @@ fn transformed_uv(in: VsOut, desc: UvDesc) -> vec2f {
     let s = desc.scale_rotation.w;
     return vec2f(c * scaled.x - s * scaled.y, s * scaled.x + c * scaled.y)
         + desc.offset_set.xy;
+}
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    return vertex_varyings(in, deform_vertex(in));
+}
+@vertex
+fn vs_outline(in: VsIn) -> VsOut {
+    let deformed = deform_vertex(in);
+    var out = vertex_varyings(in, deformed);
+    let width_mask = textureSampleLevel(
+        t_outline_width,
+        s_outline_width,
+        transformed_uv(out, material.outline_uv),
+        0.0,
+    ).g;
+    let width = material.outline.y * width_mask;
+    if material.outline.x < 1.5 {
+        // World-coordinate width is a normalized world-normal displacement,
+        // after morphing, skinning, and the complete instance transform.
+        let extruded = deformed.world_pos + deformed.world_normal * width;
+        out.clip = globals.view_proj * vec4f(extruded, 1.0);
+    } else {
+        // Project the world-normal differential, normalize it in units of
+        // viewport height, then convert the requested height ratio back to NDC.
+        // This derivative form retains shifted/off-axis projection terms.
+        let original_clip = out.clip;
+        let normal_clip = globals.view_proj * vec4f(deformed.world_normal, 0.0);
+        let w_squared = max(original_clip.w * original_clip.w, 1e-12);
+        let ndc_derivative = (
+            normal_clip.xy * original_clip.w - original_clip.xy * normal_clip.w
+        ) / w_squared;
+        let aspect = globals.viewport.x / max(globals.viewport.y, 1.0);
+        let height_direction = vec2f(ndc_derivative.x * aspect, ndc_derivative.y);
+        let direction_length_squared = dot(height_direction, height_direction);
+        if direction_length_squared > 1e-12 {
+            let direction = height_direction * inverseSqrt(direction_length_squared);
+            let ndc_offset = 2.0 * width * vec2f(direction.x / aspect, direction.y);
+            out.clip = vec4f(out.clip.xy + ndc_offset * original_clip.w, out.clip.zw);
+        }
+    }
+    // Match the mature MToon implementations' minimal normalized-depth bias:
+    // move the hull away by one millionth of clip.w to suppress coplanar leaks.
+    out.clip = vec4f(out.clip.xy, out.clip.z + 1e-6 * out.clip.w, out.clip.w);
+    return out;
 }
 fn shading_normal(in: VsOut, geometric: vec3f, uv: vec2f, normal_sample: vec3f) -> vec3f {
     // Derivatives are evaluated before the determinant branch (uniformity).
@@ -176,17 +238,11 @@ fn matcap_uv(n: vec3f, view: vec3f) -> vec2f {
     let view_y = cross(view, view_x);
     return vec2f(dot(view_x, n), dot(view_y, n)) * 0.495 + vec2f(0.5);
 }
-@fragment
-fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4f {
-    let base = textureSample(t_base, s_base, transformed_uv(in, material.base_uv))
+fn sample_base(in: VsOut) -> vec4f {
+    return textureSample(t_base, s_base, transformed_uv(in, material.base_uv))
         * material.base_color_factor;
-    if material.alpha.x > 0.5 && base.a < material.alpha.y {
-        discard;
-    }
-    var geometric = safe_normalize(in.normal);
-    if material.alpha.z > 0.5 && !front_facing {
-        geometric = -geometric;
-    }
+}
+fn surface_color(in: VsOut, geometric: vec3f, base: vec4f) -> vec3f {
     let normal_uv = transformed_uv(in, material.normal_uv);
     let n = shading_normal(
         in, geometric, normal_uv, textureSample(t_normal, s_normal, normal_uv).xyz,
@@ -218,7 +274,40 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0)
     // Their RGB lighting sum influences rim independently of base/shade/toon.
     let lighting = globals.model_sun_color.rgb + gi;
     rim *= mix(vec3f(1.0), lighting, material.rim_params.z);
-    let color = (direct + gi * base.rgb + emission + rim) * instance.tint.rgb;
+    return direct + gi * base.rgb + emission + rim;
+}
+fn output_alpha(base: vec4f) -> f32 {
     let material_alpha = select(1.0, base.a, material.alpha.w > 0.5);
-    return vec4f(color, material_alpha * instance.tint.a);
+    return material_alpha * instance.tint.a;
+}
+@fragment
+fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4f {
+    let base = sample_base(in);
+    if material.alpha.x > 0.5 && base.a < material.alpha.y {
+        discard;
+    }
+    var geometric = safe_normalize(in.normal);
+    if material.alpha.z > 0.5 && !front_facing {
+        geometric = -geometric;
+    }
+    let color = surface_color(in, geometric, base) * instance.tint.rgb;
+    return vec4f(color, output_alpha(base));
+}
+@fragment
+fn fs_outline(in: VsOut) -> @location(0) vec4f {
+    let base = sample_base(in);
+    if material.alpha.x > 0.5 && base.a < material.alpha.y {
+        discard;
+    }
+    // The lit endpoint is the same complete MToon surface result used above:
+    // direct lighting + GI + emission + rim/MatCap. Normal maps may influence
+    // its color, but never the geometric extrusion performed in vs_outline.
+    let lit = surface_color(in, safe_normalize(in.normal), base);
+    let lighting_mix = mix(
+        vec3f(1.0),
+        lit,
+        clamp(material.outline.z, 0.0, 1.0),
+    );
+    let color = material.outline_color_factor.rgb * lighting_mix * instance.tint.rgb;
+    return vec4f(color, output_alpha(base));
 }

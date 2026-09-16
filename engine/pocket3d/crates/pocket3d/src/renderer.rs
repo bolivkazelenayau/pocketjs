@@ -41,6 +41,8 @@ struct GlobalsRaw {
     fog_color: [f32; 4],
     /// x: start, y: end.
     fog_params: [f32; 4],
+    /// xy: viewport dimensions, zw: reciprocal dimensions.
+    viewport: [f32; 4],
 }
 
 pub struct Renderer {
@@ -698,6 +700,12 @@ impl Renderer {
             rim_params,
             fog_color,
             fog_params,
+            viewport: [
+                size.0 as f32,
+                size.1 as f32,
+                1.0 / size.0 as f32,
+                1.0 / size.1 as f32,
+            ],
         };
         gpu.queue
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
@@ -956,6 +964,10 @@ struct ModelPass {
     mtoon_blend_zwrite_double_sided: wgpu::RenderPipeline,
     mtoon_blend: wgpu::RenderPipeline,
     mtoon_blend_double_sided: wgpu::RenderPipeline,
+    mtoon_outline_opaque: wgpu::RenderPipeline,
+    mtoon_outline_mask: wgpu::RenderPipeline,
+    mtoon_outline_blend_zwrite: wgpu::RenderPipeline,
+    mtoon_outline_blend: wgpu::RenderPipeline,
     material_layout: wgpu::BindGroupLayout,
     mtoon_material_layout: wgpu::BindGroupLayout,
     object_layout: wgpu::BindGroupLayout,
@@ -1044,6 +1056,18 @@ impl ModelPass {
             sample_count,
         );
         let (
+            mtoon_outline_opaque,
+            mtoon_outline_mask,
+            mtoon_outline_blend_zwrite,
+            mtoon_outline_blend,
+        ) = Self::create_mtoon_outline_pipelines(
+            device,
+            color_format,
+            &mtoon_shader,
+            &mtoon_pipeline_layout,
+            sample_count,
+        );
+        let (
             opaque,
             opaque_double_sided,
             blend,
@@ -1074,6 +1098,10 @@ impl ModelPass {
             mtoon_blend_zwrite_double_sided,
             mtoon_blend,
             mtoon_blend_double_sided,
+            mtoon_outline_opaque,
+            mtoon_outline_mask,
+            mtoon_outline_blend_zwrite,
+            mtoon_outline_blend,
             material_layout,
             mtoon_material_layout,
             object_layout,
@@ -1267,6 +1295,71 @@ impl ModelPass {
         )
     }
 
+    fn create_mtoon_outline_pipelines(
+        device: &wgpu::Device,
+        color_format: wgpu::TextureFormat,
+        shader: &wgpu::ShaderModule,
+        layout: &wgpu::PipelineLayout,
+        sample_count: u32,
+    ) -> (
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+    ) {
+        let make = |label: &str, blend: Option<wgpu::BlendState>, depth_write_enabled: bool| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_outline"),
+                    compilation_options: Default::default(),
+                    buffers: &[ModelVertex::LAYOUT],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_outline"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: Some(wgpu::Face::Front),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: multisample_state(sample_count),
+                multiview: None,
+                cache: None,
+            })
+        };
+        (
+            make("MToon outline opaque", None, true),
+            make("MToon outline mask", None, true),
+            make(
+                "MToon outline blend depth-write",
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+                true,
+            ),
+            make(
+                "MToon outline blend",
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+                false,
+            ),
+        )
+    }
+
     fn rebuild_pipelines(
         &mut self,
         device: &wgpu::Device,
@@ -1304,6 +1397,18 @@ impl ModelPass {
             self.mtoon_blend,
             self.mtoon_blend_double_sided,
         ) = Self::create_mtoon_pipelines(
+            device,
+            color_format,
+            &self.mtoon_shader,
+            &self.mtoon_pipeline_layout,
+            sample_count,
+        );
+        (
+            self.mtoon_outline_opaque,
+            self.mtoon_outline_mask,
+            self.mtoon_outline_blend_zwrite,
+            self.mtoon_outline_blend,
+        ) = Self::create_mtoon_outline_pipelines(
             device,
             color_format,
             &self.mtoon_shader,
@@ -1577,24 +1682,34 @@ impl ModelPass {
                 .morph
                 .as_ref()
                 .zip(d.asset.prim_morph.get(pi).copied().flatten());
-            match morph {
+            let base_vertex = match morph {
                 Some((buf, (mi, pj))) => {
                     let mp = &d.asset.morph_meshes[mi].prims[pj];
                     pass.set_vertex_buffer(0, buf.slice(..));
-                    pass.draw_indexed(
-                        prim.first_index..prim.first_index + prim.index_count,
-                        mp.overlay_offset as i32 - mp.vertex_base as i32,
-                        0..1,
-                    );
+                    mp.overlay_offset as i32 - mp.vertex_base as i32
                 }
                 None => {
                     pass.set_vertex_buffer(0, d.asset.vbuf.slice(..));
-                    pass.draw_indexed(
-                        prim.first_index..prim.first_index + prim.index_count,
-                        0,
-                        0..1,
-                    );
+                    0
                 }
+            };
+            let index_range = prim.first_index..prim.first_index + prim.index_count;
+            pass.draw_indexed(index_range.clone(), base_vertex, 0..1);
+
+            // Surface and outline are one sorted submission. The second draw
+            // reuses the exact index/vertex or morph-overlay binding and the
+            // same instance/joint dynamic offsets, so no other transparent
+            // primitive can interleave between the pair.
+            if prim.mtoon_outline {
+                debug_assert!(prim.mtoon_bind_group.is_some());
+                let outline_pipeline = match phase {
+                    RenderPhase::Opaque => &self.mtoon_outline_opaque,
+                    RenderPhase::Mask => &self.mtoon_outline_mask,
+                    RenderPhase::MtoonBlendZWrite => &self.mtoon_outline_blend_zwrite,
+                    RenderPhase::Blend => &self.mtoon_outline_blend,
+                };
+                pass.set_pipeline(outline_pipeline);
+                pass.draw_indexed(index_range, base_vertex, 0..1);
             }
         }
     }
@@ -2065,7 +2180,7 @@ mod tests {
     use crate::hud::Hud;
     use crate::material::{RenderPhase, RenderSortKey};
     use crate::scene::Scene;
-    use glam::{Quat, Vec3};
+    use glam::{Mat4, Quat, Vec2, Vec3};
     #[cfg(not(target_arch = "wasm32"))]
     use wgpu::naga::{
         front::wgsl::parse_str,
@@ -2386,7 +2501,7 @@ mod tests {
 
     #[test]
     fn gpu_uniform_structs_retain_wgsl_alignment() {
-        assert_eq!(std::mem::size_of::<GlobalsRaw>(), 336);
+        assert_eq!(std::mem::size_of::<GlobalsRaw>(), 352);
         assert_eq!(std::mem::size_of::<InstanceRaw>(), 160);
         assert_eq!(std::mem::align_of::<GlobalsRaw>(), 4);
         assert_eq!(std::mem::align_of::<InstanceRaw>(), 4);
@@ -2416,5 +2531,136 @@ mod tests {
     fn singular_normal_matrix_fallback_stays_finite() {
         let normal = model_normal_matrix(glam::Mat4::from_scale(Vec3::new(1.0, 0.0, 2.0)));
         assert!(normal.to_cols_array().iter().all(|value| value.is_finite()));
+    }
+
+    fn screen_outline_ndc_offset(
+        view_proj: Mat4,
+        world_pos: Vec3,
+        world_normal: Vec3,
+        viewport: (u32, u32),
+        width_ratio: f32,
+    ) -> Vec2 {
+        let clip = view_proj * world_pos.extend(1.0);
+        let normal_clip = view_proj * world_normal.normalize().extend(0.0);
+        let derivative = (normal_clip.truncate().truncate() * clip.w
+            - clip.truncate().truncate() * normal_clip.w)
+            / (clip.w * clip.w).max(1e-12);
+        let aspect = viewport.0 as f32 / viewport.1 as f32;
+        let height_direction = Vec2::new(derivative.x * aspect, derivative.y);
+        if height_direction.length_squared() <= 1e-12 {
+            return Vec2::ZERO;
+        }
+        let direction = height_direction.normalize();
+        2.0 * width_ratio * Vec2::new(direction.x / aspect, direction.y)
+    }
+
+    fn pixel_length(ndc_offset: Vec2, viewport: (u32, u32)) -> f32 {
+        Vec2::new(
+            ndc_offset.x * viewport.0 as f32 * 0.5,
+            ndc_offset.y * viewport.1 as f32 * 0.5,
+        )
+        .length()
+    }
+
+    #[test]
+    fn screen_outline_is_a_viewport_height_ratio_for_distance_resolution_fov_and_shift() {
+        let width_ratio = 0.0125;
+        let world_normal = Vec3::new(1.0, 0.3, 0.4).normalize();
+        let cases: [(Vec3, (u32, u32), f32, Vec2); 4] = [
+            (Vec3::new(0.2, -0.1, -2.0), (800, 600), 40.0, Vec2::ZERO),
+            (Vec3::new(0.2, -0.1, -20.0), (800, 600), 90.0, Vec2::ZERO),
+            (
+                Vec3::new(0.2, -0.1, -5.0),
+                (450, 600),
+                70.0,
+                Vec2::new(0.3, -0.2),
+            ),
+            (
+                Vec3::new(0.2, -0.1, -5.0),
+                (1200, 900),
+                55.0,
+                Vec2::new(-0.4, 0.25),
+            ),
+        ];
+        for (position, viewport, fov, shift) in cases {
+            let aspect = viewport.0 as f32 / viewport.1 as f32;
+            let mut projection =
+                glam::camera::rh::proj::directx::perspective(fov.to_radians(), aspect, 0.1, 100.0);
+            // Off-axis perspective terms. The derivative formulation must not
+            // assume a centered projection.
+            projection.z_axis.x += shift.x;
+            projection.z_axis.y += shift.y;
+            let offset = screen_outline_ndc_offset(
+                projection,
+                position,
+                world_normal,
+                viewport,
+                width_ratio,
+            );
+            let measured_ratio = pixel_length(offset, viewport) / viewport.1 as f32;
+            assert!(
+                (measured_ratio - width_ratio).abs() < 1e-6,
+                "{position:?} {viewport:?} fov {fov} shift {shift:?}: {measured_ratio}"
+            );
+        }
+
+        let projection =
+            glam::camera::rh::proj::directx::perspective(70.0_f32.to_radians(), 1.0, 0.1, 100.0);
+        let low = screen_outline_ndc_offset(
+            projection,
+            Vec3::new(0.2, -0.1, -5.0),
+            world_normal,
+            (600, 600),
+            width_ratio,
+        );
+        let high = screen_outline_ndc_offset(
+            projection,
+            Vec3::new(0.2, -0.1, -5.0),
+            world_normal,
+            (1200, 1200),
+            width_ratio,
+        );
+        assert!(
+            (pixel_length(high, (1200, 1200)) / pixel_length(low, (600, 600)) - 2.0).abs() < 1e-6
+        );
+    }
+
+    #[test]
+    fn world_outline_is_metric_under_nonuniform_scale_and_projects_with_perspective() {
+        let factor = 0.1;
+        let model = Mat4::from_scale_rotation_translation(
+            Vec3::new(4.0, 0.25, 2.0),
+            Quat::from_rotation_y(0.4),
+            Vec3::ZERO,
+        );
+        let world_normal = model_normal_matrix(model)
+            .transform_vector3(Vec3::new(1.0, 0.5, 0.25))
+            .normalize();
+        assert!(((world_normal * factor).length() - factor).abs() < 1e-6);
+
+        let projected_width = |distance: f32, fov: f32| {
+            let projection =
+                glam::camera::rh::proj::directx::perspective(fov.to_radians(), 1.0, 0.1, 100.0);
+            let position = Vec3::new(0.0, 0.0, -distance);
+            let a = projection * position.extend(1.0);
+            let b = projection * (position + Vec3::X * factor).extend(1.0);
+            (b.truncate().truncate() / b.w - a.truncate().truncate() / a.w).length()
+        };
+        assert!(projected_width(2.0, 70.0) > projected_width(10.0, 70.0) * 4.9);
+        assert!(projected_width(5.0, 40.0) > projected_width(5.0, 90.0));
+    }
+
+    #[test]
+    fn outline_shader_locks_vertex_lod_green_channel_and_minimal_depth_bias() {
+        let shader = include_str!("shaders/mtoon.wgsl");
+        assert!(shader.contains("textureSampleLevel("));
+        assert!(shader.contains(").g;"));
+        assert!(shader.contains("@vertex\nfn vs_outline"));
+        assert!(shader.contains("@fragment\nfn fs_outline"));
+        let clip_z = 0.42_f32;
+        let clip_w = 2.5_f32;
+        let original_ndc = clip_z / clip_w;
+        let biased_ndc = (clip_z + 1e-6 * clip_w) / clip_w;
+        assert!((biased_ndc - original_ndc - 1e-6).abs() < 1e-7);
     }
 }

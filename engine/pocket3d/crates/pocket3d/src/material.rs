@@ -641,6 +641,23 @@ impl MaterialPipelineKey {
         }
     }
 
+    /// Stage E outline pipelines share the material's blend/depth family but
+    /// always cull front faces. Outline width mode and all authored factors are
+    /// shader data, so they deliberately do not add pipeline axes.
+    pub const fn native_stage_e_outline(phase: RenderPhase, sample_count: u32) -> Self {
+        Self {
+            shading_model: PipelineShadingModel::Mtoon,
+            blend_depth_family: match phase {
+                RenderPhase::Opaque | RenderPhase::Mask => PipelineBlendDepthFamily::OpaqueOrMask,
+                RenderPhase::MtoonBlendZWrite => PipelineBlendDepthFamily::BlendDepthWrite,
+                RenderPhase::Blend => PipelineBlendDepthFamily::BlendNoDepthWrite,
+            },
+            cull_mode: PipelineCullMode::Front,
+            render_pass: MaterialRenderPass::Outline,
+            sample_count,
+        }
+    }
+
     pub const fn current_fallback(
         unlit: bool,
         phase: RenderPhase,
@@ -1055,6 +1072,32 @@ mod tests {
                 .shading_model,
             PipelineShadingModel::Unlit,
         );
+    }
+
+    #[test]
+    fn stage_e_outline_pipeline_key_has_four_families_and_fixed_front_culling() {
+        for phase in [
+            RenderPhase::Opaque,
+            RenderPhase::Mask,
+            RenderPhase::MtoonBlendZWrite,
+            RenderPhase::Blend,
+        ] {
+            let key = MaterialPipelineKey::native_stage_e_outline(phase, 4);
+            assert_eq!(key.shading_model, PipelineShadingModel::Mtoon);
+            assert_eq!(key.cull_mode, PipelineCullMode::Front);
+            assert_eq!(key.render_pass, MaterialRenderPass::Outline);
+            assert_eq!(key.sample_count, 4);
+            assert_eq!(
+                key.blend_depth_family,
+                match phase {
+                    RenderPhase::Opaque | RenderPhase::Mask => {
+                        PipelineBlendDepthFamily::OpaqueOrMask
+                    }
+                    RenderPhase::MtoonBlendZWrite => PipelineBlendDepthFamily::BlendDepthWrite,
+                    RenderPhase::Blend => PipelineBlendDepthFamily::BlendNoDepthWrite,
+                }
+            );
+        }
     }
 
     #[test]
