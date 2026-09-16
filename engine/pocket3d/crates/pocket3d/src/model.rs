@@ -279,12 +279,19 @@ impl MtoonUvRaw {
 struct MtoonRaw {
     base_color_factor: [f32; 4],
     shade_color_factor: [f32; 4],
+    emissive_factor: [f32; 4],
+    matcap_factor: [f32; 4],
+    rim_color_factor: [f32; 4],
+    /// x: Fresnel power, y: lift, z: lighting mix.
+    rim_params: [f32; 4],
     surface: [f32; 4],
     alpha: [f32; 4],
     base_uv: MtoonUvRaw,
     normal_uv: MtoonUvRaw,
     shade_uv: MtoonUvRaw,
     shift_uv: MtoonUvRaw,
+    emissive_uv: MtoonUvRaw,
+    rim_uv: MtoonUvRaw,
     texture_scales: [f32; 4],
 }
 
@@ -301,6 +308,30 @@ impl MtoonRaw {
                 mtoon.shade_color_factor[1],
                 mtoon.shade_color_factor[2],
                 1.0,
+            ],
+            emissive_factor: [
+                inputs.emissive_factor[0],
+                inputs.emissive_factor[1],
+                inputs.emissive_factor[2],
+                0.0,
+            ],
+            matcap_factor: [
+                mtoon.matcap_factor[0],
+                mtoon.matcap_factor[1],
+                mtoon.matcap_factor[2],
+                0.0,
+            ],
+            rim_color_factor: [
+                mtoon.parametric_rim_color_factor[0],
+                mtoon.parametric_rim_color_factor[1],
+                mtoon.parametric_rim_color_factor[2],
+                0.0,
+            ],
+            rim_params: [
+                mtoon.parametric_rim_fresnel_power_factor,
+                mtoon.parametric_rim_lift_factor,
+                mtoon.rim_lighting_mix_factor,
+                0.0,
             ],
             surface: [
                 mtoon.shading_shift_factor,
@@ -328,6 +359,8 @@ impl MtoonRaw {
                     .as_ref()
                     .map(|shift| &shift.texture),
             ),
+            emissive_uv: MtoonUvRaw::from_texture(inputs.emissive_texture.as_ref()),
+            rim_uv: MtoonUvRaw::from_texture(mtoon.rim_multiply_texture.as_ref()),
             texture_scales: [
                 mtoon
                     .shading_shift_texture
@@ -341,16 +374,11 @@ impl MtoonRaw {
     }
 }
 
-fn native_stage_b_capable(material: &MaterialAsset) -> bool {
+fn native_stage_c_capable(material: &MaterialAsset) -> bool {
     let MaterialModel::Mtoon(mtoon) = &material.model else {
         return false;
     };
     material.inputs.alpha_mode != MaterialAlphaMode::Blend
-        && material.inputs.emissive_factor == [0.0; 3]
-        && material.inputs.emissive_texture.is_none()
-        && mtoon.matcap_texture.is_none()
-        && mtoon.parametric_rim_color_factor == [0.0; 3]
-        && mtoon.rim_multiply_texture.is_none()
         && mtoon.outline_width_mode == MtoonOutlineWidthMode::None
         && mtoon.outline_width_factor == 0.0
         && mtoon.outline_width_multiply_texture.is_none()
@@ -589,8 +617,8 @@ fn make_mtoon_bind_group(
     gpu: &Gpu,
     layout: &wgpu::BindGroupLayout,
     label: &str,
-    textures: [&wgpu::TextureView; 4],
-    samplers: [&wgpu::Sampler; 4],
+    textures: [&wgpu::TextureView; 7],
+    samplers: [&wgpu::Sampler; 7],
     material: &MtoonRaw,
 ) -> (Arc<wgpu::BindGroup>, wgpu::Buffer) {
     use wgpu::util::DeviceExt;
@@ -601,8 +629,8 @@ fn make_mtoon_bind_group(
             contents: bytemuck::bytes_of(material),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-    let mut entries = Vec::with_capacity(9);
-    for slot in 0..4 {
+    let mut entries = Vec::with_capacity(15);
+    for slot in 0..7 {
         entries.push(wgpu::BindGroupEntry {
             binding: (slot * 2) as u32,
             resource: wgpu::BindingResource::TextureView(textures[slot]),
@@ -613,7 +641,7 @@ fn make_mtoon_bind_group(
         });
     }
     entries.push(wgpu::BindGroupEntry {
-        binding: 8,
+        binding: 14,
         resource: buffer.as_entire_binding(),
     });
     let group = Arc::new(gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -624,16 +652,20 @@ fn make_mtoon_bind_group(
     (group, buffer)
 }
 
-fn stage_b_texture_semantic(texture: &TextureInfo) -> MipSemantic {
+fn mtoon_texture_semantic(texture: &TextureInfo) -> MipSemantic {
     match texture.role {
-        TextureRole::BaseColor | TextureRole::ShadeMultiply => MipSemantic::SrgbColor,
+        TextureRole::BaseColor
+        | TextureRole::ShadeMultiply
+        | TextureRole::Emissive
+        | TextureRole::Matcap
+        | TextureRole::RimMultiply => MipSemantic::SrgbColor,
         TextureRole::Normal => MipSemantic::TangentNormal,
         TextureRole::ShadingShift => MipSemantic::LinearData,
-        _ => unreachable!("later-pass texture must not enter Stage B"),
+        _ => unreachable!("unsupported texture must not enter native MToon"),
     }
 }
 
-fn stage_b_texture(
+fn mtoon_texture(
     gpu: &Gpu,
     cache: &mut ModelTextureCache,
     images: &[gltf::image::Data],
@@ -645,7 +677,7 @@ fn stage_b_texture(
         return dummy.clone();
     };
     let image = &images[texture.image_index];
-    let semantic = stage_b_texture_semantic(texture);
+    let semantic = mtoon_texture_semantic(texture);
     let (rgba, width, height) = cap_texture_rgba_semantic(
         to_rgba8(image),
         image.width,
@@ -847,7 +879,7 @@ fn authored_materials(
                 );
             }
             let tex_coord = texture.effective_tex_coord();
-            if tex_coord > 1 {
+            if texture.role != TextureRole::Matcap && tex_coord > 1 {
                 bail!(
                     "MToon material {} texture {:?} selects TEXCOORD_{tex_coord}, but Pocket3D currently imports only TEXCOORD_0 and TEXCOORD_1 in {}",
                     descriptor.material_index,
@@ -880,7 +912,7 @@ fn authored_materials(
                 if let Some(base) = descriptor.inputs.base_color_texture.as_ref() {
                     let selected = base.effective_tex_coord();
                     if !base.current_base_color_fallback_uv_supported()
-                        && !(native_mtoon && native_stage_b_capable(&authored))
+                        && !(native_mtoon && native_stage_c_capable(&authored))
                     {
                         bail!(
                             "MToon material {index} baseColorTexture selects TEXCOORD_{selected}, but the current unlit fallback samples only TEXCOORD_0 in {}",
@@ -1135,10 +1167,13 @@ impl ModelAsset {
             })
     }
 
-    /// Dedicated four-texture Stage B MToon material layout (group 1).
+    /// Dedicated seven-texture Stage C MToon material layout (group 1).
     pub fn mtoon_material_layout(gpu: &Gpu) -> wgpu::BindGroupLayout {
-        let mut entries = Vec::with_capacity(9);
-        for binding in 0..8 {
+        let limits = gpu.device.limits();
+        assert!(limits.max_sampled_textures_per_shader_stage >= 7);
+        assert!(limits.max_samplers_per_shader_stage >= 7);
+        let mut entries = Vec::with_capacity(15);
+        for binding in 0..14 {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1155,7 +1190,7 @@ impl ModelAsset {
             });
         }
         entries.push(wgpu::BindGroupLayoutEntry {
-            binding: 8,
+            binding: 14,
             visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
@@ -1443,7 +1478,7 @@ impl ModelAsset {
         )
     }
 
-    /// Activate native Stage B surfaces when the authored material is eligible.
+    /// Activate native Stage B+C surfaces when the authored material is eligible.
     #[allow(clippy::too_many_arguments)]
     pub fn load_glb_bytes_opts_with_native_mtoon<I, S>(
         gpu: &Gpu,
@@ -1731,6 +1766,15 @@ impl ModelAsset {
         let mut mtoon_material_buffers = Vec::new();
         let mut mtoon_textures = Vec::new();
         if let Some(mtoon_layout) = mtoon_layout {
+            let black = Arc::new(create_rgba_texture(
+                gpu,
+                "MToon black MatCap",
+                1,
+                1,
+                &[0, 0, 0, 255],
+                true,
+                false,
+            ));
             let flat_normal = Arc::new(create_rgba_texture(
                 gpu,
                 "MToon flat normal",
@@ -1751,7 +1795,7 @@ impl ModelAsset {
             ));
             let mut authored_samplers = GltfSamplerCache::new();
             for material in &materials {
-                if !native_stage_b_capable(material) {
+                if !native_stage_c_capable(material) {
                     if material.kind() == crate::material::MaterialKind::Mtoon {
                         log::info!(
                             "MToon material {} uses KHR_materials_unlit fallback: BLEND or later-pass properties",
@@ -1774,12 +1818,27 @@ impl ModelAsset {
                     .shading_shift_texture
                     .as_ref()
                     .map(|shift| &shift.texture);
-                let infos = [base_info, normal_info, shade_info, shift_info];
+                let emissive_info = material.inputs.emissive_texture.as_ref();
+                let matcap_info = mtoon.matcap_texture.as_ref();
+                let rim_info = mtoon.rim_multiply_texture.as_ref();
+                let infos = [
+                    base_info,
+                    normal_info,
+                    shade_info,
+                    shift_info,
+                    emissive_info,
+                    matcap_info,
+                    rim_info,
+                ];
                 let resources = [
-                    stage_b_texture(gpu, cache, &images, opts, base_info, &white),
-                    stage_b_texture(gpu, cache, &images, opts, normal_info, &flat_normal),
-                    stage_b_texture(gpu, cache, &images, opts, shade_info, &white),
-                    stage_b_texture(gpu, cache, &images, opts, shift_info, &zero_shift),
+                    mtoon_texture(gpu, cache, &images, opts, base_info, &white),
+                    mtoon_texture(gpu, cache, &images, opts, normal_info, &flat_normal),
+                    mtoon_texture(gpu, cache, &images, opts, shade_info, &white),
+                    mtoon_texture(gpu, cache, &images, opts, shift_info, &zero_shift),
+                    // Core glTF emissiveFactor works without an emissiveTexture.
+                    mtoon_texture(gpu, cache, &images, opts, emissive_info, &white),
+                    mtoon_texture(gpu, cache, &images, opts, matcap_info, &black),
+                    mtoon_texture(gpu, cache, &images, opts, rim_info, &white),
                 ];
                 let samplers: Vec<wgpu::Sampler> = infos
                     .iter()
@@ -1801,8 +1860,19 @@ impl ModelAsset {
                         &resources[1].view,
                         &resources[2].view,
                         &resources[3].view,
+                        &resources[4].view,
+                        &resources[5].view,
+                        &resources[6].view,
                     ],
-                    [&samplers[0], &samplers[1], &samplers[2], &samplers[3]],
+                    [
+                        &samplers[0],
+                        &samplers[1],
+                        &samplers[2],
+                        &samplers[3],
+                        &samplers[4],
+                        &samplers[5],
+                        &samplers[6],
+                    ],
                     &MtoonRaw::from_material(material),
                 );
                 mtoon_groups.insert(material.gltf_material_index, group);
@@ -1811,6 +1881,7 @@ impl ModelAsset {
             }
             mtoon_textures.push(flat_normal);
             mtoon_textures.push(zero_shift);
+            mtoon_textures.push(black);
         }
 
         // --- nodes / skeleton ----------------------------------------------
@@ -2422,7 +2493,7 @@ impl ModelAsset {
                             MaterialAlphaMode::Opaque => RenderPhase::Opaque,
                             MaterialAlphaMode::Mask => RenderPhase::Mask,
                             MaterialAlphaMode::Blend => {
-                                unreachable!("BLEND is not Stage B capable")
+                                unreachable!("BLEND is not native MToon capable")
                             }
                         }
                     } else {
@@ -3210,7 +3281,7 @@ fn import_byte_images(
             inputs: descriptor.inputs.clone(),
             model: MaterialModel::Mtoon(Box::new(descriptor.mtoon.clone())),
         };
-        if !native_stage_b_capable(&authored) {
+        if !native_stage_c_capable(&authored) {
             continue;
         }
         for texture in [
@@ -3226,6 +3297,9 @@ fn import_byte_images(
                 .shading_shift_texture
                 .as_ref()
                 .map(|shift| &shift.texture),
+            descriptor.inputs.emissive_texture.as_ref(),
+            descriptor.mtoon.matcap_texture.as_ref(),
+            descriptor.mtoon.rim_multiply_texture.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -3358,16 +3432,20 @@ mod tests {
 
     use crate::anim::{AnimState, Channel, ChannelPath, Clip, Interpolation, NodeTrs, Skeleton};
     use crate::gpu::Gpu;
-    use crate::material::TextureColorSpace;
+    use crate::material::{
+        GltfMagFilter, GltfMinFilter, GltfSampler, MaterialAsset, MaterialInputs, MaterialModel,
+        MtoonMaterial, MtoonMaterialDescriptor, MtoonOutlineWidthMode, ScaledTextureInfo,
+        TextureColorSpace, TextureInfo, TextureRole, TextureTransform,
+    };
     use crate::texture::{MipSemantic, Samplers};
 
     use super::{
         ByteImageBudget, MAX_BYTE_IMAGE_BYTES, MAX_BYTE_IMAGE_COUNT, MaterialBaseColorMode,
         MaterialRaw, ModelAsset, ModelLoadOptions, ModelTextureCacheKey, authored_materials,
         cap_texture_rgba, find_node_named, import_glb_slice, import_glb_slice_with_options,
-        pocket3d_base_color_mode_from_extras, pocket3d_role_from_extras, sample_node_transform,
-        semantic_material_matches, to_rgba8, validate_joint_palette_count, validate_model_input,
-        validate_normalized_texcoord0,
+        mtoon_texture_semantic, native_stage_c_capable, pocket3d_base_color_mode_from_extras,
+        pocket3d_role_from_extras, sample_node_transform, semantic_material_matches, to_rgba8,
+        validate_joint_palette_count, validate_model_input, validate_normalized_texcoord0,
     };
 
     fn glb_from_json(value: Value, bin: &[u8]) -> Vec<u8> {
@@ -3426,6 +3504,151 @@ mod tests {
             .unwrap();
         drop(writer);
         encoded
+    }
+
+    fn rgba_png(width: u32, height: u32, pixels: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        let mut encoder = png::Encoder::new(&mut encoded, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(pixels).unwrap();
+        drop(writer);
+        encoded
+    }
+
+    fn stage_c_texture(role: TextureRole, index: usize) -> TextureInfo {
+        TextureInfo {
+            texture_index: index,
+            image_index: index,
+            sampler: GltfSampler {
+                mag_filter: Some(GltfMagFilter::Nearest),
+                min_filter: Some(GltfMinFilter::Nearest),
+                ..Default::default()
+            },
+            tex_coord: 0,
+            transform: TextureTransform::default(),
+            role,
+            color_space: role.color_space(),
+        }
+    }
+
+    fn stage_c_descriptor() -> MtoonMaterialDescriptor {
+        MtoonMaterialDescriptor {
+            material_index: 0,
+            inputs: MaterialInputs {
+                base_color_factor: [0.0, 0.0, 0.0, 1.0],
+                double_sided: true,
+                ..Default::default()
+            },
+            mtoon: MtoonMaterial {
+                spec_version: "1.0".into(),
+                transparent_with_z_write: false,
+                render_queue_offset_number: 0,
+                shade_color_factor: [0.0; 3],
+                shade_multiply_texture: None,
+                shading_shift_factor: 0.0,
+                shading_shift_texture: None,
+                shading_toony_factor: 0.9,
+                gi_equalization_factor: 0.9,
+                matcap_factor: [1.0; 3],
+                matcap_texture: None,
+                parametric_rim_color_factor: [0.0; 3],
+                parametric_rim_fresnel_power_factor: 5.0,
+                parametric_rim_lift_factor: 0.0,
+                rim_multiply_texture: None,
+                rim_lighting_mix_factor: 1.0,
+                outline_width_mode: MtoonOutlineWidthMode::None,
+                outline_width_factor: 0.0,
+                outline_width_multiply_texture: None,
+                outline_color_factor: [0.0; 3],
+                outline_lighting_mix_factor: 1.0,
+                uv_animation_mask_texture: None,
+                uv_animation_scroll_x_speed_factor: 0.0,
+                uv_animation_scroll_y_speed_factor: 0.0,
+                uv_animation_rotation_speed_factor: 0.0,
+            },
+        }
+    }
+
+    fn stage_c_quad(backface: bool) -> Vec<u8> {
+        let mut bin = Vec::new();
+        let mut views = Vec::new();
+        let mut accessors = Vec::new();
+        let corners = if backface {
+            [0, 2, 1, 0, 3, 2]
+        } else {
+            [0, 1, 2, 0, 2, 3]
+        };
+        let positions = [
+            [-0.8, -0.8, 0.0],
+            [0.8, -0.8, 0.0],
+            [0.8, 0.8, 0.0],
+            [-0.8, 0.8, 0.0],
+        ];
+        let uv0 = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        let (pos, normal, tex0, tex1) = {
+            let mut add = |components: usize, values: Vec<f32>| {
+                let offset = bin.len();
+                for value in &values {
+                    bin.extend_from_slice(&value.to_le_bytes());
+                }
+                let view = views.len();
+                views.push(
+                    json!({"buffer":0,"byteOffset":offset,"byteLength":values.len()*4,"target":34962}),
+                );
+                let accessor = accessors.len();
+                accessors.push(json!({
+                    "bufferView":view,"componentType":5126,"count":6,
+                    "type":if components == 3 {"VEC3"} else {"VEC2"}
+                }));
+                accessor
+            };
+            let pos = add(3, corners.iter().flat_map(|&i| positions[i]).collect());
+            let normal = add(3, corners.iter().flat_map(|_| [0.6, 0.0, 0.8]).collect());
+            let tex0 = add(2, corners.iter().flat_map(|&i| uv0[i]).collect());
+            let tex1 = add(2, corners.iter().flat_map(|_| [0.25, 0.5]).collect());
+            (pos, normal, tex0, tex1)
+        };
+        accessors[pos]["min"] = json!([-0.8, -0.8, 0.0]);
+        accessors[pos]["max"] = json!([0.8, 0.8, 0.0]);
+        let image = |width, height, pixels: &[u8]| {
+            let png = rgba_png(width, height, pixels);
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(png)
+            )
+        };
+        let images = [
+            image(2, 1, &[255, 0, 0, 255, 0, 255, 0, 255]),
+            image(
+                4,
+                1,
+                &[
+                    255, 0, 0, 255, 255, 255, 0, 255, 0, 255, 255, 255, 0, 0, 255, 255,
+                ],
+            ),
+            image(2, 1, &[255, 255, 255, 255, 0, 0, 0, 255]),
+            image(1, 1, &[0, 128, 128, 255]),
+        ];
+        glb_from_json(
+            json!({
+                "asset":{"version":"2.0"},
+                "scene":0,"scenes":[{"nodes":[0]}],
+                "nodes":[{"mesh":0}],
+                "meshes":[{"primitives":[{"attributes":{
+                    "POSITION":pos,"NORMAL":normal,"TEXCOORD_0":tex0,"TEXCOORD_1":tex1
+                },"material":0}]}],
+                "materials":[{"doubleSided":true,"extensions":{
+                    "KHR_materials_unlit":{},"VRMC_materials_mtoon":{"specVersion":"1.0"}
+                }}],
+                "extensionsUsed":["KHR_materials_unlit","VRMC_materials_mtoon"],
+                "images":images.iter().map(|uri| json!({"uri":uri})).collect::<Vec<_>>(),
+                "textures":[{"source":0},{"source":1},{"source":2},{"source":3}],
+                "buffers":[{"byteLength":bin.len()}],"bufferViews":views,"accessors":accessors
+            }),
+            &bin,
+        )
     }
 
     fn data_uri_image_glb(width: u32, height: u32) -> Vec<u8> {
@@ -4282,6 +4505,187 @@ mod tests {
         };
         assert!(color != normal);
         assert!(normal != shift);
+    }
+
+    #[test]
+    fn stage_c_roles_use_linear_light_color_mips_and_safe_capability_gate() {
+        let pixels = [
+            0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+        ];
+        for role in [
+            TextureRole::Emissive,
+            TextureRole::Matcap,
+            TextureRole::RimMultiply,
+        ] {
+            let info = stage_c_texture(role, 0);
+            assert_eq!(info.color_space, TextureColorSpace::Srgb);
+            let semantic = mtoon_texture_semantic(&info);
+            assert_eq!(semantic, MipSemantic::SrgbColor);
+            let (filtered, width, height) =
+                super::cap_texture_rgba_semantic(pixels.to_vec(), 2, 2, Some(1), semantic);
+            assert_eq!((width, height), (1, 1));
+            assert!((filtered[0] as i32 - 188).abs() <= 1);
+        }
+        let descriptor = stage_c_descriptor();
+        let mut material = MaterialAsset {
+            gltf_material_index: 0,
+            name: None,
+            inputs: descriptor.inputs,
+            model: MaterialModel::Mtoon(Box::new(descriptor.mtoon)),
+        };
+        assert!(native_stage_c_capable(&material));
+        material.inputs.emissive_factor = [1.0, 0.0, 0.0];
+        assert!(native_stage_c_capable(&material));
+        let MaterialModel::Mtoon(mtoon) = &mut material.model else {
+            unreachable!()
+        };
+        mtoon.matcap_texture = Some(stage_c_texture(TextureRole::Matcap, 1));
+        mtoon.parametric_rim_color_factor = [1.0; 3];
+        mtoon.rim_multiply_texture = Some(stage_c_texture(TextureRole::RimMultiply, 2));
+        assert!(native_stage_c_capable(&material));
+        let MaterialModel::Mtoon(mtoon) = &mut material.model else {
+            unreachable!()
+        };
+        mtoon.outline_width_mode = MtoonOutlineWidthMode::WorldCoordinates;
+        assert!(!native_stage_c_capable(&material));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stage_c_gpu_surface_variants_use_final_normal_and_independent_uvs() {
+        use crate::camera::Camera;
+        use crate::gpu::{OFFSCREEN_FORMAT, OffscreenTarget};
+        use crate::hud::Hud;
+        use crate::model::ModelInstance;
+        use crate::renderer::Renderer;
+        use crate::scene::Scene;
+
+        let gpu = Gpu::new_headless().expect("headless GPU is required for Stage C fixtures");
+        let mut renderer = Renderer::new(&gpu, OFFSCREEN_FORMAT).unwrap();
+        let front = stage_c_quad(false);
+        let back = stage_c_quad(true);
+        let mut pixel = |descriptor: &MtoonMaterialDescriptor, backface: bool, camera_pos: Vec3| {
+            let bytes = if backface { &back } else { &front };
+            let asset = ModelAsset::load_glb_bytes_opts_with_native_mtoon(
+                &gpu,
+                &renderer.model_material_layout,
+                &renderer.mtoon_material_layout,
+                &renderer.samplers,
+                bytes,
+                "stage-c-quad.glb",
+                &ModelLoadOptions::default(),
+                std::iter::empty::<&str>(),
+                std::slice::from_ref(descriptor),
+            )
+            .unwrap();
+            assert!(asset.primitives[0].mtoon_bind_group.is_some());
+            let mut scene = Scene::default();
+            scene.sky.zenith = Vec3::ZERO;
+            scene.sky.horizon = Vec3::ZERO;
+            scene.lighting.sun_color = Vec3::ZERO;
+            scene.lighting.ambient = Vec3::ZERO;
+            scene.models.push(ModelInstance::new(asset));
+            let camera = Camera {
+                pos: camera_pos,
+                znear: 0.1,
+                zfar: 10.0,
+                ..Default::default()
+            };
+            let target = OffscreenTarget::new(&gpu, 64, 64);
+            renderer.render(
+                &gpu,
+                &target.view,
+                target.size,
+                &scene,
+                &camera,
+                &Hud::default(),
+            );
+            let rgba = target.read_rgba(&gpu).unwrap();
+            let offset = ((32 * 64 + 32) * 4) as usize;
+            [rgba[offset], rgba[offset + 1], rgba[offset + 2]]
+        };
+        let camera = Vec3::new(0.0, 0.0, 2.0);
+        let baseline = pixel(&stage_c_descriptor(), false, camera);
+
+        let mut emission = stage_c_descriptor();
+        emission.inputs.emissive_factor = [1.0, 0.0, 0.0];
+        let factor_only = pixel(&emission, false, camera);
+        assert!(factor_only[0] > baseline[0] + 40);
+        emission.inputs.emissive_factor = [1.0; 3];
+        emission.inputs.emissive_texture = Some(stage_c_texture(TextureRole::Emissive, 0));
+        let uv0 = pixel(&emission, false, camera);
+        let emissive = emission.inputs.emissive_texture.as_mut().unwrap();
+        emissive.tex_coord = 0;
+        emissive.transform.tex_coord_override = Some(1);
+        let uv1_red = pixel(&emission, false, camera);
+        emission
+            .inputs
+            .emissive_texture
+            .as_mut()
+            .unwrap()
+            .transform
+            .offset = [0.5, 0.0];
+        let uv1_green = pixel(&emission, false, camera);
+        assert!(uv1_red[0] > uv0[0]);
+        assert!(uv1_green[1] > uv1_red[1]);
+
+        let mut matcap = stage_c_descriptor();
+        matcap.mtoon.matcap_texture = Some(stage_c_texture(TextureRole::Matcap, 1));
+        matcap.mtoon.rim_lighting_mix_factor = 0.0;
+        let matcap_front = pixel(&matcap, false, camera);
+        // MatCap is projected from V and N; its textureInfo UV metadata is irrelevant.
+        let matcap_info = matcap.mtoon.matcap_texture.as_mut().unwrap();
+        matcap_info.transform.tex_coord_override = Some(7);
+        matcap_info.transform.offset = [0.5, 0.0];
+        assert_eq!(matcap_front, pixel(&matcap, false, camera));
+        let matcap_back = pixel(&matcap, true, camera);
+        assert_ne!(matcap_front, matcap_back);
+        let matcap_view_change = pixel(&matcap, false, Vec3::new(1.0, 0.0, 2.0));
+        assert_ne!(matcap_front, matcap_view_change);
+        matcap.inputs.normal_texture = Some(ScaledTextureInfo {
+            texture: stage_c_texture(TextureRole::Normal, 3),
+            scale: 1.0,
+        });
+        let matcap_mapped = pixel(&matcap, false, camera);
+        assert_ne!(matcap_front, matcap_mapped);
+
+        let mut rim = stage_c_descriptor();
+        rim.mtoon.parametric_rim_color_factor = [1.0; 3];
+        rim.mtoon.parametric_rim_fresnel_power_factor = 1.0;
+        rim.mtoon.rim_lighting_mix_factor = 0.0;
+        let rim_front = pixel(&rim, false, camera);
+        let rim_back = pixel(&rim, true, camera);
+        assert!(rim_front[0] > baseline[0]);
+        assert!(rim_back[0] > rim_front[0]);
+        rim.inputs.normal_texture = Some(ScaledTextureInfo {
+            texture: stage_c_texture(TextureRole::Normal, 3),
+            scale: 1.0,
+        });
+        let rim_mapped = pixel(&rim, false, camera);
+        assert_ne!(rim_front, rim_mapped);
+        rim.mtoon.parametric_rim_lift_factor = 0.5;
+        let rim_lifted = pixel(&rim, false, camera);
+        assert!(rim_lifted[0] >= rim_mapped[0]);
+        rim.mtoon.parametric_rim_fresnel_power_factor = 0.0;
+        let rim_zero_power = pixel(&rim, false, camera);
+        assert!(rim_zero_power[0] > baseline[0]);
+        rim.mtoon.rim_lighting_mix_factor = 1.0;
+        let rim_fully_lit = pixel(&rim, false, camera);
+        assert_eq!(rim_fully_lit, baseline);
+
+        rim.mtoon.rim_lighting_mix_factor = 0.0;
+        rim.mtoon.rim_multiply_texture = Some(stage_c_texture(TextureRole::RimMultiply, 2));
+        let mask = rim.mtoon.rim_multiply_texture.as_mut().unwrap();
+        mask.transform.tex_coord_override = Some(1);
+        let rim_white_mask = pixel(&rim, false, camera);
+        rim.mtoon
+            .rim_multiply_texture
+            .as_mut()
+            .unwrap()
+            .transform
+            .offset = [0.5, 0.0];
+        let rim_black_mask = pixel(&rim, false, camera);
+        assert!(rim_white_mask[0] > rim_black_mask[0]);
     }
 
     #[test]

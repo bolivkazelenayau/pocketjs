@@ -1,4 +1,4 @@
-// Native VRMC_materials_mtoon 1.0 opaque/masked surface. Later passes are absent.
+// Native VRMC_materials_mtoon 1.0 Stage B+C opaque/masked surface.
 struct Globals {
     view_proj: mat4x4f,
     inverse_view_proj: mat4x4f,
@@ -31,6 +31,11 @@ struct UvDesc {
 struct MtoonMaterial {
     base_color_factor: vec4f,
     shade_color_factor: vec4f,
+    emissive_factor: vec4f,
+    matcap_factor: vec4f,
+    rim_color_factor: vec4f,
+    // x: Fresnel power, y: lift, z: lighting mix
+    rim_params: vec4f,
     // x: shift factor, y: toony, z: GI equalization, w: normal scale
     surface: vec4f,
     // x: MASK, y: authored cutoff, z: double sided
@@ -39,6 +44,8 @@ struct MtoonMaterial {
     normal_uv: UvDesc,
     shade_uv: UvDesc,
     shift_uv: UvDesc,
+    emissive_uv: UvDesc,
+    rim_uv: UvDesc,
     // x: shading shift texture scale
     texture_scales: vec4f,
 }
@@ -51,7 +58,13 @@ struct MtoonMaterial {
 @group(1) @binding(5) var s_shade: sampler;
 @group(1) @binding(6) var t_shift: texture_2d<f32>;
 @group(1) @binding(7) var s_shift: sampler;
-@group(1) @binding(8) var<uniform> material: MtoonMaterial;
+@group(1) @binding(8) var t_emissive: texture_2d<f32>;
+@group(1) @binding(9) var s_emissive: sampler;
+@group(1) @binding(10) var t_matcap: texture_2d<f32>;
+@group(1) @binding(11) var s_matcap: sampler;
+@group(1) @binding(12) var t_rim: texture_2d<f32>;
+@group(1) @binding(13) var s_rim: sampler;
+@group(1) @binding(14) var<uniform> material: MtoonMaterial;
 @group(2) @binding(0) var<uniform> instance: Instance;
 @group(2) @binding(1) var<storage, read> joints: array<mat4x4f>;
 
@@ -152,6 +165,17 @@ fn toon_factor(shading: f32, toony: f32) -> f32 {
     let edge1 = 1.0 - clamped;
     return clamp((shading - edge0) / (edge1 - edge0), 0.0, 1.0);
 }
+fn matcap_uv(n: vec3f, view: vec3f) -> vec2f {
+    // The specified world-view basis is undefined for a vertical view vector.
+    // Use a perpendicular world X axis in that degenerate case.
+    let horizontal = vec3f(view.z, 0.0, -view.x);
+    var view_x = vec3f(1.0, 0.0, 0.0);
+    if dot(horizontal, horizontal) > 1e-10 {
+        view_x = normalize(horizontal);
+    }
+    let view_y = cross(view, view_x);
+    return vec2f(dot(view_x, n), dot(view_y, n)) * 0.495 + vec2f(0.5);
+}
 @fragment
 fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0) vec4f {
     let base = textureSample(t_base, s_base, transformed_uv(in, material.base_uv))
@@ -178,6 +202,22 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0)
     let uniform_gi = (raw_gi(vec3f(0.0, 1.0, 0.0))
         + raw_gi(vec3f(0.0, -1.0, 0.0))) * 0.5;
     let gi = mix(raw_gi(n), uniform_gi, clamp(material.surface.z, 0.0, 1.0));
-    let color = direct + gi * base.rgb;
+    // V is surface-to-camera in world space, consistent with the world normal.
+    let view = safe_normalize(globals.cam_pos.xyz - in.world_pos);
+    let emission = material.emissive_factor.rgb
+        * textureSample(t_emissive, s_emissive, transformed_uv(in, material.emissive_uv)).rgb;
+    let matcap = material.matcap_factor.rgb
+        * textureSample(t_matcap, s_matcap, matcap_uv(n, view)).rgb;
+    let rim_shape = pow(
+        clamp(1.0 - dot(n, view) + material.rim_params.y, 0.0, 1.0),
+        max(material.rim_params.x, 0.00001),
+    );
+    var rim = matcap + rim_shape * material.rim_color_factor.rgb;
+    rim *= textureSample(t_rim, s_rim, transformed_uv(in, material.rim_uv)).rgb;
+    // Pocket3D has one unattenuated direct sun and equalized hemisphere GI.
+    // Their RGB lighting sum influences rim independently of base/shade/toon.
+    let lighting = globals.model_sun_color.rgb + gi;
+    rim *= mix(vec3f(1.0), lighting, material.rim_params.z);
+    let color = direct + gi * base.rgb + emission + rim;
     return vec4f(color, 1.0);
 }

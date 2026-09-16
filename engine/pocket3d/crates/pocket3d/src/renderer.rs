@@ -2164,6 +2164,7 @@ mod tests {
         for (label, source) in [
             ("world.wgsl", include_str!("shaders/world.wgsl")),
             ("model.wgsl", include_str!("shaders/model.wgsl")),
+            ("mtoon.wgsl", include_str!("shaders/mtoon.wgsl")),
             ("sprite.wgsl", include_str!("shaders/sprite.wgsl")),
             ("hud.wgsl", include_str!("shaders/hud.wgsl")),
         ] {
