@@ -19,7 +19,12 @@ fn mask_coverage_uses_authored_alpha_while_final_alpha_policy_stays_intact() {
         .find(|line| line.trim_start().starts_with("if alpha_cutoff > 0.0"))
         .expect("fallback shader must alpha-test MASK surfaces");
     assert!(cutoff_test.contains("material_albedo.a < alpha_cutoff"));
-    assert!(shader.contains("let alpha = select(1.0, albedo.a, material.params.w > 0.5);"));
+    assert!(
+        shader.contains(
+            "let material_alpha = select(1.0, material_albedo.a, material.params.w > 0.5);"
+        )
+    );
+    assert!(shader.contains("let alpha = material_alpha * instance.tint.a;"));
 }
 
 fn mask_quad(alpha: f32) -> Vec<u8> {

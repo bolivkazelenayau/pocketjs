@@ -1,4 +1,4 @@
-// Native VRMC_materials_mtoon 1.0 Stage B+C opaque/masked surface.
+// Native VRMC_materials_mtoon 1.0 Stage B-D surface.
 struct Globals {
     view_proj: mat4x4f,
     inverse_view_proj: mat4x4f,
@@ -38,7 +38,7 @@ struct MtoonMaterial {
     rim_params: vec4f,
     // x: shift factor, y: toony, z: GI equalization, w: normal scale
     surface: vec4f,
-    // x: MASK, y: authored cutoff, z: double sided
+    // x: MASK, y: authored cutoff, z: double sided, w: authored BLEND
     alpha: vec4f,
     base_uv: UvDesc,
     normal_uv: UvDesc,
@@ -218,6 +218,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0)
     // Their RGB lighting sum influences rim independently of base/shade/toon.
     let lighting = globals.model_sun_color.rgb + gi;
     rim *= mix(vec3f(1.0), lighting, material.rim_params.z);
-    let color = direct + gi * base.rgb + emission + rim;
-    return vec4f(color, 1.0);
+    let color = (direct + gi * base.rgb + emission + rim) * instance.tint.rgb;
+    let material_alpha = select(1.0, base.a, material.alpha.w > 0.5);
+    return vec4f(color, material_alpha * instance.tint.a);
 }

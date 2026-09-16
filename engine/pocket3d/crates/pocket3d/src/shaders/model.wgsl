@@ -167,7 +167,8 @@ fn fs_main(in: VsOut, @builtin(front_facing) front_facing: bool) -> @location(0)
             + globals.rim_color.rgb * rim,
         lit_amount,
     );
-    let alpha = select(1.0, albedo.a, material.params.w > 0.5);
+    let material_alpha = select(1.0, material_albedo.a, material.params.w > 0.5);
+    let alpha = material_alpha * instance.tint.a;
     let color = mix(
         albedo.rgb * lighting,
         globals.fog_color.rgb,

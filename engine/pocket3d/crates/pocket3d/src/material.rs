@@ -1,8 +1,8 @@
 //! Authored material semantics and per-instance material state.
 //!
-//! The current renderer intentionally continues to use its PocketLit and
-//! Unlit shader paths. `Mtoon` is an authored material kind and descriptor in
-//! this module, but it is not yet a native pipeline selection.
+//! Authored MToon materials use the native surface pipeline when every active
+//! semantic is supported. PocketLit and Unlit remain the conservative
+//! fallback for later-stage MToon features.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -530,10 +530,21 @@ impl RenderPhase {
             Self::MtoonBlendZWrite | Self::Blend => RenderPassClass::Blend,
         }
     }
+
+    /// Whole-instance fades are a presentation override, not an authored
+    /// material mutation. Opaque and cutout surfaces join the ordinary
+    /// no-depth-write blend phase while fading; authored transparent surfaces
+    /// retain their MToon depth-write choice.
+    pub const fn with_presentation_alpha(self, presentation_alpha: f32) -> Self {
+        if presentation_alpha < 1.0 && matches!(self, Self::Opaque | Self::Mask) {
+            Self::Blend
+        } else {
+            self
+        }
+    }
 }
 
-/// The two existing draw traversals. Keeping opaque and mask in one class
-/// preserves current author/draw order while exposing their future phases.
+/// Coarse render-state class shared by CPU ordering and pipeline selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderPassClass {
     Solid,
@@ -553,9 +564,22 @@ impl RenderSortKey {
         self.phase
             .cmp(&other.phase)
             .then_with(|| self.queue_offset.cmp(&other.queue_offset))
-            .then_with(|| self.camera_depth.total_cmp(&other.camera_depth))
+            .then_with(|| {
+                if self.phase.pass_class() == RenderPassClass::Blend {
+                    // Larger camera-forward depth is farther away, so reverse
+                    // the comparison for source-over back-to-front rendering.
+                    safe_camera_depth(other.camera_depth)
+                        .total_cmp(&safe_camera_depth(self.camera_depth))
+                } else {
+                    Ordering::Equal
+                }
+            })
             .then_with(|| self.author_draw_order.cmp(&other.author_draw_order))
     }
+}
+
+fn safe_camera_depth(depth: f32) -> f32 {
+    if depth.is_finite() { depth } else { 0.0 }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -597,25 +621,23 @@ pub struct MaterialPipelineKey {
 }
 
 impl MaterialPipelineKey {
-    /// Stage B has only depth-writing, unblended MToon surfaces.
-    pub const fn native_stage_b(
-        phase: RenderPhase,
-        double_sided: bool,
-        sample_count: u32,
-    ) -> Option<Self> {
-        match phase {
-            RenderPhase::Opaque | RenderPhase::Mask => Some(Self {
-                shading_model: PipelineShadingModel::Mtoon,
-                blend_depth_family: PipelineBlendDepthFamily::OpaqueOrMask,
-                cull_mode: if double_sided {
-                    PipelineCullMode::None
-                } else {
-                    PipelineCullMode::Back
-                },
-                render_pass: MaterialRenderPass::Surface,
-                sample_count,
-            }),
-            RenderPhase::MtoonBlendZWrite | RenderPhase::Blend => None,
+    /// Native Stage D supports every surface render mode. Queue offsets are
+    /// submission metadata and therefore deliberately absent from this key.
+    pub const fn native_stage_d(phase: RenderPhase, double_sided: bool, sample_count: u32) -> Self {
+        Self {
+            shading_model: PipelineShadingModel::Mtoon,
+            blend_depth_family: match phase {
+                RenderPhase::Opaque | RenderPhase::Mask => PipelineBlendDepthFamily::OpaqueOrMask,
+                RenderPhase::MtoonBlendZWrite => PipelineBlendDepthFamily::BlendDepthWrite,
+                RenderPhase::Blend => PipelineBlendDepthFamily::BlendNoDepthWrite,
+            },
+            cull_mode: if double_sided {
+                PipelineCullMode::None
+            } else {
+                PipelineCullMode::Back
+            },
+            render_pass: MaterialRenderPass::Surface,
+            sample_count,
         }
     }
 
@@ -861,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn render_phases_and_sort_keys_are_deterministic() {
+    fn render_phases_have_explicit_semantic_priority() {
         assert_eq!(
             RenderPhase::fallback(MaterialAlphaMode::Opaque),
             RenderPhase::Opaque
@@ -877,27 +899,105 @@ mod tests {
         assert_eq!(RenderPhase::Opaque.pass_class(), RenderPassClass::Solid);
         assert_eq!(RenderPhase::Mask.pass_class(), RenderPassClass::Solid);
 
-        let base = RenderSortKey {
+        let key = |phase, queue_offset| RenderSortKey {
+            phase,
+            queue_offset,
+            camera_depth: 0.0,
+            author_draw_order: 0,
+        };
+        assert_eq!(
+            key(RenderPhase::Opaque, i32::MAX).compare(&key(RenderPhase::Mask, i32::MIN)),
+            Ordering::Less,
+        );
+        assert_eq!(
+            key(RenderPhase::Mask, i32::MAX).compare(&key(RenderPhase::MtoonBlendZWrite, i32::MIN)),
+            Ordering::Less,
+        );
+        assert_eq!(
+            key(RenderPhase::MtoonBlendZWrite, i32::MAX)
+                .compare(&key(RenderPhase::Blend, i32::MIN)),
+            Ordering::Less,
+        );
+    }
+
+    #[test]
+    fn transparent_sort_uses_queue_then_back_to_front_then_stable_tie() {
+        let key = |queue_offset, camera_depth, author_draw_order| RenderSortKey {
+            phase: RenderPhase::Blend,
+            queue_offset,
+            camera_depth,
+            author_draw_order,
+        };
+        let near_early_queue = key(-1, 2.0, 0);
+        let far_late_queue = key(0, 20.0, 1);
+        assert_eq!(
+            near_early_queue.compare(&far_late_queue),
+            Ordering::Less,
+            "queue offset must outrank depth",
+        );
+
+        let near = key(0, 2.0, 0);
+        let far = key(0, 20.0, 1);
+        assert_eq!(far.compare(&near), Ordering::Less);
+        assert_eq!(near.compare(&far), Ordering::Greater);
+
+        let zwrite_near = RenderSortKey {
+            phase: RenderPhase::MtoonBlendZWrite,
+            ..near
+        };
+        let zwrite_far = RenderSortKey {
+            phase: RenderPhase::MtoonBlendZWrite,
+            ..far
+        };
+        assert_eq!(
+            zwrite_far.compare(&zwrite_near),
+            Ordering::Less,
+            "equal-queue BLEND+ZWrite must also draw back-to-front"
+        );
+
+        let first = key(0, 2.0, 4);
+        let second = key(0, 2.0, 5);
+        assert_eq!(first.compare(&second), Ordering::Less);
+        assert_eq!(first.compare(&first), Ordering::Equal);
+    }
+
+    #[test]
+    fn non_finite_transparent_depth_has_a_deterministic_safe_fallback() {
+        let key = |camera_depth, author_draw_order| RenderSortKey {
             phase: RenderPhase::Blend,
             queue_offset: 0,
-            camera_depth: 3.0,
-            author_draw_order: 4,
+            camera_depth,
+            author_draw_order,
         };
-        let same = RenderSortKey {
-            queue_offset: 0,
-            ..base
-        };
-        assert_eq!(base.compare(&same), Ordering::Equal);
-        let later = RenderSortKey {
-            author_draw_order: 5,
-            ..base
-        };
-        assert_eq!(base.compare(&later), Ordering::Less);
-        let queued = RenderSortKey {
-            queue_offset: 1,
-            ..base
-        };
-        assert_eq!(base.compare(&queued), Ordering::Less);
+        assert_eq!(key(f32::NAN, 2).compare(&key(0.0, 3)), Ordering::Less);
+        assert_eq!(
+            key(f32::INFINITY, 2).compare(&key(f32::NEG_INFINITY, 3)),
+            Ordering::Less,
+        );
+    }
+
+    #[test]
+    fn presentation_fade_only_overrides_authored_solid_phases() {
+        assert_eq!(
+            RenderPhase::Opaque.with_presentation_alpha(0.5),
+            RenderPhase::Blend
+        );
+        assert_eq!(
+            RenderPhase::Mask.with_presentation_alpha(0.5),
+            RenderPhase::Blend
+        );
+        assert_eq!(
+            RenderPhase::MtoonBlendZWrite.with_presentation_alpha(0.5),
+            RenderPhase::MtoonBlendZWrite
+        );
+        assert_eq!(
+            RenderPhase::Blend.with_presentation_alpha(0.5),
+            RenderPhase::Blend
+        );
+        assert_eq!(
+            RenderPhase::Mask.with_presentation_alpha(1.0),
+            RenderPhase::Mask
+        );
     }
 
     #[test]
@@ -912,14 +1012,27 @@ mod tests {
     }
 
     #[test]
-    fn stage_b_pipeline_key_only_accepts_solid_mtoon_surfaces() {
-        for phase in [RenderPhase::Opaque, RenderPhase::Mask] {
+    fn stage_d_pipeline_key_covers_four_phases_and_both_cull_modes() {
+        for phase in [
+            RenderPhase::Opaque,
+            RenderPhase::Mask,
+            RenderPhase::MtoonBlendZWrite,
+            RenderPhase::Blend,
+        ] {
             for double_sided in [false, true] {
-                let key = MaterialPipelineKey::native_stage_b(phase, double_sided, 4).unwrap();
+                let key = MaterialPipelineKey::native_stage_d(phase, double_sided, 4);
                 assert_eq!(key.shading_model, PipelineShadingModel::Mtoon);
                 assert_eq!(
                     key.blend_depth_family,
-                    PipelineBlendDepthFamily::OpaqueOrMask
+                    match phase {
+                        RenderPhase::Opaque | RenderPhase::Mask => {
+                            PipelineBlendDepthFamily::OpaqueOrMask
+                        }
+                        RenderPhase::MtoonBlendZWrite => {
+                            PipelineBlendDepthFamily::BlendDepthWrite
+                        }
+                        RenderPhase::Blend => PipelineBlendDepthFamily::BlendNoDepthWrite,
+                    }
                 );
                 assert_eq!(key.sample_count, 4);
                 assert_eq!(
@@ -932,10 +1045,6 @@ mod tests {
                 );
             }
         }
-        assert!(MaterialPipelineKey::native_stage_b(RenderPhase::Blend, false, 4).is_none());
-        assert!(
-            MaterialPipelineKey::native_stage_b(RenderPhase::MtoonBlendZWrite, true, 4).is_none()
-        );
         assert_eq!(
             MaterialPipelineKey::current_fallback(false, RenderPhase::Opaque, false, 4)
                 .shading_model,

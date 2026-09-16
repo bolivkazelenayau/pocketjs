@@ -8,7 +8,7 @@ use glam::{Mat4, Vec3};
 use crate::camera::Camera;
 use crate::gpu::{DEPTH_FORMAT, DepthTarget, Gpu};
 use crate::hud::{ATLAS_H, ATLAS_W, Hud, HudVertex, build_font_atlas};
-use crate::material::{MaterialPipelineKey, PipelineShadingModel, RenderPassClass};
+use crate::material::{MaterialPipelineKey, PipelineShadingModel, RenderPhase, RenderSortKey};
 use crate::model::{ModelAsset, ModelInstance, ModelVertex};
 use crate::scene::Scene;
 use crate::texture::{GpuTexture, Samplers, create_rgba_texture};
@@ -703,7 +703,7 @@ impl Renderer {
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         // Upload per-instance data (joint palettes etc.) before recording.
-        let (model_draws, viewmodel_draw) = self.models.prepare(gpu, scene);
+        let (model_draws, viewmodel_draw) = self.models.prepare(gpu, scene, camera);
         let sprite_verts = self.sprites.prepare(gpu, scene, camera);
 
         let mut encoder = gpu
@@ -790,7 +790,7 @@ impl Renderer {
                 }
             }
 
-            self.models.draw(&mut pass, &model_draws);
+            self.models.draw_scene(&mut pass, &model_draws);
             self.sprites.draw(&mut pass, sprite_verts);
         }
 
@@ -826,7 +826,8 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, &self.globals_bg, &[]);
-            self.models.draw(&mut pass, std::slice::from_ref(vm));
+            self.models
+                .draw_viewmodel(&mut pass, std::slice::from_ref(vm));
         }
 
         // Resolve the complete 3D image only after both 3D passes. The final
@@ -913,12 +914,30 @@ fn model_normal_matrix(model: Mat4) -> Mat4 {
     }
 }
 
+fn presentation_alpha(alpha: f32) -> f32 {
+    finite_or(alpha, 1.0).clamp(0.0, 1.0)
+}
+
+fn camera_relative_depth(camera: &Camera, model: Mat4, rest_bounds_center: Vec3) -> f32 {
+    let center = model.transform_point3(rest_bounds_center);
+    (center - camera.pos).dot(camera.forward())
+}
+
 pub(crate) struct ModelDraw {
     asset: std::sync::Arc<ModelAsset>,
     inst_offset: u32,
     joints_offset: u32,
+    model: Mat4,
+    presentation_alpha: f32,
     /// The instance's morph overlay buffer (wgpu buffers are ref-counted).
     morph: Option<wgpu::Buffer>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ModelSubmission {
+    draw_index: usize,
+    primitive_index: usize,
+    sort_key: RenderSortKey,
 }
 
 struct ModelPass {
@@ -927,10 +946,16 @@ struct ModelPass {
     opaque_double_sided: wgpu::RenderPipeline,
     blend: wgpu::RenderPipeline,
     blend_double_sided: wgpu::RenderPipeline,
+    blend_zwrite: wgpu::RenderPipeline,
+    blend_zwrite_double_sided: wgpu::RenderPipeline,
     mtoon_opaque: wgpu::RenderPipeline,
     mtoon_opaque_double_sided: wgpu::RenderPipeline,
     mtoon_mask: wgpu::RenderPipeline,
     mtoon_mask_double_sided: wgpu::RenderPipeline,
+    mtoon_blend_zwrite: wgpu::RenderPipeline,
+    mtoon_blend_zwrite_double_sided: wgpu::RenderPipeline,
+    mtoon_blend: wgpu::RenderPipeline,
+    mtoon_blend_double_sided: wgpu::RenderPipeline,
     material_layout: wgpu::BindGroupLayout,
     mtoon_material_layout: wgpu::BindGroupLayout,
     object_layout: wgpu::BindGroupLayout,
@@ -943,6 +968,8 @@ struct ModelPass {
     joints_buf: wgpu::Buffer,
     instance_capacity: u64,
     joints_capacity: u64,
+    scene_submissions: Vec<ModelSubmission>,
+    viewmodel_submissions: Vec<ModelSubmission>,
 }
 
 impl ModelPass {
@@ -1000,16 +1027,30 @@ impl ModelPass {
                 bind_group_layouts: &[globals_bgl, &mtoon_material_layout, &object_layout],
                 push_constant_ranges: &[],
             });
-        let (mtoon_opaque, mtoon_opaque_double_sided, mtoon_mask, mtoon_mask_double_sided) =
-            Self::create_mtoon_pipelines(
-                device,
-                color_format,
-                &mtoon_shader,
-                &mtoon_pipeline_layout,
-                sample_count,
-            );
-        let (opaque, opaque_double_sided, blend, blend_double_sided) =
-            Self::create_pipelines(device, color_format, &shader, &layout, sample_count);
+        let (
+            mtoon_opaque,
+            mtoon_opaque_double_sided,
+            mtoon_mask,
+            mtoon_mask_double_sided,
+            mtoon_blend_zwrite,
+            mtoon_blend_zwrite_double_sided,
+            mtoon_blend,
+            mtoon_blend_double_sided,
+        ) = Self::create_mtoon_pipelines(
+            device,
+            color_format,
+            &mtoon_shader,
+            &mtoon_pipeline_layout,
+            sample_count,
+        );
+        let (
+            opaque,
+            opaque_double_sided,
+            blend,
+            blend_double_sided,
+            blend_zwrite,
+            blend_zwrite_double_sided,
+        ) = Self::create_pipelines(device, color_format, &shader, &layout, sample_count);
 
         let instance_capacity = 64 * INSTANCE_STRIDE;
         let joints_capacity = 256 * 1024;
@@ -1023,10 +1064,16 @@ impl ModelPass {
             opaque_double_sided,
             blend,
             blend_double_sided,
+            blend_zwrite,
+            blend_zwrite_double_sided,
             mtoon_opaque,
             mtoon_opaque_double_sided,
             mtoon_mask,
             mtoon_mask_double_sided,
+            mtoon_blend_zwrite,
+            mtoon_blend_zwrite_double_sided,
+            mtoon_blend,
+            mtoon_blend_double_sided,
             material_layout,
             mtoon_material_layout,
             object_layout,
@@ -1039,6 +1086,8 @@ impl ModelPass {
             joints_buf,
             instance_capacity,
             joints_capacity,
+            scene_submissions: Vec::new(),
+            viewmodel_submissions: Vec::new(),
         }
     }
 
@@ -1049,6 +1098,8 @@ impl ModelPass {
         pipeline_layout: &wgpu::PipelineLayout,
         sample_count: u32,
     ) -> (
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
         wgpu::RenderPipeline,
         wgpu::RenderPipeline,
         wgpu::RenderPipeline,
@@ -1109,6 +1160,18 @@ impl ModelPass {
                 false,
                 None,
             ),
+            make_pipeline(
+                "model blend depth-write",
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+                true,
+                Some(wgpu::Face::Back),
+            ),
+            make_pipeline(
+                "model blend depth-write double-sided",
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+                true,
+                None,
+            ),
         )
     }
 
@@ -1123,8 +1186,15 @@ impl ModelPass {
         wgpu::RenderPipeline,
         wgpu::RenderPipeline,
         wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
+        wgpu::RenderPipeline,
     ) {
-        let make = |label: &str, double_sided: bool| {
+        let make = |label: &str,
+                    blend: Option<wgpu::BlendState>,
+                    depth_write_enabled: bool,
+                    double_sided: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
@@ -1140,7 +1210,7 @@ impl ModelPass {
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: color_format,
-                        blend: None,
+                        blend,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -1155,7 +1225,7 @@ impl ModelPass {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: DEPTH_FORMAT,
-                    depth_write_enabled: true,
+                    depth_write_enabled,
                     depth_compare: wgpu::CompareFunction::LessEqual,
                     stencil: Default::default(),
                     bias: Default::default(),
@@ -1166,10 +1236,34 @@ impl ModelPass {
             })
         };
         (
-            make("MToon opaque", false),
-            make("MToon opaque double-sided", true),
-            make("MToon mask", false),
-            make("MToon mask double-sided", true),
+            make("MToon opaque", None, true, false),
+            make("MToon opaque double-sided", None, true, true),
+            make("MToon mask", None, true, false),
+            make("MToon mask double-sided", None, true, true),
+            make(
+                "MToon blend depth-write",
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+                true,
+                false,
+            ),
+            make(
+                "MToon blend depth-write double-sided",
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+                true,
+                true,
+            ),
+            make(
+                "MToon blend",
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+                false,
+                false,
+            ),
+            make(
+                "MToon blend double-sided",
+                Some(wgpu::BlendState::ALPHA_BLENDING),
+                false,
+                true,
+            ),
         )
     }
 
@@ -1179,7 +1273,14 @@ impl ModelPass {
         color_format: wgpu::TextureFormat,
         sample_count: u32,
     ) {
-        let (opaque, opaque_double_sided, blend, blend_double_sided) = Self::create_pipelines(
+        let (
+            opaque,
+            opaque_double_sided,
+            blend,
+            blend_double_sided,
+            blend_zwrite,
+            blend_zwrite_double_sided,
+        ) = Self::create_pipelines(
             device,
             color_format,
             &self.shader,
@@ -1190,12 +1291,18 @@ impl ModelPass {
         self.opaque_double_sided = opaque_double_sided;
         self.blend = blend;
         self.blend_double_sided = blend_double_sided;
+        self.blend_zwrite = blend_zwrite;
+        self.blend_zwrite_double_sided = blend_zwrite_double_sided;
         self.sample_count = sample_count;
         (
             self.mtoon_opaque,
             self.mtoon_opaque_double_sided,
             self.mtoon_mask,
             self.mtoon_mask_double_sided,
+            self.mtoon_blend_zwrite,
+            self.mtoon_blend_zwrite_double_sided,
+            self.mtoon_blend,
+            self.mtoon_blend_double_sided,
         ) = Self::create_mtoon_pipelines(
             device,
             color_format,
@@ -1255,7 +1362,12 @@ impl ModelPass {
 
     /// Compute palettes + instance data for everything in the scene and
     /// upload once. Returns draw entries (scene models, viewmodel).
-    fn prepare(&mut self, gpu: &Gpu, scene: &Scene) -> (Vec<ModelDraw>, Option<ModelDraw>) {
+    fn prepare(
+        &mut self,
+        gpu: &Gpu,
+        scene: &Scene,
+        camera: &Camera,
+    ) -> (Vec<ModelDraw>, Option<ModelDraw>) {
         let all: Vec<&ModelInstance> = scene.models.iter().chain(scene.viewmodel.iter()).collect();
         if all.is_empty() {
             return (Vec::new(), None);
@@ -1267,10 +1379,13 @@ impl ModelPass {
         let mut palette: Vec<Mat4> = Vec::new();
 
         for (i, inst) in all.iter().enumerate() {
+            let presentation_alpha = presentation_alpha(inst.tint[3]);
+            let mut tint = inst.tint;
+            tint[3] = presentation_alpha;
             let raw = InstanceRaw {
                 model: inst.transform.to_cols_array_2d(),
                 normal_model: model_normal_matrix(inst.transform).to_cols_array_2d(),
-                tint: inst.tint,
+                tint,
                 params: [inst.lit, inst.cutout, 0.0, 0.0],
             };
             let off = i * INSTANCE_STRIDE as usize;
@@ -1305,6 +1420,8 @@ impl ModelPass {
                 asset: inst.asset.clone(),
                 inst_offset: off as u32,
                 joints_offset,
+                model: inst.transform,
+                presentation_alpha,
                 morph: inst.morph.as_ref().map(|m| m.buffer().clone()),
             });
         }
@@ -1344,108 +1461,139 @@ impl ModelPass {
         }
 
         let viewmodel = scene.viewmodel.is_some().then(|| draws.pop()).flatten();
+        Self::collect_submissions(&draws, camera, &mut self.scene_submissions);
+        Self::collect_submissions(
+            viewmodel.as_slice(),
+            camera,
+            &mut self.viewmodel_submissions,
+        );
         (draws, viewmodel)
     }
 
-    fn draw<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, draws: &'p [ModelDraw]) {
-        if draws.is_empty() {
-            return;
+    fn collect_submissions(
+        draws: &[ModelDraw],
+        camera: &Camera,
+        output: &mut Vec<ModelSubmission>,
+    ) {
+        output.clear();
+        let primitive_count = draws.iter().map(|draw| draw.asset.primitives.len()).sum();
+        output.reserve(primitive_count);
+        let mut author_draw_order = 0_u64;
+        for (draw_index, draw) in draws.iter().enumerate() {
+            if draw.presentation_alpha == 0.0 {
+                author_draw_order += draw.asset.primitives.len() as u64;
+                continue;
+            }
+            for (primitive_index, primitive) in draw.asset.primitives.iter().enumerate() {
+                let phase = primitive
+                    .render_phase
+                    .with_presentation_alpha(draw.presentation_alpha);
+                let camera_depth = if phase.pass_class() == crate::material::RenderPassClass::Blend
+                {
+                    camera_relative_depth(camera, draw.model, primitive.rest_bounds_center)
+                } else {
+                    0.0
+                };
+                output.push(ModelSubmission {
+                    draw_index,
+                    primitive_index,
+                    sort_key: RenderSortKey {
+                        phase,
+                        queue_offset: primitive.render_queue_offset,
+                        camera_depth,
+                        author_draw_order,
+                    },
+                });
+                author_draw_order += 1;
+            }
         }
-        self.draw_phase(pass, draws, RenderPassClass::Solid);
-        self.draw_phase(pass, draws, RenderPassClass::Blend);
+        output.sort_by(|left, right| left.sort_key.compare(&right.sort_key));
     }
 
-    /// Draw all opaque/masked primitives across all instances before any
-    /// blended primitive. Blend primitives keep depth testing but never write
-    /// depth; glTF authoring order is retained within each phase.
-    fn draw_phase<'p>(
+    fn draw_scene<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, draws: &'p [ModelDraw]) {
+        self.draw_submissions(pass, draws, &self.scene_submissions);
+    }
+
+    fn draw_viewmodel<'p>(&'p self, pass: &mut wgpu::RenderPass<'p>, draws: &'p [ModelDraw]) {
+        self.draw_submissions(pass, draws, &self.viewmodel_submissions);
+    }
+
+    /// Draw one globally ordered submission list. The scene list spans every
+    /// `ModelInstance`, so transparent primitives from separate assets sort
+    /// against each other rather than only within their source model.
+    fn draw_submissions<'p>(
         &'p self,
         pass: &mut wgpu::RenderPass<'p>,
         draws: &'p [ModelDraw],
-        pass_class: RenderPassClass,
+        submissions: &[ModelSubmission],
     ) {
-        for d in draws {
+        for submission in submissions {
+            let d = &draws[submission.draw_index];
+            let pi = submission.primitive_index;
+            let prim = &d.asset.primitives[pi];
             pass.set_bind_group(2, &self.object_bg, &[d.inst_offset, d.joints_offset]);
-            pass.set_vertex_buffer(0, d.asset.vbuf.slice(..));
             pass.set_index_buffer(d.asset.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-            let mut overlay_bound = false;
-            for (pi, prim) in d.asset.primitives.iter().enumerate() {
-                if prim.render_phase.pass_class() != pass_class {
-                    continue;
+            let phase = submission.sort_key.phase;
+            let pipeline_key = if prim.mtoon_bind_group.is_some() {
+                MaterialPipelineKey::native_stage_d(phase, prim.double_sided, self.sample_count)
+            } else {
+                MaterialPipelineKey::current_fallback(
+                    prim.unlit,
+                    phase,
+                    prim.double_sided,
+                    self.sample_count,
+                )
+            };
+            let pipeline = if pipeline_key.shading_model == PipelineShadingModel::Mtoon {
+                match (phase, prim.double_sided) {
+                    (RenderPhase::Opaque, false) => &self.mtoon_opaque,
+                    (RenderPhase::Opaque, true) => &self.mtoon_opaque_double_sided,
+                    (RenderPhase::Mask, false) => &self.mtoon_mask,
+                    (RenderPhase::Mask, true) => &self.mtoon_mask_double_sided,
+                    (RenderPhase::MtoonBlendZWrite, false) => &self.mtoon_blend_zwrite,
+                    (RenderPhase::MtoonBlendZWrite, true) => &self.mtoon_blend_zwrite_double_sided,
+                    (RenderPhase::Blend, false) => &self.mtoon_blend,
+                    (RenderPhase::Blend, true) => &self.mtoon_blend_double_sided,
                 }
-                let pipeline_key = if prim.mtoon_bind_group.is_some() {
-                    MaterialPipelineKey::native_stage_b(
-                        prim.render_phase,
-                        prim.double_sided,
-                        self.sample_count,
-                    )
-                    .expect("native MToon only supports OPAQUE/MASK")
-                } else {
-                    MaterialPipelineKey::current_fallback(
-                        prim.unlit,
-                        prim.render_phase,
-                        prim.double_sided,
-                        self.sample_count,
-                    )
-                };
-                let pipeline = if pipeline_key.shading_model == PipelineShadingModel::Mtoon {
-                    match (prim.alpha_mode, prim.double_sided) {
-                        (crate::material::MaterialAlphaMode::Opaque, false) => &self.mtoon_opaque,
-                        (crate::material::MaterialAlphaMode::Opaque, true) => {
-                            &self.mtoon_opaque_double_sided
-                        }
-                        (crate::material::MaterialAlphaMode::Mask, false) => &self.mtoon_mask,
-                        (crate::material::MaterialAlphaMode::Mask, true) => {
-                            &self.mtoon_mask_double_sided
-                        }
-                        (crate::material::MaterialAlphaMode::Blend, _) => {
-                            unreachable!("BLEND cannot use Stage B native pipeline")
-                        }
-                    }
-                } else {
-                    match (pass_class, prim.double_sided) {
-                        (RenderPassClass::Solid, false) => &self.opaque,
-                        (RenderPassClass::Solid, true) => &self.opaque_double_sided,
-                        (RenderPassClass::Blend, false) => &self.blend,
-                        (RenderPassClass::Blend, true) => &self.blend_double_sided,
-                    }
-                };
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(
-                    1,
-                    prim.mtoon_bind_group.as_deref().unwrap_or(&prim.bind_group),
-                    &[],
-                );
-                // Morphing primitives read vertices from the instance's
-                // overlay buffer; base_vertex redirects the shared indices.
-                let morph = d
-                    .morph
-                    .as_ref()
-                    .zip(d.asset.prim_morph.get(pi).copied().flatten());
-                match morph {
-                    Some((buf, (mi, pj))) => {
-                        let mp = &d.asset.morph_meshes[mi].prims[pj];
-                        if !overlay_bound {
-                            pass.set_vertex_buffer(0, buf.slice(..));
-                            overlay_bound = true;
-                        }
-                        pass.draw_indexed(
-                            prim.first_index..prim.first_index + prim.index_count,
-                            mp.overlay_offset as i32 - mp.vertex_base as i32,
-                            0..1,
-                        );
-                    }
-                    None => {
-                        if overlay_bound {
-                            pass.set_vertex_buffer(0, d.asset.vbuf.slice(..));
-                            overlay_bound = false;
-                        }
-                        pass.draw_indexed(
-                            prim.first_index..prim.first_index + prim.index_count,
-                            0,
-                            0..1,
-                        );
-                    }
+            } else {
+                match (phase, prim.double_sided) {
+                    (RenderPhase::Opaque | RenderPhase::Mask, false) => &self.opaque,
+                    (RenderPhase::Opaque | RenderPhase::Mask, true) => &self.opaque_double_sided,
+                    (RenderPhase::MtoonBlendZWrite, false) => &self.blend_zwrite,
+                    (RenderPhase::MtoonBlendZWrite, true) => &self.blend_zwrite_double_sided,
+                    (RenderPhase::Blend, false) => &self.blend,
+                    (RenderPhase::Blend, true) => &self.blend_double_sided,
+                }
+            };
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(
+                1,
+                prim.mtoon_bind_group.as_deref().unwrap_or(&prim.bind_group),
+                &[],
+            );
+            // Morphing primitives read vertices from the instance's overlay
+            // buffer; base_vertex redirects the shared indices.
+            let morph = d
+                .morph
+                .as_ref()
+                .zip(d.asset.prim_morph.get(pi).copied().flatten());
+            match morph {
+                Some((buf, (mi, pj))) => {
+                    let mp = &d.asset.morph_meshes[mi].prims[pj];
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw_indexed(
+                        prim.first_index..prim.first_index + prim.index_count,
+                        mp.overlay_offset as i32 - mp.vertex_base as i32,
+                        0..1,
+                    );
+                }
+                None => {
+                    pass.set_vertex_buffer(0, d.asset.vbuf.slice(..));
+                    pass.draw_indexed(
+                        prim.first_index..prim.first_index + prim.index_count,
+                        0,
+                        0..1,
+                    );
                 }
             }
         }
@@ -1915,6 +2063,7 @@ mod tests {
     use crate::camera::Camera;
     use crate::gpu::{Gpu, OFFSCREEN_FORMAT, OffscreenTarget};
     use crate::hud::Hud;
+    use crate::material::{RenderPhase, RenderSortKey};
     use crate::scene::Scene;
     use glam::{Quat, Vec3};
     #[cfg(not(target_arch = "wasm32"))]
@@ -1924,9 +2073,51 @@ mod tests {
     };
 
     use super::{
-        GlobalsRaw, InstanceRaw, RendererConfig, TargetResizePlan, model_normal_matrix,
-        sample_count_transition, select_effective_sample_count,
+        GlobalsRaw, InstanceRaw, RendererConfig, TargetResizePlan, camera_relative_depth,
+        model_normal_matrix, presentation_alpha, sample_count_transition,
+        select_effective_sample_count,
     };
+
+    #[test]
+    fn presentation_alpha_is_bounded_and_non_finite_is_opaque() {
+        assert_eq!(presentation_alpha(-1.0), 0.0);
+        assert_eq!(presentation_alpha(0.25), 0.25);
+        assert_eq!(presentation_alpha(2.0), 1.0);
+        assert_eq!(presentation_alpha(f32::NAN), 1.0);
+        assert_eq!(presentation_alpha(f32::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn camera_relative_depth_tracks_camera_movement_and_direction() {
+        let model = glam::Mat4::IDENTITY;
+        let forward = Camera::default();
+        let near_center = Vec3::new(0.0, 0.0, -1.0);
+        let far_center = Vec3::new(0.0, 0.0, -2.0);
+        assert_eq!(camera_relative_depth(&forward, model, far_center), 2.0);
+
+        let reversed = Camera {
+            pos: Vec3::new(0.0, 0.0, -3.0),
+            yaw: std::f32::consts::PI,
+            ..Camera::default()
+        };
+        assert_eq!(camera_relative_depth(&reversed, model, near_center), 2.0);
+
+        let key = |camera: &Camera, center, order| RenderSortKey {
+            phase: RenderPhase::Blend,
+            queue_offset: 0,
+            camera_depth: camera_relative_depth(camera, model, center),
+            author_draw_order: order,
+        };
+        assert_eq!(
+            key(&forward, far_center, 1).compare(&key(&forward, near_center, 0)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            key(&reversed, near_center, 0).compare(&key(&reversed, far_center, 1)),
+            std::cmp::Ordering::Less,
+            "moving through the layers and reversing the camera must reverse their draw order"
+        );
+    }
 
     #[test]
     fn default_config_preserves_public_api_defaults() {

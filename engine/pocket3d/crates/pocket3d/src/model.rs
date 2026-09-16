@@ -346,7 +346,7 @@ impl MtoonRaw {
                 (inputs.alpha_mode == MaterialAlphaMode::Mask) as u8 as f32,
                 inputs.alpha_cutoff,
                 inputs.double_sided as u8 as f32,
-                0.0,
+                (inputs.alpha_mode == MaterialAlphaMode::Blend) as u8 as f32,
             ],
             base_uv: MtoonUvRaw::from_texture(inputs.base_color_texture.as_ref()),
             normal_uv: MtoonUvRaw::from_texture(
@@ -374,18 +374,54 @@ impl MtoonRaw {
     }
 }
 
-fn native_stage_c_capable(material: &MaterialAsset) -> bool {
+fn native_stage_d_capable(material: &MaterialAsset) -> bool {
     let MaterialModel::Mtoon(mtoon) = &material.model else {
         return false;
     };
-    material.inputs.alpha_mode != MaterialAlphaMode::Blend
-        && mtoon.outline_width_mode == MtoonOutlineWidthMode::None
+    mtoon.outline_width_mode == MtoonOutlineWidthMode::None
         && mtoon.outline_width_factor == 0.0
         && mtoon.outline_width_multiply_texture.is_none()
         && mtoon.uv_animation_scroll_x_speed_factor == 0.0
         && mtoon.uv_animation_scroll_y_speed_factor == 0.0
         && mtoon.uv_animation_rotation_speed_factor == 0.0
-        && mtoon.render_queue_offset_number == 0
+}
+
+fn authored_render_phase(
+    alpha_mode: MaterialAlphaMode,
+    material: Option<&MaterialAsset>,
+) -> RenderPhase {
+    match alpha_mode {
+        MaterialAlphaMode::Opaque => RenderPhase::Opaque,
+        MaterialAlphaMode::Mask => RenderPhase::Mask,
+        MaterialAlphaMode::Blend => match material.map(|material| &material.model) {
+            Some(MaterialModel::Mtoon(mtoon)) if mtoon.transparent_with_z_write => {
+                RenderPhase::MtoonBlendZWrite
+            }
+            _ => RenderPhase::Blend,
+        },
+    }
+}
+
+fn authored_render_queue_offset(
+    alpha_mode: MaterialAlphaMode,
+    material: Option<&MaterialAsset>,
+) -> i32 {
+    if alpha_mode != MaterialAlphaMode::Blend {
+        return 0;
+    }
+    match material.map(|material| &material.model) {
+        Some(MaterialModel::Mtoon(mtoon)) => mtoon.render_queue_offset_number,
+        _ => 0,
+    }
+}
+
+fn aabb_center(aabb: (Vec3, Vec3)) -> Vec3 {
+    let center = (aabb.0 + aabb.1) * 0.5;
+    if center.is_finite() {
+        center
+    } else {
+        Vec3::ZERO
+    }
 }
 
 struct PrimitiveUpload {
@@ -402,6 +438,7 @@ struct PrimitiveUpload {
     material_role: Option<String>,
     texture_override: Option<usize>,
     material_index: Option<usize>,
+    rest_bounds_center: Vec3,
 }
 
 pub struct Primitive {
@@ -419,6 +456,11 @@ pub struct Primitive {
     pub material_role: Option<String>,
     pub material_index: Option<usize>,
     pub render_phase: RenderPhase,
+    pub render_queue_offset: i32,
+    /// Rest-pose object-space center used as the inexpensive transparent sort
+    /// representative. Skinning and morphing are intentionally not evaluated
+    /// on the CPU merely to sort a frame.
+    pub rest_bounds_center: Vec3,
     /// Kept alive explicitly alongside the bind group.
     #[allow(dead_code)]
     material_buf: wgpu::Buffer,
@@ -912,7 +954,7 @@ fn authored_materials(
                 if let Some(base) = descriptor.inputs.base_color_texture.as_ref() {
                     let selected = base.effective_tex_coord();
                     if !base.current_base_color_fallback_uv_supported()
-                        && !(native_mtoon && native_stage_c_capable(&authored))
+                        && !(native_mtoon && native_stage_d_capable(&authored))
                     {
                         bail!(
                             "MToon material {index} baseColorTexture selects TEXCOORD_{selected}, but the current unlit fallback samples only TEXCOORD_0 in {}",
@@ -1270,6 +1312,8 @@ impl ModelAsset {
                 material_role: None,
                 material_index: Some(0),
                 render_phase: RenderPhase::Opaque,
+                render_queue_offset: 0,
+                rest_bounds_center: aabb_center(aabb),
                 material_buf,
             }],
             materials: vec![MaterialAsset::pocket_lit(0, Some(label.to_owned()))],
@@ -1348,6 +1392,8 @@ impl ModelAsset {
                 material_role: None,
                 material_index: Some(0),
                 render_phase: RenderPhase::Opaque,
+                render_queue_offset: 0,
+                rest_bounds_center: aabb_center(aabb),
                 material_buf,
             }],
             materials: vec![MaterialAsset::pocket_lit(0, Some(label.to_owned()))],
@@ -1478,7 +1524,7 @@ impl ModelAsset {
         )
     }
 
-    /// Activate native Stage B+C surfaces when the authored material is eligible.
+    /// Activate native Stage B-D surfaces when the authored material is eligible.
     #[allow(clippy::too_many_arguments)]
     pub fn load_glb_bytes_opts_with_native_mtoon<I, S>(
         gpu: &Gpu,
@@ -1795,10 +1841,10 @@ impl ModelAsset {
             ));
             let mut authored_samplers = GltfSamplerCache::new();
             for material in &materials {
-                if !native_stage_c_capable(material) {
+                if !native_stage_d_capable(material) {
                     if material.kind() == crate::material::MaterialKind::Mtoon {
                         log::info!(
-                            "MToon material {} uses KHR_materials_unlit fallback: BLEND or later-pass properties",
+                            "MToon material {} uses KHR_materials_unlit fallback: unsupported later-stage properties",
                             material.gltf_material_index
                         );
                     }
@@ -2000,6 +2046,7 @@ impl ModelAsset {
                     continue;
                 };
                 let base = vertices.len() as u32;
+                let mut primitive_aabb = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
 
                 let positions: Vec<[f32; 3]> = pos_iter.collect();
                 let normals: Vec<[f32; 3]> = match reader.read_normals() {
@@ -2090,6 +2137,8 @@ impl ModelAsset {
                             }
                             aabb.0 = aabb.0.min(rest);
                             aabb.1 = aabb.1.max(rest);
+                            primitive_aabb.0 = primitive_aabb.0.min(rest);
+                            primitive_aabb.1 = primitive_aabb.1.max(rest);
                             let base = skin_base[si];
                             (
                                 [
@@ -2104,6 +2153,8 @@ impl ModelAsset {
                         None => {
                             aabb.0 = aabb.0.min(p);
                             aabb.1 = aabb.1.max(p);
+                            primitive_aabb.0 = primitive_aabb.0.min(p);
+                            primitive_aabb.1 = primitive_aabb.1.max(p);
                             ([0; 4], [1.0, 0.0, 0.0, 0.0])
                         }
                     };
@@ -2307,6 +2358,7 @@ impl ModelAsset {
                     material_role,
                     texture_override,
                     material_index,
+                    rest_bounds_center: aabb_center(primitive_aabb),
                 });
             }
         }
@@ -2469,6 +2521,7 @@ impl ModelAsset {
                 let label = meta.material_name.as_deref().unwrap_or("model material");
                 let (bind_group, material_buf) =
                     make_material_bind_group(gpu, layout, label, view, sampler, &material);
+                let authored_material = meta.material_index.and_then(|index| materials.get(index));
                 Primitive {
                     first_index: meta.first_index,
                     index_count: meta.index_count,
@@ -2485,20 +2538,12 @@ impl ModelAsset {
                     material_name: meta.material_name,
                     material_role: meta.material_role,
                     material_index: meta.material_index,
-                    render_phase: if meta
-                        .material_index
-                        .is_some_and(|index| mtoon_groups.contains_key(&index))
-                    {
-                        match meta.alpha_mode {
-                            MaterialAlphaMode::Opaque => RenderPhase::Opaque,
-                            MaterialAlphaMode::Mask => RenderPhase::Mask,
-                            MaterialAlphaMode::Blend => {
-                                unreachable!("BLEND is not native MToon capable")
-                            }
-                        }
-                    } else {
-                        RenderPhase::fallback(meta.alpha_mode)
-                    },
+                    render_phase: authored_render_phase(meta.alpha_mode, authored_material),
+                    render_queue_offset: authored_render_queue_offset(
+                        meta.alpha_mode,
+                        authored_material,
+                    ),
+                    rest_bounds_center: meta.rest_bounds_center,
                     material_buf,
                 }
             })
@@ -3281,7 +3326,7 @@ fn import_byte_images(
             inputs: descriptor.inputs.clone(),
             model: MaterialModel::Mtoon(Box::new(descriptor.mtoon.clone())),
         };
-        if !native_stage_c_capable(&authored) {
+        if !native_stage_d_capable(&authored) {
             continue;
         }
         for texture in [
@@ -3427,25 +3472,27 @@ mod tests {
     use std::path::Path;
 
     use base64::Engine as _;
-    use glam::{Quat, Vec3};
+    use glam::{Mat4, Quat, Vec3};
     use serde_json::{Value, json};
 
     use crate::anim::{AnimState, Channel, ChannelPath, Clip, Interpolation, NodeTrs, Skeleton};
     use crate::gpu::Gpu;
     use crate::material::{
-        GltfMagFilter, GltfMinFilter, GltfSampler, MaterialAsset, MaterialInputs, MaterialModel,
-        MtoonMaterial, MtoonMaterialDescriptor, MtoonOutlineWidthMode, ScaledTextureInfo,
-        TextureColorSpace, TextureInfo, TextureRole, TextureTransform,
+        GltfMagFilter, GltfMinFilter, GltfSampler, MaterialAlphaMode, MaterialAsset,
+        MaterialInputs, MaterialModel, MtoonMaterial, MtoonMaterialDescriptor,
+        MtoonOutlineWidthMode, RenderPhase, ScaledTextureInfo, TextureColorSpace, TextureInfo,
+        TextureRole, TextureTransform,
     };
     use crate::texture::{MipSemantic, Samplers};
 
     use super::{
         ByteImageBudget, MAX_BYTE_IMAGE_BYTES, MAX_BYTE_IMAGE_COUNT, MaterialBaseColorMode,
         MaterialRaw, ModelAsset, ModelLoadOptions, ModelTextureCacheKey, authored_materials,
-        cap_texture_rgba, find_node_named, import_glb_slice, import_glb_slice_with_options,
-        mtoon_texture_semantic, native_stage_c_capable, pocket3d_base_color_mode_from_extras,
-        pocket3d_role_from_extras, sample_node_transform, semantic_material_matches, to_rgba8,
-        validate_joint_palette_count, validate_model_input, validate_normalized_texcoord0,
+        authored_render_phase, authored_render_queue_offset, cap_texture_rgba, find_node_named,
+        import_glb_slice, import_glb_slice_with_options, mtoon_texture_semantic,
+        native_stage_d_capable, pocket3d_base_color_mode_from_extras, pocket3d_role_from_extras,
+        sample_node_transform, semantic_material_matches, to_rgba8, validate_joint_palette_count,
+        validate_model_input, validate_normalized_texcoord0,
     };
 
     fn glb_from_json(value: Value, bin: &[u8]) -> Vec<u8> {
@@ -3571,7 +3618,54 @@ mod tests {
         }
     }
 
+    fn stage_d_descriptor(
+        color: [f32; 3],
+        alpha_mode: MaterialAlphaMode,
+        alpha: f32,
+        transparent_with_z_write: bool,
+        render_queue_offset_number: i32,
+        double_sided: bool,
+    ) -> MtoonMaterialDescriptor {
+        let mut descriptor = stage_c_descriptor();
+        descriptor.inputs.alpha_mode = alpha_mode;
+        descriptor.inputs.alpha_cutoff = 0.5;
+        descriptor.inputs.base_color_factor = [1.0, 1.0, 1.0, alpha];
+        descriptor.inputs.emissive_factor = color;
+        descriptor.inputs.double_sided = double_sided;
+        descriptor.mtoon.transparent_with_z_write = transparent_with_z_write;
+        descriptor.mtoon.render_queue_offset_number = render_queue_offset_number;
+        descriptor
+    }
+
+    fn linear_srgb_byte(value: f32) -> u8 {
+        let encoded = if value <= 0.003_130_8 {
+            value * 12.92
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        };
+        (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
+    }
+
+    fn assert_linear_pixel(actual: [u8; 4], expected: [f32; 4]) {
+        let encoded = [
+            linear_srgb_byte(expected[0]),
+            linear_srgb_byte(expected[1]),
+            linear_srgb_byte(expected[2]),
+            (expected[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+        ];
+        for channel in 0..4 {
+            assert!(
+                (i16::from(actual[channel]) - i16::from(encoded[channel])).abs() <= 3,
+                "pixel {actual:?} differs from expected linear {expected:?} / encoded {encoded:?} at channel {channel}"
+            );
+        }
+    }
+
     fn stage_c_quad(backface: bool) -> Vec<u8> {
+        mtoon_quad(backface, "OPAQUE", true)
+    }
+
+    fn mtoon_quad(backface: bool, alpha_mode: &str, double_sided: bool) -> Vec<u8> {
         let mut bin = Vec::new();
         let mut views = Vec::new();
         let mut accessors = Vec::new();
@@ -3639,7 +3733,7 @@ mod tests {
                 "meshes":[{"primitives":[{"attributes":{
                     "POSITION":pos,"NORMAL":normal,"TEXCOORD_0":tex0,"TEXCOORD_1":tex1
                 },"material":0}]}],
-                "materials":[{"doubleSided":true,"extensions":{
+                "materials":[{"alphaMode":alpha_mode,"doubleSided":double_sided,"extensions":{
                     "KHR_materials_unlit":{},"VRMC_materials_mtoon":{"specVersion":"1.0"}
                 }}],
                 "extensionsUsed":["KHR_materials_unlit","VRMC_materials_mtoon"],
@@ -4533,21 +4627,80 @@ mod tests {
             inputs: descriptor.inputs,
             model: MaterialModel::Mtoon(Box::new(descriptor.mtoon)),
         };
-        assert!(native_stage_c_capable(&material));
+        assert!(native_stage_d_capable(&material));
         material.inputs.emissive_factor = [1.0, 0.0, 0.0];
-        assert!(native_stage_c_capable(&material));
+        assert!(native_stage_d_capable(&material));
         let MaterialModel::Mtoon(mtoon) = &mut material.model else {
             unreachable!()
         };
         mtoon.matcap_texture = Some(stage_c_texture(TextureRole::Matcap, 1));
         mtoon.parametric_rim_color_factor = [1.0; 3];
         mtoon.rim_multiply_texture = Some(stage_c_texture(TextureRole::RimMultiply, 2));
-        assert!(native_stage_c_capable(&material));
+        assert!(native_stage_d_capable(&material));
+        material.inputs.alpha_mode = MaterialAlphaMode::Blend;
+        let MaterialModel::Mtoon(mtoon) = &mut material.model else {
+            unreachable!()
+        };
+        mtoon.transparent_with_z_write = true;
+        mtoon.render_queue_offset_number = 4;
+        assert!(native_stage_d_capable(&material));
         let MaterialModel::Mtoon(mtoon) = &mut material.model else {
             unreachable!()
         };
         mtoon.outline_width_mode = MtoonOutlineWidthMode::WorldCoordinates;
-        assert!(!native_stage_c_capable(&material));
+        assert!(!native_stage_d_capable(&material));
+    }
+
+    #[test]
+    fn authored_render_metadata_classifies_mtoon_and_non_mtoon_transparency() {
+        let mut descriptor = stage_d_descriptor(
+            [1.0, 1.0, 1.0],
+            MaterialAlphaMode::Blend,
+            0.5,
+            true,
+            7,
+            false,
+        );
+        let mut mtoon = MaterialAsset {
+            gltf_material_index: 0,
+            name: None,
+            inputs: descriptor.inputs.clone(),
+            model: MaterialModel::Mtoon(Box::new(descriptor.mtoon.clone())),
+        };
+        assert_eq!(
+            authored_render_phase(MaterialAlphaMode::Blend, Some(&mtoon)),
+            RenderPhase::MtoonBlendZWrite
+        );
+        assert_eq!(
+            authored_render_queue_offset(MaterialAlphaMode::Blend, Some(&mtoon)),
+            7
+        );
+
+        descriptor.mtoon.transparent_with_z_write = false;
+        descriptor.mtoon.render_queue_offset_number = -6;
+        mtoon.model = MaterialModel::Mtoon(Box::new(descriptor.mtoon));
+        assert_eq!(
+            authored_render_phase(MaterialAlphaMode::Blend, Some(&mtoon)),
+            RenderPhase::Blend
+        );
+        assert_eq!(
+            authored_render_queue_offset(MaterialAlphaMode::Blend, Some(&mtoon)),
+            -6
+        );
+
+        let ordinary = MaterialAsset::pocket_lit(0, None);
+        assert_eq!(
+            authored_render_phase(MaterialAlphaMode::Blend, Some(&ordinary)),
+            RenderPhase::Blend
+        );
+        assert_eq!(
+            authored_render_queue_offset(MaterialAlphaMode::Blend, Some(&ordinary)),
+            0
+        );
+        assert_eq!(
+            authored_render_queue_offset(MaterialAlphaMode::Mask, Some(&mtoon)),
+            0
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -4686,6 +4839,199 @@ mod tests {
             .offset = [0.5, 0.0];
         let rim_black_mask = pixel(&rim, false, camera);
         assert!(rim_white_mask[0] > rim_black_mask[0]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stage_d_gpu_blend_order_depth_write_and_presentation_alpha() {
+        use crate::camera::Camera;
+        use crate::gpu::{OFFSCREEN_FORMAT, OffscreenTarget};
+        use crate::hud::Hud;
+        use crate::model::ModelInstance;
+        use crate::renderer::Renderer;
+        use crate::scene::Scene;
+
+        let gpu = Gpu::new_headless().expect("headless GPU is required for Stage D fixtures");
+        let mut renderer = Renderer::new(&gpu, OFFSCREEN_FORMAT).unwrap();
+        let camera = Camera {
+            pos: Vec3::new(0.0, 0.0, 3.0),
+            znear: 0.1,
+            zfar: 10.0,
+            ..Default::default()
+        };
+        let mut render = |layers: Vec<(MtoonMaterialDescriptor, bool, f32, [f32; 4])>| {
+            let mut scene = Scene {
+                transparent_clear: true,
+                ..Scene::default()
+            };
+            scene.sky.zenith = Vec3::ZERO;
+            scene.sky.horizon = Vec3::ZERO;
+            scene.lighting.sun_color = Vec3::ZERO;
+            scene.lighting.ambient = Vec3::ZERO;
+            for (descriptor, backface, z, tint) in layers {
+                let alpha_mode = match descriptor.inputs.alpha_mode {
+                    MaterialAlphaMode::Opaque => "OPAQUE",
+                    MaterialAlphaMode::Mask => "MASK",
+                    MaterialAlphaMode::Blend => "BLEND",
+                };
+                let bytes = mtoon_quad(backface, alpha_mode, descriptor.inputs.double_sided);
+                let asset = ModelAsset::load_glb_bytes_opts_with_native_mtoon(
+                    &gpu,
+                    &renderer.model_material_layout,
+                    &renderer.mtoon_material_layout,
+                    &renderer.samplers,
+                    &bytes,
+                    "stage-d-quad.glb",
+                    &ModelLoadOptions::default(),
+                    std::iter::empty::<&str>(),
+                    std::slice::from_ref(&descriptor),
+                )
+                .unwrap();
+                assert!(asset.primitives[0].mtoon_bind_group.is_some());
+                let mut instance = ModelInstance::new(asset);
+                instance.transform = Mat4::from_translation(Vec3::new(0.0, 0.0, z));
+                instance.tint = tint;
+                scene.models.push(instance);
+            }
+            let target = OffscreenTarget::new(&gpu, 64, 64);
+            renderer.render(
+                &gpu,
+                &target.view,
+                target.size,
+                &scene,
+                &camera,
+                &Hud::default(),
+            );
+            let rgba = target.read_rgba(&gpu).unwrap();
+            let offset = ((32 * 64 + 32) * 4) as usize;
+            let pixel = [
+                rgba[offset],
+                rgba[offset + 1],
+                rgba[offset + 2],
+                rgba[offset + 3],
+            ];
+            let coverage = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|sample| sample[3] != 0)
+                .count();
+            (pixel, coverage)
+        };
+        let blend = |color, queue| {
+            stage_d_descriptor(color, MaterialAlphaMode::Blend, 0.5, false, queue, true)
+        };
+
+        // Submitted near-first on purpose. Equal-queue global sorting across
+        // the two instances must draw the far red layer before near green.
+        let (ordinary, coverage) = render(vec![
+            (blend([0.0, 1.0, 0.0], 0), false, 0.5, [1.0; 4]),
+            (blend([1.0, 0.0, 0.0], 0), false, 0.0, [1.0; 4]),
+        ]);
+        assert!(coverage > 100);
+        assert_linear_pixel(ordinary, [0.25, 0.5, 0.0, 0.75]);
+
+        // Queue offset outranks depth: the farther red layer has the larger
+        // queue and therefore draws after the nearer green layer.
+        let (queued, _) = render(vec![
+            (blend([0.0, 1.0, 0.0], -1), false, 0.5, [1.0; 4]),
+            (blend([1.0, 0.0, 0.0], 0), false, 0.0, [1.0; 4]),
+        ]);
+        assert_linear_pixel(queued, [0.5, 0.25, 0.0, 0.75]);
+
+        // A front blended ZWrite layer runs in the earlier semantic phase and
+        // prevents the later ordinary transparent layer behind it from
+        // passing depth. It still blends rather than behaving as MASK/OPAQUE.
+        let zwrite_front = stage_d_descriptor(
+            [0.0, 1.0, 0.0],
+            MaterialAlphaMode::Blend,
+            0.5,
+            true,
+            0,
+            true,
+        );
+        let (with_zwrite, _) = render(vec![
+            (zwrite_front, false, 0.5, [1.0; 4]),
+            (blend([1.0, 0.0, 0.0], 0), false, 0.0, [1.0; 4]),
+        ]);
+        assert_linear_pixel(with_zwrite, [0.0, 0.5, 0.0, 0.5]);
+
+        // The same deliberately front-first queue arrangement without ZWrite
+        // lets the later layer behind contribute.
+        let (without_zwrite, _) = render(vec![
+            (blend([0.0, 1.0, 0.0], -1), false, 0.5, [1.0; 4]),
+            (blend([1.0, 0.0, 0.0], 0), false, 0.0, [1.0; 4]),
+        ]);
+        assert_linear_pixel(without_zwrite, [0.5, 0.25, 0.0, 0.75]);
+
+        // OPAQUE ignores authored base alpha but fades through the
+        // presentation blend path.
+        let opaque = stage_d_descriptor(
+            [1.0, 0.0, 0.0],
+            MaterialAlphaMode::Opaque,
+            0.1,
+            false,
+            0,
+            true,
+        );
+        let (faded_opaque, _) = render(vec![(opaque, false, 0.0, [1.0, 1.0, 1.0, 0.5])]);
+        assert_linear_pixel(faded_opaque, [0.5, 0.0, 0.0, 0.5]);
+
+        // MASK coverage is authored-alpha-only. A surviving texel becomes a
+        // presentation-alpha layer after cutoff; one below cutoff disappears.
+        let visible_mask = stage_d_descriptor(
+            [1.0, 0.0, 0.0],
+            MaterialAlphaMode::Mask,
+            0.75,
+            false,
+            0,
+            true,
+        );
+        let (faded_mask, faded_mask_coverage) =
+            render(vec![(visible_mask, false, 0.0, [1.0, 1.0, 1.0, 0.25])]);
+        assert!(faded_mask_coverage > 100);
+        assert_linear_pixel(faded_mask, [0.25, 0.0, 0.0, 0.25]);
+        let discarded_mask = stage_d_descriptor(
+            [1.0, 0.0, 0.0],
+            MaterialAlphaMode::Mask,
+            0.25,
+            false,
+            0,
+            true,
+        );
+        let (discarded, discarded_coverage) =
+            render(vec![(discarded_mask, false, 0.0, [1.0, 1.0, 1.0, 0.25])]);
+        assert_eq!(discarded, [0; 4]);
+        assert_eq!(discarded_coverage, 0);
+
+        // Authored BLEND multiplies authored and presentation alpha. A
+        // back-facing double-sided quad also proves the cull-free variant.
+        let authored_blend = stage_d_descriptor(
+            [0.0, 0.0, 1.0],
+            MaterialAlphaMode::Blend,
+            0.5,
+            false,
+            0,
+            true,
+        );
+        let (faded_blend, faded_blend_coverage) =
+            render(vec![(authored_blend, true, 0.0, [1.0, 1.0, 1.0, 0.5])]);
+        assert!(faded_blend_coverage > 100);
+        assert_linear_pixel(faded_blend, [0.0, 0.0, 0.25, 0.25]);
+
+        // Exact zero is a deterministic no-submit optimization and therefore
+        // cannot write depth, including for authored ZWrite materials.
+        let zero = stage_d_descriptor(
+            [1.0, 1.0, 1.0],
+            MaterialAlphaMode::Blend,
+            1.0,
+            true,
+            0,
+            true,
+        );
+        let (zero_pixel, zero_coverage) = render(vec![(zero, false, 0.5, [1.0, 1.0, 1.0, 0.0])]);
+        assert_eq!(zero_pixel, [0; 4]);
+        assert_eq!(zero_coverage, 0);
     }
 
     #[test]
