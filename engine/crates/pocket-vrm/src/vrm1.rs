@@ -329,17 +329,42 @@ pub struct Vrm1MorphTargetBind {
     pub index: usize,
     pub weight: f32,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vrm1MaterialColorBindType {
+    Color,
+    EmissionColor,
+    ShadeColor,
+    MatcapColor,
+    RimColor,
+    OutlineColor,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vrm1MaterialColorBind {
+    pub material: usize,
+    pub kind: Vrm1MaterialColorBindType,
+    pub target_value: [f32; 4],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vrm1TextureTransformBind {
+    pub material: usize,
+    pub scale: [f32; 2],
+    pub offset: [f32; 2],
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vrm1Expression {
     pub name: String,
     pub kind: Vrm1ExpressionKind,
     pub morph_target_binds: Vec<Vrm1MorphTargetBind>,
+    pub material_color_binds: Vec<Vrm1MaterialColorBind>,
+    pub texture_transform_binds: Vec<Vrm1TextureTransformBind>,
     pub is_binary: bool,
     pub override_blink: Vrm1ExpressionOverride,
     pub override_look_at: Vrm1ExpressionOverride,
     pub override_mouth: Vrm1ExpressionOverride,
-    pub has_material_color_binds: bool,
-    pub has_texture_transform_binds: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -488,7 +513,13 @@ impl Vrm1Doc {
             spring_bone_semantics,
             node_constraint,
             node_constraint_semantics,
-            expressions: parse_expressions(vrm)?,
+            expressions: parse_expressions(
+                vrm,
+                glb.json
+                    .get("materials")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
+            )?,
             has_expressions: vrm.contains_key("expressions"),
             look_at,
             has_first_person: optional_object(vrm, "firstPerson")?,
@@ -804,7 +835,10 @@ fn is_ancestor(a: usize, mut n: usize, p: &[Option<usize>]) -> bool {
     false
 }
 
-fn parse_expressions(vrm: &Map<String, Value>) -> Result<Vec<Vrm1Expression>> {
+fn parse_expressions(
+    vrm: &Map<String, Value>,
+    material_count: usize,
+) -> Result<Vec<Vrm1Expression>> {
     let Some(v) = vrm.get("expressions") else {
         return Ok(Vec::new());
     };
@@ -835,7 +869,7 @@ fn parse_expressions(vrm: &Map<String, Value>) -> Result<Vec<Vrm1Expression>> {
                     "custom VRM 1.0 expression name {name:?} conflicts with a preset"
                 )
             }
-            let binds = match x.get("morphTargetBinds") {
+            let morph_target_binds = match x.get("morphTargetBinds") {
                 None => Vec::new(),
                 Some(v) => {
                     let a = v.as_array().with_context(|| {
@@ -871,20 +905,100 @@ fn parse_expressions(vrm: &Map<String, Value>) -> Result<Vec<Vrm1Expression>> {
                         .collect::<Result<Vec<_>>>()?
                 }
             };
+            let material_color_binds = match x.get("materialColorBinds") {
+                None => Vec::new(),
+                Some(value) => value
+                    .as_array()
+                    .with_context(|| {
+                        format!("expression {name}.materialColorBinds must be an array")
+                    })?
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        let context = format!("expression {name}.materialColorBinds[{index}]");
+                        let bind = value
+                            .as_object()
+                            .with_context(|| format!("{context} must be an object"))?;
+                        let material = index_value(
+                            bind.get("material")
+                                .with_context(|| format!("{context} is missing material"))?,
+                            &format!("{context}.material"),
+                        )?;
+                        ensure!(
+                            material < material_count,
+                            "{context}.material index {material} is out of range for {material_count} materials"
+                        );
+                        let kind = match bind
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .with_context(|| format!("{context}.type must be a string"))?
+                        {
+                            "color" => Vrm1MaterialColorBindType::Color,
+                            "emissionColor" => Vrm1MaterialColorBindType::EmissionColor,
+                            "shadeColor" => Vrm1MaterialColorBindType::ShadeColor,
+                            "matcapColor" => Vrm1MaterialColorBindType::MatcapColor,
+                            "rimColor" => Vrm1MaterialColorBindType::RimColor,
+                            "outlineColor" => Vrm1MaterialColorBindType::OutlineColor,
+                            value => bail!("{context}.type has unknown value {value:?}"),
+                        };
+                        let target_value = required_f32_array::<4>(
+                            bind.get("targetValue")
+                                .with_context(|| format!("{context} is missing targetValue"))?,
+                            &format!("{context}.targetValue"),
+                        )?;
+                        Ok(Vrm1MaterialColorBind {
+                            material,
+                            kind,
+                            target_value,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            };
+            let texture_transform_binds = match x.get("textureTransformBinds") {
+                None => Vec::new(),
+                Some(value) => value
+                    .as_array()
+                    .with_context(|| {
+                        format!("expression {name}.textureTransformBinds must be an array")
+                    })?
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        let context = format!("expression {name}.textureTransformBinds[{index}]");
+                        let bind = value
+                            .as_object()
+                            .with_context(|| format!("{context} must be an object"))?;
+                        let material = index_value(
+                            bind.get("material")
+                                .with_context(|| format!("{context} is missing material"))?,
+                            &format!("{context}.material"),
+                        )?;
+                        ensure!(
+                            material < material_count,
+                            "{context}.material index {material} is out of range for {material_count} materials"
+                        );
+                        let scale = optional_f32_array::<2>(bind, "scale", &context)?
+                            .unwrap_or([1.0, 1.0]);
+                        let offset = optional_f32_array::<2>(bind, "offset", &context)?
+                            .unwrap_or([0.0, 0.0]);
+                        Ok(Vrm1TextureTransformBind {
+                            material,
+                            scale,
+                            offset,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            };
             out.push(Vrm1Expression {
                 name: name.clone(),
                 kind,
-                morph_target_binds: binds,
+                morph_target_binds,
+                material_color_binds,
+                texture_transform_binds,
                 is_binary: optional_bool(x, "isBinary", name)?.unwrap_or(false),
                 override_blink: parse_override(x, "overrideBlink", name)?,
                 override_look_at: parse_override(x, "overrideLookAt", name)?,
                 override_mouth: parse_override(x, "overrideMouth", name)?,
-                has_material_color_binds: optional_array_presence(x, "materialColorBinds", name)?,
-                has_texture_transform_binds: optional_array_presence(
-                    x,
-                    "textureTransformBinds",
-                    name,
-                )?,
             })
         }
     }
@@ -986,16 +1100,6 @@ fn parse_override(o: &Map<String, Value>, key: &str, name: &str) -> Result<Vrm1E
             v => bail!("expression {name}.{key} must be one of none, block, blend, got {v:?}"),
         },
     }
-}
-fn optional_array_presence(o: &Map<String, Value>, key: &str, name: &str) -> Result<bool> {
-    let Some(v) = o.get(key) else {
-        return Ok(false);
-    };
-    ensure!(
-        v.is_array(),
-        "expression {name}.{key} must be an array when present"
-    );
-    Ok(true)
 }
 fn parse_meta(v: &Map<String, Value>) -> Result<Vrm1Meta> {
     let m = v
@@ -1433,6 +1537,30 @@ fn number(v: &Value, context: &str) -> Result<f32> {
         "{context} must remain finite after f32 conversion"
     );
     Ok(n)
+}
+fn required_f32_array<const N: usize>(v: &Value, context: &str) -> Result<[f32; N]> {
+    let values = v
+        .as_array()
+        .with_context(|| format!("{context} must be an array"))?;
+    ensure!(
+        values.len() == N,
+        "{context} must contain exactly {N} numbers"
+    );
+    let mut result = [0.0; N];
+    for (index, value) in values.iter().enumerate() {
+        result[index] = number(value, &format!("{context}[{index}]"))?;
+    }
+    Ok(result)
+}
+fn optional_f32_array<const N: usize>(
+    object: &Map<String, Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<[f32; N]>> {
+    object
+        .get(key)
+        .map(|value| required_f32_array(value, &format!("{context}.{key}")))
+        .transpose()
 }
 fn required_f32(v: &Value, context: &str) -> Result<f32> {
     v.as_f64()
@@ -2009,7 +2137,7 @@ mod tests {
     }
 
     #[test]
-    fn expressions_retain_preset_custom_and_unsupported_semantics() {
+    fn expressions_retain_all_typed_bind_families_and_defaults() {
         let mut value = valid_document();
         value["extensions"]["VRMC_vrm"]["expressions"] = json!({
             "preset": {
@@ -2019,18 +2147,38 @@ mod tests {
                     "overrideBlink":"block",
                     "overrideLookAt":"blend",
                     "overrideMouth":"none",
-                    "materialColorBinds":[],
-                    "textureTransformBinds":[]
+                    "materialColorBinds":[
+                        {"material":0,"type":"color","targetValue":[0.1,0.2,0.3,0.4]},
+                        {"material":0,"type":"emissionColor","targetValue":[1.0,2.0,3.0,4.0]},
+                        {"material":0,"type":"shadeColor","targetValue":[0.2,0.3,0.4,0.5]},
+                        {"material":0,"type":"matcapColor","targetValue":[0.3,0.4,0.5,0.6]},
+                        {"material":0,"type":"rimColor","targetValue":[0.4,0.5,0.6,0.7]},
+                        {"material":0,"type":"outlineColor","targetValue":[0.5,0.6,0.7,0.8]}
+                    ],
+                    "textureTransformBinds":[
+                        {"material":0},
+                        {"material":0,"scale":[2.0,3.0],"offset":[0.25,-0.5]}
+                    ]
                 }
             },
             "custom": {
                 "MyFace": {
                     "morphTargetBinds":[{"node":3,"index":1,"weight":1.0}]
+                },
+                "materialOnly": {
+                    "materialColorBinds":[
+                        {"material":0,"type":"color","targetValue":[0.6,0.7,0.8,0.9]}
+                    ]
+                },
+                "textureOnly": {
+                    "textureTransformBinds":[
+                        {"material":0,"scale":[0.5,0.75],"offset":[0.1,0.2]}
+                    ]
                 }
             }
         });
         let doc = parse(value).unwrap();
-        assert_eq!(doc.expressions.len(), 2);
+        assert_eq!(doc.expressions.len(), 4);
         let blink = &doc.expressions[0];
         assert_eq!(blink.name, "blink");
         assert_eq!(blink.kind, Vrm1ExpressionKind::Preset);
@@ -2041,10 +2189,111 @@ mod tests {
         assert_eq!(blink.override_blink, Vrm1ExpressionOverride::Block);
         assert_eq!(blink.override_look_at, Vrm1ExpressionOverride::Blend);
         assert_eq!(blink.override_mouth, Vrm1ExpressionOverride::None);
-        assert!(blink.has_material_color_binds);
-        assert!(blink.has_texture_transform_binds);
-        assert_eq!(doc.expressions[1].kind, Vrm1ExpressionKind::Custom);
-        assert!(!doc.expressions[1].is_binary);
+        assert_eq!(blink.material_color_binds.len(), 6);
+        assert_eq!(
+            blink
+                .material_color_binds
+                .iter()
+                .map(|bind| bind.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                Vrm1MaterialColorBindType::Color,
+                Vrm1MaterialColorBindType::EmissionColor,
+                Vrm1MaterialColorBindType::ShadeColor,
+                Vrm1MaterialColorBindType::MatcapColor,
+                Vrm1MaterialColorBindType::RimColor,
+                Vrm1MaterialColorBindType::OutlineColor,
+            ]
+        );
+        assert_eq!(blink.material_color_binds[0].material, 0);
+        assert_eq!(
+            blink.material_color_binds[0].target_value,
+            [0.1, 0.2, 0.3, 0.4]
+        );
+        assert_eq!(blink.texture_transform_binds[0].scale, [1.0, 1.0]);
+        assert_eq!(blink.texture_transform_binds[0].offset, [0.0, 0.0]);
+        assert_eq!(blink.texture_transform_binds[1].scale, [2.0, 3.0]);
+        assert_eq!(blink.texture_transform_binds[1].offset, [0.25, -0.5]);
+        let face = doc
+            .expressions
+            .iter()
+            .find(|expression| expression.name == "MyFace")
+            .unwrap();
+        assert_eq!(face.kind, Vrm1ExpressionKind::Custom);
+        assert!(!face.is_binary);
+        assert_eq!(face.morph_target_binds.len(), 1);
+        assert!(face.material_color_binds.is_empty());
+        assert!(face.texture_transform_binds.is_empty());
+        let material_only = doc
+            .expressions
+            .iter()
+            .find(|expression| expression.name == "materialOnly")
+            .unwrap();
+        assert!(material_only.morph_target_binds.is_empty());
+        assert_eq!(material_only.material_color_binds.len(), 1);
+        assert!(material_only.texture_transform_binds.is_empty());
+        let texture_only = doc
+            .expressions
+            .iter()
+            .find(|expression| expression.name == "textureOnly")
+            .unwrap();
+        assert!(texture_only.morph_target_binds.is_empty());
+        assert!(texture_only.material_color_binds.is_empty());
+        assert_eq!(texture_only.texture_transform_binds.len(), 1);
+    }
+
+    #[test]
+    fn expression_material_binds_reject_malformed_values() {
+        let expression = |bind: Value, key: &str| {
+            let mut value = valid_document();
+            value["extensions"]["VRMC_vrm"]["expressions"] = json!({
+                "custom": {"materialOnly": {(key): [bind]}}
+            });
+            value
+        };
+
+        assert!(
+            parse(expression(
+                json!({"material":1,"type":"color","targetValue":[1.0,1.0,1.0,1.0]}),
+                "materialColorBinds"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(expression(
+                json!({"material":0,"type":"invalid","targetValue":[1.0,1.0,1.0,1.0]}),
+                "materialColorBinds"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(expression(
+                json!({"material":0,"type":"color","targetValue":[1.0,1.0,1.0]}),
+                "materialColorBinds"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(expression(
+                json!({"material":0,"type":"color","targetValue":[3.5e38_f64,1.0,1.0,1.0]}),
+                "materialColorBinds"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(expression(
+                json!({"material":0,"scale":[1.0,3.5e38_f64]}),
+                "textureTransformBinds"
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(expression(
+                json!({"material":0,"offset":[0.0]}),
+                "textureTransformBinds"
+            ))
+            .is_err()
+        );
     }
 
     #[test]

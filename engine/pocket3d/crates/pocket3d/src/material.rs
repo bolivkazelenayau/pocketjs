@@ -497,6 +497,15 @@ impl MaterialStateSet {
         self.states.get_mut(gltf_material_index)
     }
 
+    /// Restore all mutable values from immutable authored material data.
+    /// Expression composition calls this before accumulating base-relative
+    /// deltas, making results independent of expression order and frame history.
+    pub fn reset_from_assets(&mut self, materials: &[MaterialAsset]) {
+        self.states.clear();
+        self.states
+            .extend(materials.iter().map(MaterialAsset::authored_state));
+    }
+
     pub fn len(&self) -> usize {
         self.states.len()
     }

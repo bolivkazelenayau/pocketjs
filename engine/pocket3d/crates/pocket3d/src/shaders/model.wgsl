@@ -43,10 +43,9 @@ struct Material {
 
 @group(1) @binding(0) var t_albedo: texture_2d<f32>;
 @group(1) @binding(1) var s_albedo: sampler;
-@group(1) @binding(2) var<uniform> material: Material;
-
 @group(2) @binding(0) var<uniform> instance: Instance;
 @group(2) @binding(1) var<storage, read> joints: array<mat4x4f>;
+@group(2) @binding(2) var<uniform> material: Material;
 
 struct VsIn {
     @location(0) pos: vec3f,

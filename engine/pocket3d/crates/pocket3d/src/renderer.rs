@@ -9,13 +9,17 @@ use crate::camera::Camera;
 use crate::gpu::{DEPTH_FORMAT, DepthTarget, Gpu};
 use crate::hud::{ATLAS_H, ATLAS_W, Hud, HudVertex, build_font_atlas};
 use crate::material::{MaterialPipelineKey, PipelineShadingModel, RenderPhase, RenderSortKey};
-use crate::model::{ModelAsset, ModelInstance, ModelVertex};
+use crate::model::{MaterialInstanceRaw, ModelAsset, ModelInstance, ModelVertex};
 use crate::scene::Scene;
 use crate::texture::{GpuTexture, Samplers, create_rgba_texture};
 use crate::world::{WorldBatchKind, WorldVertex};
 
 fn finite_or(value: f32, fallback: f32) -> f32 {
     if value.is_finite() { value } else { fallback }
+}
+
+fn aligned_size(size: u64, alignment: u64) -> u64 {
+    size.div_ceil(alignment) * alignment
 }
 
 #[repr(C)]
@@ -937,6 +941,7 @@ pub(crate) struct ModelDraw {
     joints_offset: u32,
     model: Mat4,
     presentation_alpha: f32,
+    material_offsets: Vec<u32>,
     /// The instance's morph overlay buffer (wgpu buffers are ref-counted).
     morph: Option<wgpu::Buffer>,
 }
@@ -978,8 +983,11 @@ struct ModelPass {
     object_bg: wgpu::BindGroup,
     instance_buf: wgpu::Buffer,
     joints_buf: wgpu::Buffer,
+    material_instance_buf: wgpu::Buffer,
     instance_capacity: u64,
     joints_capacity: u64,
+    material_instance_capacity: u64,
+    material_instance_stride: u64,
     scene_submissions: Vec<ModelSubmission>,
     viewmodel_submissions: Vec<ModelSubmission>,
 }
@@ -1014,6 +1022,18 @@ impl ModelPass {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: true,
                         min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<
+                            MaterialInstanceRaw,
+                        >() as u64),
                     },
                     count: None,
                 },
@@ -1078,9 +1098,22 @@ impl ModelPass {
 
         let instance_capacity = 64 * INSTANCE_STRIDE;
         let joints_capacity = 256 * 1024;
+        let material_instance_stride = aligned_size(
+            std::mem::size_of::<MaterialInstanceRaw>() as u64,
+            device.limits().min_uniform_buffer_offset_alignment as u64,
+        );
+        let material_instance_capacity = 64 * material_instance_stride;
         let instance_buf = Self::make_instance_buf(device, instance_capacity);
         let joints_buf = Self::make_joints_buf(device, joints_capacity);
-        let object_bg = Self::make_object_bg(device, &object_layout, &instance_buf, &joints_buf);
+        let material_instance_buf =
+            Self::make_material_instance_buf(device, material_instance_capacity);
+        let object_bg = Self::make_object_bg(
+            device,
+            &object_layout,
+            &instance_buf,
+            &joints_buf,
+            &material_instance_buf,
+        );
 
         Self {
             sample_count,
@@ -1112,8 +1145,11 @@ impl ModelPass {
             object_bg,
             instance_buf,
             joints_buf,
+            material_instance_buf,
             instance_capacity,
             joints_capacity,
+            material_instance_capacity,
+            material_instance_stride,
             scene_submissions: Vec::new(),
             viewmodel_submissions: Vec::new(),
         }
@@ -1435,11 +1471,21 @@ impl ModelPass {
         })
     }
 
+    fn make_material_instance_buf(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("model instance materials"),
+            size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
     fn make_object_bg(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         instances: &wgpu::Buffer,
         joints: &wgpu::Buffer,
+        materials: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("model object bg"),
@@ -1461,6 +1507,16 @@ impl ModelPass {
                         size: wgpu::BufferSize::new(JOINT_WINDOW),
                     }),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: materials,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(
+                            std::mem::size_of::<MaterialInstanceRaw>() as u64
+                        ),
+                    }),
+                },
             ],
         })
     }
@@ -1480,6 +1536,7 @@ impl ModelPass {
 
         let mut inst_bytes = vec![0u8; all.len() * INSTANCE_STRIDE as usize];
         let mut joint_bytes: Vec<u8> = Vec::with_capacity(all.len() * 64 * 4);
+        let mut material_bytes = Vec::new();
         let mut draws = Vec::with_capacity(all.len());
         let mut palette: Vec<Mat4> = Vec::new();
 
@@ -1521,12 +1578,26 @@ impl ModelPass {
                 % JOINT_ALIGN as usize;
             joint_bytes.extend(std::iter::repeat_n(0u8, pad));
 
+            let material_offsets = (0..inst.asset.primitives.len())
+                .map(|primitive_index| {
+                    let offset = material_bytes.len();
+                    material_bytes.resize(offset + self.material_instance_stride as usize, 0);
+                    let raw = inst
+                        .asset
+                        .instance_material_raw(primitive_index, &inst.materials);
+                    let bytes = bytemuck::bytes_of(&raw);
+                    material_bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+                    offset as u32
+                })
+                .collect();
+
             draws.push(ModelDraw {
                 asset: inst.asset.clone(),
                 inst_offset: off as u32,
                 joints_offset,
                 model: inst.transform,
                 presentation_alpha,
+                material_offsets,
                 morph: inst.morph.as_ref().map(|m| m.buffer().clone()),
             });
         }
@@ -1552,17 +1623,28 @@ impl ModelPass {
             self.joints_buf = Self::make_joints_buf(device, self.joints_capacity);
             recreate = true;
         }
+        if material_bytes.len() as u64 > self.material_instance_capacity {
+            self.material_instance_capacity = (material_bytes.len() as u64).next_power_of_two();
+            self.material_instance_buf =
+                Self::make_material_instance_buf(device, self.material_instance_capacity);
+            recreate = true;
+        }
         if recreate {
             self.object_bg = Self::make_object_bg(
                 device,
                 &self.object_layout,
                 &self.instance_buf,
                 &self.joints_buf,
+                &self.material_instance_buf,
             );
         }
         gpu.queue.write_buffer(&self.instance_buf, 0, &inst_bytes);
         if !joint_bytes.is_empty() {
             gpu.queue.write_buffer(&self.joints_buf, 0, &joint_bytes);
+        }
+        if !material_bytes.is_empty() {
+            gpu.queue
+                .write_buffer(&self.material_instance_buf, 0, &material_bytes);
         }
 
         let viewmodel = scene.viewmodel.is_some().then(|| draws.pop()).flatten();
@@ -1636,7 +1718,11 @@ impl ModelPass {
             let d = &draws[submission.draw_index];
             let pi = submission.primitive_index;
             let prim = &d.asset.primitives[pi];
-            pass.set_bind_group(2, &self.object_bg, &[d.inst_offset, d.joints_offset]);
+            pass.set_bind_group(
+                2,
+                &self.object_bg,
+                &[d.inst_offset, d.joints_offset, d.material_offsets[pi]],
+            );
             pass.set_index_buffer(d.asset.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             let phase = submission.sort_key.phase;
             let pipeline_key = if prim.mtoon_bind_group.is_some() {

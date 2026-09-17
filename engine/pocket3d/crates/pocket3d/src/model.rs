@@ -272,6 +272,33 @@ impl MtoonUvRaw {
             ],
         }
     }
+
+    fn from_instance(
+        texture: Option<&TextureInfo>,
+        state: &crate::material::MaterialState,
+    ) -> Self {
+        let mut transform = texture.map(|texture| texture.transform).unwrap_or_default();
+        if let Some(texture) = texture
+            && let Some(instance_transform) = state.texture_transforms.get(&texture.role)
+        {
+            transform.scale = instance_transform.scale;
+            transform.offset = instance_transform.offset;
+        }
+        Self {
+            scale_rotation: [
+                transform.scale[0],
+                transform.scale[1],
+                transform.rotation.cos(),
+                transform.rotation.sin(),
+            ],
+            offset_set: [
+                transform.offset[0],
+                transform.offset[1],
+                texture.map(TextureInfo::effective_tex_coord).unwrap_or(0) as f32,
+                0.0,
+            ],
+        }
+    }
 }
 
 #[repr(C)]
@@ -408,6 +435,188 @@ impl MtoonRaw {
     }
 }
 
+/// One complete material record uploaded into a renderer-owned dynamic
+/// uniform slot for a single model instance and primitive. The first three
+/// vectors are the generic material layout; native MToon consumes the full
+/// record. Raster state and texture resources remain authored asset data.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub(crate) struct MaterialInstanceRaw {
+    base_color_factor: [f32; 4],
+    params: [f32; 4],
+    style: [f32; 4],
+    shade_color_factor: [f32; 4],
+    emissive_factor: [f32; 4],
+    matcap_factor: [f32; 4],
+    rim_color_factor: [f32; 4],
+    rim_params: [f32; 4],
+    surface: [f32; 4],
+    alpha: [f32; 4],
+    outline_color_factor: [f32; 4],
+    outline: [f32; 4],
+    base_uv: MtoonUvRaw,
+    normal_uv: MtoonUvRaw,
+    shade_uv: MtoonUvRaw,
+    shift_uv: MtoonUvRaw,
+    emissive_uv: MtoonUvRaw,
+    rim_uv: MtoonUvRaw,
+    outline_uv: MtoonUvRaw,
+    uv_animation_mask_uv: MtoonUvRaw,
+    texture_scales: [f32; 4],
+    uv_animation: [f32; 4],
+}
+
+impl MaterialInstanceRaw {
+    fn from_primitive(
+        asset: &ModelAsset,
+        primitive: &Primitive,
+        states: &MaterialStateSet,
+    ) -> Self {
+        let state = primitive.material_index.and_then(|index| states.get(index));
+        let base_color_factor = state
+            .map(|state| state.base_color_factor)
+            .unwrap_or(primitive.base_color_factor);
+        let generic = Self {
+            base_color_factor,
+            params: [
+                primitive.unlit as u8 as f32,
+                if primitive.alpha_mode == MaterialAlphaMode::Mask {
+                    primitive.alpha_cutoff
+                } else {
+                    0.0
+                },
+                primitive.double_sided as u8 as f32,
+                (primitive.alpha_mode == MaterialAlphaMode::Blend) as u8 as f32,
+            ],
+            style: [
+                (primitive.base_color_mode == MaterialBaseColorMode::Monochrome) as u8 as f32,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            ..Zeroable::zeroed()
+        };
+        let Some(material_index) = primitive.material_index else {
+            return generic;
+        };
+        let Some(material) = asset.materials.get(material_index) else {
+            return generic;
+        };
+        let MaterialModel::Mtoon(mtoon) = &material.model else {
+            return generic;
+        };
+        let Some(state) = state else {
+            return generic;
+        };
+        let Some(mtoon_state) = state.mtoon.as_ref() else {
+            return generic;
+        };
+        let inputs = &material.inputs;
+        Self {
+            shade_color_factor: [
+                mtoon_state.shade_color_factor[0],
+                mtoon_state.shade_color_factor[1],
+                mtoon_state.shade_color_factor[2],
+                1.0,
+            ],
+            emissive_factor: [
+                state.emissive_factor[0],
+                state.emissive_factor[1],
+                state.emissive_factor[2],
+                0.0,
+            ],
+            matcap_factor: [
+                mtoon_state.matcap_factor[0],
+                mtoon_state.matcap_factor[1],
+                mtoon_state.matcap_factor[2],
+                0.0,
+            ],
+            rim_color_factor: [
+                mtoon_state.parametric_rim_color_factor[0],
+                mtoon_state.parametric_rim_color_factor[1],
+                mtoon_state.parametric_rim_color_factor[2],
+                0.0,
+            ],
+            rim_params: [
+                mtoon.parametric_rim_fresnel_power_factor,
+                mtoon.parametric_rim_lift_factor,
+                mtoon.rim_lighting_mix_factor,
+                0.0,
+            ],
+            surface: [
+                mtoon.shading_shift_factor,
+                mtoon.shading_toony_factor,
+                mtoon.gi_equalization_factor,
+                inputs
+                    .normal_texture
+                    .as_ref()
+                    .map_or(0.0, |normal| normal.scale),
+            ],
+            alpha: [
+                (inputs.alpha_mode == MaterialAlphaMode::Mask) as u8 as f32,
+                inputs.alpha_cutoff,
+                inputs.double_sided as u8 as f32,
+                (inputs.alpha_mode == MaterialAlphaMode::Blend) as u8 as f32,
+            ],
+            outline_color_factor: [
+                mtoon_state.outline_color_factor[0],
+                mtoon_state.outline_color_factor[1],
+                mtoon_state.outline_color_factor[2],
+                0.0,
+            ],
+            outline: [
+                match mtoon.outline_width_mode {
+                    MtoonOutlineWidthMode::None => 0.0,
+                    MtoonOutlineWidthMode::WorldCoordinates => 1.0,
+                    MtoonOutlineWidthMode::ScreenCoordinates => 2.0,
+                },
+                mtoon.outline_width_factor,
+                mtoon.outline_lighting_mix_factor,
+                0.0,
+            ],
+            base_uv: MtoonUvRaw::from_instance(inputs.base_color_texture.as_ref(), state),
+            normal_uv: MtoonUvRaw::from_instance(
+                inputs.normal_texture.as_ref().map(|normal| &normal.texture),
+                state,
+            ),
+            shade_uv: MtoonUvRaw::from_instance(mtoon.shade_multiply_texture.as_ref(), state),
+            shift_uv: MtoonUvRaw::from_instance(
+                mtoon
+                    .shading_shift_texture
+                    .as_ref()
+                    .map(|shift| &shift.texture),
+                state,
+            ),
+            emissive_uv: MtoonUvRaw::from_instance(inputs.emissive_texture.as_ref(), state),
+            rim_uv: MtoonUvRaw::from_instance(mtoon.rim_multiply_texture.as_ref(), state),
+            outline_uv: MtoonUvRaw::from_instance(
+                mtoon.outline_width_multiply_texture.as_ref(),
+                state,
+            ),
+            uv_animation_mask_uv: MtoonUvRaw::from_instance(
+                mtoon.uv_animation_mask_texture.as_ref(),
+                state,
+            ),
+            texture_scales: [
+                mtoon
+                    .shading_shift_texture
+                    .as_ref()
+                    .map_or(0.0, |shift| shift.scale),
+                0.0,
+                0.0,
+                0.0,
+            ],
+            uv_animation: [
+                mtoon.uv_animation_scroll_x_speed_factor,
+                mtoon.uv_animation_scroll_y_speed_factor,
+                mtoon.uv_animation_rotation_speed_factor,
+                0.0,
+            ],
+            ..generic
+        }
+    }
+}
+
 fn native_stage_f_capable(material: &MaterialAsset) -> bool {
     matches!(material.model, MaterialModel::Mtoon(_))
 }
@@ -484,6 +693,8 @@ pub struct Primitive {
     pub mtoon_bind_group: Option<Arc<wgpu::BindGroup>>,
     /// Stage-E inverted hull is emitted immediately after this surface draw.
     pub mtoon_outline: bool,
+    /// Authored fallback factor retained for per-instance material uploads.
+    pub base_color_factor: [f32; 4],
     pub alpha_mode: MaterialAlphaMode,
     pub alpha_cutoff: f32,
     pub double_sided: bool,
@@ -1139,6 +1350,14 @@ impl ModelAsset {
         &self.materials
     }
 
+    pub(crate) fn instance_material_raw(
+        &self,
+        primitive_index: usize,
+        states: &MaterialStateSet,
+    ) -> MaterialInstanceRaw {
+        MaterialInstanceRaw::from_primitive(self, &self.primitives[primitive_index], states)
+    }
+
     /// Return the glTF node index for `name`.
     ///
     /// Node indices address [`Self::skeleton`] and can be sampled with
@@ -1390,6 +1609,7 @@ impl ModelAsset {
                 bind_group,
                 mtoon_bind_group: None,
                 mtoon_outline: false,
+                base_color_factor: material.base_color_factor,
                 alpha_mode: MaterialAlphaMode::Opaque,
                 alpha_cutoff: 0.0,
                 double_sided: false,
@@ -1471,6 +1691,7 @@ impl ModelAsset {
                 bind_group,
                 mtoon_bind_group: None,
                 mtoon_outline: false,
+                base_color_factor: material.base_color_factor,
                 alpha_mode: MaterialAlphaMode::Opaque,
                 alpha_cutoff: 0.0,
                 double_sided: false,
@@ -2649,6 +2870,7 @@ impl ModelAsset {
                     bind_group,
                     mtoon_bind_group,
                     mtoon_outline,
+                    base_color_factor: meta.base_color_factor,
                     alpha_mode: meta.alpha_mode,
                     alpha_cutoff: meta.alpha_cutoff,
                     double_sided: meta.double_sided,
@@ -3830,6 +4052,22 @@ mod tests {
         double_sided: bool,
         vertex_normal: [f32; 3],
     ) -> Vec<u8> {
+        mtoon_quad_with_normal_and_primitive_count(
+            backface,
+            alpha_mode,
+            double_sided,
+            vertex_normal,
+            1,
+        )
+    }
+
+    fn mtoon_quad_with_normal_and_primitive_count(
+        backface: bool,
+        alpha_mode: &str,
+        double_sided: bool,
+        vertex_normal: [f32; 3],
+        primitive_count: usize,
+    ) -> Vec<u8> {
         let mut bin = Vec::new();
         let mut views = Vec::new();
         let mut accessors = Vec::new();
@@ -3903,9 +4141,9 @@ mod tests {
                 "asset":{"version":"2.0"},
                 "scene":0,"scenes":[{"nodes":[0]}],
                 "nodes":[{"mesh":0}],
-                "meshes":[{"primitives":[{"attributes":{
+                "meshes":[{"primitives":(0..primitive_count).map(|_| json!({"attributes":{
                     "POSITION":pos,"NORMAL":normal,"TEXCOORD_0":tex0,"TEXCOORD_1":tex1
-                },"material":0}]}],
+                },"material":0})).collect::<Vec<_>>()}],
                 "materials":[{"alphaMode":alpha_mode,"doubleSided":double_sided,"extensions":{
                     "KHR_materials_unlit":{},"VRMC_materials_mtoon":{"specVersion":"1.0"}
                 }}],
@@ -4719,6 +4957,8 @@ mod tests {
     fn material_uniform_has_portable_uniform_alignment() {
         assert_eq!(std::mem::size_of::<MaterialRaw>(), 48);
         assert_eq!(std::mem::align_of::<MaterialRaw>(), 4);
+        assert_eq!(std::mem::size_of::<super::MaterialInstanceRaw>(), 480);
+        assert_eq!(std::mem::align_of::<super::MaterialInstanceRaw>(), 4);
     }
 
     #[test]
@@ -4963,6 +5203,486 @@ mod tests {
         assert!(!shader.contains("animated_transformed_uv(in, material.matcap"));
         assert!(!shader.contains("clamp(animated_uv"));
         assert!(!shader.contains("fract(animated_uv"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stage_g_gpu_material_state_covers_colors_alpha_transforms_and_instance_isolation() {
+        use crate::camera::Camera;
+        use crate::gpu::{OFFSCREEN_FORMAT, OffscreenTarget};
+        use crate::hud::Hud;
+        use crate::model::ModelInstance;
+        use crate::renderer::Renderer;
+        use crate::scene::Scene;
+
+        let gpu = Gpu::new_headless().expect("headless GPU is required for Stage G fixtures");
+        let mut renderer = Renderer::new(&gpu, OFFSCREEN_FORMAT).unwrap();
+        let camera = Camera {
+            pos: Vec3::new(0.0, 0.0, 3.0),
+            znear: 0.1,
+            zfar: 10.0,
+            ..Default::default()
+        };
+        let center = |rgba: &[u8]| {
+            let offset = (32 * 64 + 32) * 4;
+            [
+                rgba[offset],
+                rgba[offset + 1],
+                rgba[offset + 2],
+                rgba[offset + 3],
+            ]
+        };
+        let changed_pixels = |a: &[u8], b: &[u8]| {
+            a.as_chunks::<4>()
+                .0
+                .iter()
+                .zip(b.as_chunks::<4>().0)
+                .filter(|(a, b)| a != b)
+                .count()
+        };
+        let mut render = |descriptor: &MtoonMaterialDescriptor,
+                          update: &dyn Fn(&mut ModelInstance),
+                          time: f32,
+                          tint_alpha: f32| {
+            let alpha_mode = match descriptor.inputs.alpha_mode {
+                MaterialAlphaMode::Opaque => "OPAQUE",
+                MaterialAlphaMode::Mask => "MASK",
+                MaterialAlphaMode::Blend => "BLEND",
+            };
+            let bytes = mtoon_quad(true, alpha_mode, descriptor.inputs.double_sided);
+            let asset = ModelAsset::load_glb_bytes_opts_with_native_mtoon(
+                &gpu,
+                &renderer.model_material_layout,
+                &renderer.mtoon_material_layout,
+                &renderer.samplers,
+                &bytes,
+                "stage-g-material-expression.glb",
+                &ModelLoadOptions::default(),
+                std::iter::empty::<&str>(),
+                std::slice::from_ref(descriptor),
+            )
+            .unwrap();
+            let mut instance = ModelInstance::new(asset);
+            update(&mut instance);
+            instance.tint[3] = tint_alpha;
+            let mut scene = Scene::default();
+            scene.draw_sky = false;
+            scene.transparent_clear = true;
+            scene.sky.zenith = Vec3::ZERO;
+            scene.sky.horizon = Vec3::ZERO;
+            scene.lighting.sun_dir = Vec3::new(-0.6, 0.0, -0.8);
+            scene.lighting.sun_color = Vec3::splat(0.8);
+            scene.lighting.ambient = Vec3::splat(0.2);
+            scene.time = time;
+            scene.models.push(instance);
+            let target = OffscreenTarget::new(&gpu, 64, 64);
+            renderer.render(
+                &gpu,
+                &target.view,
+                target.size,
+                &scene,
+                &camera,
+                &Hud::default(),
+            );
+            target.read_rgba(&gpu).unwrap()
+        };
+
+        // Color factors use the same dynamic instance slot. Base color covers
+        // endpoint weights 0, 0.5 and 1; the parent expression tests cover the
+        // exact base-relative composition producing these state values.
+        let mut base = stage_c_descriptor();
+        base.inputs.base_color_factor = [0.0, 0.0, 0.0, 1.0];
+        base.mtoon.matcap_factor = [0.0; 3];
+        base.mtoon.shading_shift_factor = 2.0;
+        let base_zero = render(&base, &|_| {}, 0.0, 1.0);
+        let base_half = render(
+            &base,
+            &|instance| {
+                instance.materials.get_mut(0).unwrap().base_color_factor = [0.5, 0.0, 0.0, 1.0];
+            },
+            0.0,
+            1.0,
+        );
+        let base_full = render(
+            &base,
+            &|instance| {
+                instance.materials.get_mut(0).unwrap().base_color_factor = [1.0, 0.0, 0.0, 1.0];
+            },
+            0.0,
+            1.0,
+        );
+        let [zero_r, _, _, _] = center(&base_zero);
+        let [half_r, _, _, _] = center(&base_half);
+        let [full_r, _, _, _] = center(&base_full);
+        assert!(
+            zero_r < half_r && half_r < full_r,
+            "base endpoints did not order"
+        );
+
+        let mut emission = base.clone();
+        emission.mtoon.shading_shift_factor = 0.0;
+        let emission_zero = render(&emission, &|_| {}, 0.0, 1.0);
+        let emission_full = render(
+            &emission,
+            &|instance| {
+                instance.materials.get_mut(0).unwrap().emissive_factor = [0.0, 1.0, 0.0];
+            },
+            0.0,
+            1.0,
+        );
+        assert!(center(&emission_full)[1] > center(&emission_zero)[1] + 100);
+
+        let mut shade = base.clone();
+        shade.mtoon.shading_shift_factor = -2.0;
+        let shade_zero = render(&shade, &|_| {}, 0.0, 1.0);
+        let shade_full = render(
+            &shade,
+            &|instance| {
+                instance
+                    .materials
+                    .get_mut(0)
+                    .unwrap()
+                    .mtoon
+                    .as_mut()
+                    .unwrap()
+                    .shade_color_factor = [0.0, 0.0, 1.0];
+            },
+            0.0,
+            1.0,
+        );
+        assert!(center(&shade_full)[2] > center(&shade_zero)[2] + 100);
+
+        let mut matcap = base.clone();
+        matcap.mtoon.shading_shift_factor = 0.0;
+        matcap.mtoon.matcap_texture = Some(stage_c_texture(TextureRole::Matcap, 5));
+        let matcap_zero = render(&matcap, &|_| {}, 0.0, 1.0);
+        let matcap_full = render(
+            &matcap,
+            &|instance| {
+                instance
+                    .materials
+                    .get_mut(0)
+                    .unwrap()
+                    .mtoon
+                    .as_mut()
+                    .unwrap()
+                    .matcap_factor = [1.0; 3];
+            },
+            0.0,
+            1.0,
+        );
+        assert!(center(&matcap_full)[2] > center(&matcap_zero)[2] + 40);
+
+        let mut rim = base.clone();
+        rim.mtoon.shading_shift_factor = 0.0;
+        rim.mtoon.parametric_rim_fresnel_power_factor = 1.0;
+        rim.mtoon.parametric_rim_lift_factor = 1.0;
+        rim.mtoon.rim_lighting_mix_factor = 0.0;
+        let rim_zero = render(&rim, &|_| {}, 0.0, 1.0);
+        let rim_full = render(
+            &rim,
+            &|instance| {
+                instance
+                    .materials
+                    .get_mut(0)
+                    .unwrap()
+                    .mtoon
+                    .as_mut()
+                    .unwrap()
+                    .parametric_rim_color_factor = [1.0, 0.0, 1.0];
+            },
+            0.0,
+            1.0,
+        );
+        assert!(center(&rim_full)[0] > center(&rim_zero)[0] + 100);
+        assert!(center(&rim_full)[2] > center(&rim_zero)[2] + 100);
+
+        let mut outline = stage_e_descriptor(MtoonOutlineWidthMode::ScreenCoordinates, 0.12);
+        outline.mtoon.outline_color_factor = [0.0; 3];
+        let outline_zero = render(&outline, &|_| {}, 0.0, 1.0);
+        let outline_red = render(
+            &outline,
+            &|instance| {
+                instance
+                    .materials
+                    .get_mut(0)
+                    .unwrap()
+                    .mtoon
+                    .as_mut()
+                    .unwrap()
+                    .outline_color_factor = [1.0, 0.0, 0.0];
+            },
+            0.0,
+            1.0,
+        );
+        assert!(changed_pixels(&outline_zero, &outline_red) > 20);
+
+        // Authored alphaMode remains the pipeline key. MASK cutoff consumes
+        // composed base alpha but not presentation alpha; OPAQUE ignores base
+        // alpha for output routing; both BLEND variants retain authored blend.
+        let mut mask = emission.clone();
+        mask.inputs.alpha_mode = MaterialAlphaMode::Mask;
+        mask.inputs.alpha_cutoff = 0.5;
+        mask.inputs.emissive_factor = [0.0, 1.0, 0.0];
+        mask.inputs.base_color_factor[3] = 1.0;
+        let mask_visible = render(&mask, &|_| {}, 0.0, 1.0);
+        let mask_expression_cut = render(
+            &mask,
+            &|instance| {
+                instance.materials.get_mut(0).unwrap().base_color_factor[3] = 0.25;
+            },
+            0.0,
+            1.0,
+        );
+        let mask_presentation_fade = render(&mask, &|_| {}, 0.0, 0.1);
+        assert!(center(&mask_visible)[1] > 100);
+        assert_eq!(center(&mask_expression_cut), [0, 0, 0, 0]);
+        assert_ne!(center(&mask_presentation_fade), [0, 0, 0, 0]);
+        assert!(center(&mask_presentation_fade)[3] > 0);
+
+        let opaque_alpha = render(
+            &emission,
+            &|instance| {
+                instance.materials.get_mut(0).unwrap().base_color_factor[3] = 0.25;
+            },
+            0.0,
+            1.0,
+        );
+        assert_eq!(center(&opaque_alpha)[3], 255);
+        for z_write in [false, true] {
+            let mut blend = emission.clone();
+            blend.inputs.alpha_mode = MaterialAlphaMode::Blend;
+            blend.inputs.emissive_factor = [1.0, 0.0, 0.0];
+            blend.mtoon.transparent_with_z_write = z_write;
+            let blend_full = render(&blend, &|_| {}, 0.0, 1.0);
+            let blend_half = render(
+                &blend,
+                &|instance| {
+                    instance.materials.get_mut(0).unwrap().base_color_factor[3] = 0.5;
+                },
+                0.0,
+                1.0,
+            );
+            assert!(center(&blend_half)[0] < center(&blend_full)[0]);
+            assert!(center(&blend_half)[3] < center(&blend_full)[3]);
+        }
+
+        // Texture transforms feed the existing KHR helper for every mesh-UV
+        // role. These render checks cover base, rim/normal-class mesh UV,
+        // outline vertex lookup, and the UV-animation mask.
+        let mut base_texture = base.clone();
+        base_texture.inputs.base_color_factor = [1.0; 4];
+        base_texture.inputs.base_color_texture = Some(stage_c_texture(TextureRole::BaseColor, 0));
+        let base_uv_a = render(&base_texture, &|_| {}, 0.0, 1.0);
+        let base_uv_b = render(
+            &base_texture,
+            &|instance| {
+                instance
+                    .materials
+                    .get_mut(0)
+                    .unwrap()
+                    .texture_transforms
+                    .get_mut(&TextureRole::BaseColor)
+                    .unwrap()
+                    .offset = [0.5, 0.0];
+            },
+            0.0,
+            1.0,
+        );
+        assert!(changed_pixels(&base_uv_a, &base_uv_b) > 100);
+
+        let mut rim_texture = rim.clone();
+        rim_texture.mtoon.parametric_rim_color_factor = [1.0; 3];
+        rim_texture.mtoon.rim_multiply_texture = Some(stage_c_texture(TextureRole::RimMultiply, 0));
+        let rim_uv_a = render(&rim_texture, &|_| {}, 0.0, 1.0);
+        let rim_uv_b = render(
+            &rim_texture,
+            &|instance| {
+                instance
+                    .materials
+                    .get_mut(0)
+                    .unwrap()
+                    .texture_transforms
+                    .get_mut(&TextureRole::RimMultiply)
+                    .unwrap()
+                    .offset = [0.5, 0.0];
+            },
+            0.0,
+            1.0,
+        );
+        assert!(changed_pixels(&rim_uv_a, &rim_uv_b) > 100);
+
+        let mut outline_texture =
+            stage_e_descriptor(MtoonOutlineWidthMode::ScreenCoordinates, 0.16);
+        outline_texture.mtoon.outline_width_multiply_texture =
+            Some(stage_c_texture(TextureRole::OutlineWidth, 2));
+        let outline_uv_a = render(&outline_texture, &|_| {}, 0.0, 1.0);
+        let outline_uv_b = render(
+            &outline_texture,
+            &|instance| {
+                instance
+                    .materials
+                    .get_mut(0)
+                    .unwrap()
+                    .texture_transforms
+                    .get_mut(&TextureRole::OutlineWidth)
+                    .unwrap()
+                    .offset = [0.5, 0.0];
+            },
+            0.0,
+            1.0,
+        );
+        assert!(changed_pixels(&outline_uv_a, &outline_uv_b) > 20);
+
+        let mut animated = emission.clone();
+        animated.inputs.emissive_factor = [1.0; 3];
+        animated.inputs.emissive_texture = Some(stage_c_texture(TextureRole::Emissive, 0));
+        animated.mtoon.uv_animation_mask_texture =
+            Some(stage_c_texture(TextureRole::UvAnimationMask, 2));
+        animated.mtoon.uv_animation_scroll_x_speed_factor = 0.5;
+        let mask_uv_a = render(&animated, &|_| {}, 1.0, 1.0);
+        let mask_uv_b = render(
+            &animated,
+            &|instance| {
+                instance
+                    .materials
+                    .get_mut(0)
+                    .unwrap()
+                    .texture_transforms
+                    .get_mut(&TextureRole::UvAnimationMask)
+                    .unwrap()
+                    .offset = [0.5, 0.0];
+            },
+            1.0,
+            1.0,
+        );
+        assert!(changed_pixels(&mask_uv_a, &mask_uv_b) > 100);
+
+        // MatCap has view/normal coordinates and deliberately ignores even a
+        // directly injected mesh-UV transform, while its color factor above
+        // remains dynamic.
+        let matcap_static = render(
+            &matcap,
+            &|instance| {
+                instance
+                    .materials
+                    .get_mut(0)
+                    .unwrap()
+                    .mtoon
+                    .as_mut()
+                    .unwrap()
+                    .matcap_factor = [1.0; 3];
+            },
+            0.0,
+            1.0,
+        );
+        let matcap_transformed = render(
+            &matcap,
+            &|instance| {
+                let state = instance.materials.get_mut(0).unwrap();
+                state.mtoon.as_mut().unwrap().matcap_factor = [1.0; 3];
+                let transform = state
+                    .texture_transforms
+                    .get_mut(&TextureRole::Matcap)
+                    .unwrap();
+                transform.scale = [9.0, -7.0];
+                transform.offset = [13.0, -11.0];
+            },
+            0.0,
+            1.0,
+        );
+        assert_eq!(matcap_static, matcap_transformed);
+        drop(render);
+
+        // One shared asset, duplicate primitives using one material index, and
+        // two simultaneous instances prove both identity and GPU-slot isolation.
+        let mut isolated = stage_c_descriptor();
+        isolated.inputs.base_color_factor = [0.0, 0.0, 0.0, 1.0];
+        isolated.mtoon.shade_color_factor = [0.0; 3];
+        isolated.mtoon.matcap_factor = [0.0; 3];
+        let bytes =
+            mtoon_quad_with_normal_and_primitive_count(true, "OPAQUE", true, [0.6, 0.0, 0.8], 2);
+        let asset = ModelAsset::load_glb_bytes_opts_with_native_mtoon(
+            &gpu,
+            &renderer.model_material_layout,
+            &renderer.mtoon_material_layout,
+            &renderer.samplers,
+            &bytes,
+            "stage-g-instance-isolation.glb",
+            &ModelLoadOptions::default(),
+            std::iter::empty::<&str>(),
+            std::slice::from_ref(&isolated),
+        )
+        .unwrap();
+        assert_eq!(asset.primitives.len(), 2);
+        assert_eq!(asset.primitives[0].material_index, Some(0));
+        assert_eq!(asset.primitives[1].material_index, Some(0));
+        let mut left = ModelInstance::new(asset.clone());
+        let mut right = ModelInstance::new(asset.clone());
+        left.transform =
+            Mat4::from_translation(Vec3::new(-0.75, 0.0, 0.0)) * Mat4::from_scale(Vec3::splat(0.5));
+        right.transform =
+            Mat4::from_translation(Vec3::new(0.75, 0.0, 0.0)) * Mat4::from_scale(Vec3::splat(0.5));
+        left.materials.get_mut(0).unwrap().emissive_factor = [1.0, 0.0, 0.0];
+        right.materials.get_mut(0).unwrap().emissive_factor = [0.0, 0.0, 1.0];
+        assert!(std::sync::Arc::ptr_eq(&left.asset, &right.asset));
+        let left_raw_0 = asset.instance_material_raw(0, &left.materials);
+        let left_raw_1 = asset.instance_material_raw(1, &left.materials);
+        assert_eq!(left_raw_0.emissive_factor, left_raw_1.emissive_factor);
+        assert_eq!(left_raw_0.emissive_factor, [1.0, 0.0, 0.0, 0.0]);
+
+        let mut scene = Scene::default();
+        scene.draw_sky = false;
+        scene.transparent_clear = true;
+        scene.lighting.sun_color = Vec3::ZERO;
+        scene.lighting.ambient = Vec3::ZERO;
+        scene.models = vec![left, right];
+        let target = OffscreenTarget::new(&gpu, 64, 64);
+        let mut draw = |scene: &Scene| {
+            renderer.render(
+                &gpu,
+                &target.view,
+                target.size,
+                scene,
+                &camera,
+                &Hud::default(),
+            );
+            target.read_rgba(&gpu).unwrap()
+        };
+        let first = draw(&scene);
+        scene.models[0]
+            .materials
+            .get_mut(0)
+            .unwrap()
+            .emissive_factor = [0.0, 0.0, 1.0];
+        scene.models[1]
+            .materials
+            .get_mut(0)
+            .unwrap()
+            .emissive_factor = [1.0, 0.0, 0.0];
+        let swapped = draw(&scene);
+        let half_score = |rgba: &[u8], left_half: bool| {
+            let mut red = 0u64;
+            let mut blue = 0u64;
+            for y in 0..64 {
+                let xs = if left_half { 0..32 } else { 32..64 };
+                for x in xs {
+                    let offset = (y * 64 + x) * 4;
+                    red += u64::from(rgba[offset]);
+                    blue += u64::from(rgba[offset + 2]);
+                }
+            }
+            (red, blue)
+        };
+        let (first_left_red, first_left_blue) = half_score(&first, true);
+        let (first_right_red, first_right_blue) = half_score(&first, false);
+        assert!(first_left_red > first_left_blue * 2);
+        assert!(first_right_blue > first_right_red * 2);
+        let (swapped_left_red, swapped_left_blue) = half_score(&swapped, true);
+        let (swapped_right_red, swapped_right_blue) = half_score(&swapped, false);
+        assert!(swapped_left_blue > swapped_left_red * 2);
+        assert!(swapped_right_red > swapped_right_blue * 2);
+        assert_eq!(asset.materials[0].inputs.emissive_factor, [0.0; 3]);
     }
 
     #[cfg(not(target_arch = "wasm32"))]

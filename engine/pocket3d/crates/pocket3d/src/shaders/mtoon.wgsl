@@ -32,6 +32,9 @@ struct UvDesc {
 }
 struct MtoonMaterial {
     base_color_factor: vec4f,
+    // Generic fallback fields retained so all pipelines share one instance slot.
+    params: vec4f,
+    style: vec4f,
     shade_color_factor: vec4f,
     emissive_factor: vec4f,
     matcap_factor: vec4f,
@@ -74,13 +77,13 @@ struct MtoonMaterial {
 @group(1) @binding(11) var s_matcap: sampler;
 @group(1) @binding(12) var t_rim: texture_2d<f32>;
 @group(1) @binding(13) var s_rim: sampler;
-@group(1) @binding(14) var<uniform> material: MtoonMaterial;
 @group(1) @binding(15) var t_outline_width: texture_2d<f32>;
 @group(1) @binding(16) var s_outline_width: sampler;
 @group(1) @binding(17) var t_uv_animation_mask: texture_2d<f32>;
 @group(1) @binding(18) var s_uv_animation_mask: sampler;
 @group(2) @binding(0) var<uniform> instance: Instance;
 @group(2) @binding(1) var<storage, read> joints: array<mat4x4f>;
+@group(2) @binding(2) var<uniform> material: MtoonMaterial;
 
 struct VsIn {
     @location(0) pos: vec3f,
