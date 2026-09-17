@@ -1204,12 +1204,6 @@ fn authored_materials(
                 .expect("document material iterator always has an index");
             let name = material.name().map(str::to_owned);
             if let Some(descriptor) = mtoon_by_index.get(&index) {
-                if !material.unlit() {
-                    bail!(
-                        "MToon material {index} lacks KHR_materials_unlit fallback in {}",
-                        path.display()
-                    );
-                }
                 let authored = MaterialAsset {
                     gltf_material_index: index,
                     name,
@@ -4058,6 +4052,32 @@ mod tests {
             double_sided,
             vertex_normal,
             1,
+            true,
+            None,
+        )
+    }
+
+    fn mtoon_quad_without_unlit() -> Vec<u8> {
+        mtoon_quad_with_normal_and_primitive_count(
+            true,
+            "OPAQUE",
+            true,
+            [0.6, 0.0, 0.8],
+            1,
+            false,
+            None,
+        )
+    }
+
+    fn mtoon_quad_with_uv(uv0: [[f32; 2]; 4]) -> Vec<u8> {
+        mtoon_quad_with_normal_and_primitive_count(
+            false,
+            "OPAQUE",
+            true,
+            [0.6, 0.0, 0.8],
+            1,
+            true,
+            Some(uv0),
         )
     }
 
@@ -4067,6 +4087,8 @@ mod tests {
         double_sided: bool,
         vertex_normal: [f32; 3],
         primitive_count: usize,
+        include_unlit: bool,
+        uv0_override: Option<[[f32; 2]; 4]>,
     ) -> Vec<u8> {
         let mut bin = Vec::new();
         let mut views = Vec::new();
@@ -4082,7 +4104,7 @@ mod tests {
             [0.8, 0.8, 0.0],
             [-0.8, 0.8, 0.0],
         ];
-        let uv0 = [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]];
+        let uv0 = uv0_override.unwrap_or([[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
         let (pos, normal, tex0, tex1) = {
             let mut add = |components: usize, values: Vec<f32>| {
                 let offset = bin.len();
@@ -4136,6 +4158,15 @@ mod tests {
                 ],
             ),
         ];
+        let mut material_extensions = serde_json::Map::from_iter([(
+            "VRMC_materials_mtoon".to_owned(),
+            json!({"specVersion":"1.0"}),
+        )]);
+        let mut extensions_used = vec![json!("VRMC_materials_mtoon")];
+        if include_unlit {
+            material_extensions.insert("KHR_materials_unlit".to_owned(), json!({}));
+            extensions_used.insert(0, json!("KHR_materials_unlit"));
+        }
         glb_from_json(
             json!({
                 "asset":{"version":"2.0"},
@@ -4144,10 +4175,14 @@ mod tests {
                 "meshes":[{"primitives":(0..primitive_count).map(|_| json!({"attributes":{
                     "POSITION":pos,"NORMAL":normal,"TEXCOORD_0":tex0,"TEXCOORD_1":tex1
                 },"material":0})).collect::<Vec<_>>()}],
-                "materials":[{"alphaMode":alpha_mode,"doubleSided":double_sided,"extensions":{
-                    "KHR_materials_unlit":{},"VRMC_materials_mtoon":{"specVersion":"1.0"}
-                }}],
-                "extensionsUsed":["KHR_materials_unlit","VRMC_materials_mtoon"],
+                "materials":[{"alphaMode":alpha_mode,"doubleSided":double_sided,
+                    "extensions":Value::Object(material_extensions)}],
+                "extensionsUsed":extensions_used,
+                "extensionsRequired":if include_unlit {
+                    Vec::<Value>::new()
+                } else {
+                    vec![json!("VRMC_materials_mtoon")]
+                },
                 "images":images.iter().map(|uri| json!({"uri":uri})).collect::<Vec<_>>(),
                 "textures":[
                     {"source":0},{"source":1},{"source":2},{"source":3},
@@ -4741,6 +4776,25 @@ mod tests {
         let err = import_glb_slice(&bytes, "unknown-extension.glb", &[]).unwrap_err();
         assert!(format!("{err:#}").contains("required extension X_TEST_UNKNOWN"));
         assert!(format!("{err:#}").contains("not enabled or caller-validated"));
+    }
+
+    #[test]
+    fn required_khr_texture_transform_is_recognized_by_core_validation() {
+        let bytes = glb_from_json(
+            json!({
+                "asset": {"version": "2.0"},
+                "extensionsUsed": ["KHR_texture_transform"],
+                "extensionsRequired": ["KHR_texture_transform"],
+                "scene": 0,
+                "scenes": [{"nodes": []}]
+            }),
+            &[],
+        );
+        let (doc, buffers, images) =
+            import_glb_slice(&bytes, "required-texture-transform.glb", &[]).unwrap();
+        assert_eq!(doc.scenes().count(), 1);
+        assert!(buffers.is_empty());
+        assert!(images.is_empty());
     }
 
     #[test]
@@ -5600,8 +5654,15 @@ mod tests {
         isolated.inputs.base_color_factor = [0.0, 0.0, 0.0, 1.0];
         isolated.mtoon.shade_color_factor = [0.0; 3];
         isolated.mtoon.matcap_factor = [0.0; 3];
-        let bytes =
-            mtoon_quad_with_normal_and_primitive_count(true, "OPAQUE", true, [0.6, 0.0, 0.8], 2);
+        let bytes = mtoon_quad_with_normal_and_primitive_count(
+            true,
+            "OPAQUE",
+            true,
+            [0.6, 0.0, 0.8],
+            2,
+            true,
+            None,
+        );
         let asset = ModelAsset::load_glb_bytes_opts_with_native_mtoon(
             &gpu,
             &renderer.model_material_layout,
@@ -6139,6 +6200,73 @@ mod tests {
             .offset = [0.5, 0.0];
         let rim_black_mask = pixel(&rim, false, camera);
         assert!(rim_white_mask[0] > rim_black_mask[0]);
+
+        let mut mapped_pixel = |uv0: [[f32; 2]; 4]| {
+            let bytes = mtoon_quad_with_uv(uv0);
+            let asset = ModelAsset::load_glb_bytes_opts_with_native_mtoon(
+                &gpu,
+                &renderer.model_material_layout,
+                &renderer.mtoon_material_layout,
+                &renderer.samplers,
+                &bytes,
+                "stage-h-normal-map-uv.glb",
+                &ModelLoadOptions::default(),
+                std::iter::empty::<&str>(),
+                std::slice::from_ref(&matcap),
+            )
+            .unwrap();
+            let mut scene = Scene::default();
+            scene.sky.zenith = Vec3::ZERO;
+            scene.sky.horizon = Vec3::ZERO;
+            scene.lighting.sun_color = Vec3::ZERO;
+            scene.lighting.ambient = Vec3::ZERO;
+            scene.models.push(ModelInstance::new(asset));
+            let camera = Camera {
+                pos: camera,
+                znear: 0.1,
+                zfar: 10.0,
+                ..Default::default()
+            };
+            let target = OffscreenTarget::new(&gpu, 64, 64);
+            renderer.render(
+                &gpu,
+                &target.view,
+                target.size,
+                &scene,
+                &camera,
+                &Hud::default(),
+            );
+            let rgba = target.read_rgba(&gpu).unwrap();
+            let offset = (32 * 64 + 32) * 4;
+            [rgba[offset], rgba[offset + 1], rgba[offset + 2]]
+        };
+        let mapped_standard = mapped_pixel([[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]);
+        let mapped_mirrored = mapped_pixel([[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]]);
+        let mapped_degenerate = mapped_pixel([[0.25, 0.25]; 4]);
+        assert_eq!(mapped_standard, matcap_mapped);
+        assert_ne!(mapped_mirrored, mapped_standard);
+        assert_eq!(mapped_degenerate, matcap_front);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn required_native_mtoon_without_unlit_uses_the_mtoon_pipeline() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for Stage H fixtures");
+        let renderer = crate::renderer::Renderer::new(&gpu, crate::gpu::OFFSCREEN_FORMAT).unwrap();
+        let asset = ModelAsset::load_glb_bytes_opts_with_native_mtoon(
+            &gpu,
+            &renderer.model_material_layout,
+            &renderer.mtoon_material_layout,
+            &renderer.samplers,
+            &mtoon_quad_without_unlit(),
+            "stage-h-required-native-mtoon.glb",
+            &ModelLoadOptions::default(),
+            ["VRMC_materials_mtoon"],
+            &[stage_c_descriptor()],
+        )
+        .unwrap();
+        assert!(matches!(asset.materials[0].model, MaterialModel::Mtoon(_)));
+        assert!(asset.primitives[0].mtoon_bind_group.is_some());
     }
 
     #[cfg(not(target_arch = "wasm32"))]

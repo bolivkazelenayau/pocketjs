@@ -1223,4 +1223,34 @@ mod tests {
         assert!(alpha < 0.5);
         assert!(alpha >= 0.4);
     }
+
+    #[test]
+    fn stage_h_matcap_vertical_degeneracy_is_finite_and_deterministic() {
+        let reference_matcap_uv = |normal: glam::Vec3, view: glam::Vec3| {
+            let horizontal = glam::Vec3::new(view.z, 0.0, -view.x);
+            let view_x = if horizontal.length_squared() > 1.0e-10 {
+                horizontal.normalize()
+            } else {
+                glam::Vec3::X
+            };
+            let view_y = view.cross(view_x);
+            glam::Vec2::new(view_x.dot(normal), view_y.dot(normal)) * 0.495 + glam::Vec2::splat(0.5)
+        };
+        let normal = glam::Vec3::new(0.3, 0.4, 0.5).normalize();
+        let exact_up = reference_matcap_uv(normal, glam::Vec3::Y);
+        let exact_down = reference_matcap_uv(normal, -glam::Vec3::Y);
+        let near_up = reference_matcap_uv(normal, glam::Vec3::new(0.0, 1.0, 1.0e-6).normalize());
+        let near_down = reference_matcap_uv(normal, glam::Vec3::new(0.0, -1.0, 1.0e-6).normalize());
+        for uv in [exact_up, exact_down, near_up, near_down] {
+            assert!(uv.is_finite());
+        }
+        assert_eq!(exact_up, reference_matcap_uv(normal, glam::Vec3::Y));
+        assert_eq!(exact_down, reference_matcap_uv(normal, -glam::Vec3::Y));
+        assert!((near_up - exact_up).length() < 1.0e-5);
+        assert!((near_down - exact_down).length() < 1.0e-5);
+
+        let shader = include_str!("shaders/mtoon.wgsl");
+        assert!(shader.contains("var view_x = vec3f(1.0, 0.0, 0.0)"));
+        assert!(shader.contains("if dot(horizontal, horizontal) > 1e-10"));
+    }
 }

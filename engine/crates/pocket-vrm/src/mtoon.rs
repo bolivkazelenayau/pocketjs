@@ -197,6 +197,43 @@ pub struct Vrm1MtoonMaterial {
 }
 
 impl Vrm1MtoonMaterial {
+    /// Return the first authored UV set that the native Pocket3D MToon path
+    /// cannot represent. MatCap is deliberately excluded because its lookup
+    /// coordinates are derived from the view-space normal, not a mesh UV set.
+    pub(crate) fn unsupported_texture_coordinate(
+        &self,
+        max_supported: u32,
+    ) -> Option<(&'static str, u32)> {
+        let textures = [
+            ("baseColorTexture", self.base_color_texture.as_ref()),
+            (
+                "normalTexture",
+                self.normal_texture.as_ref().map(|value| &value.texture),
+            ),
+            ("emissiveTexture", self.emissive_texture.as_ref()),
+            ("shadeMultiplyTexture", self.shade_multiply_texture.as_ref()),
+            (
+                "shadingShiftTexture",
+                self.shading_shift_texture
+                    .as_ref()
+                    .map(|value| &value.texture),
+            ),
+            ("rimMultiplyTexture", self.rim_multiply_texture.as_ref()),
+            (
+                "outlineWidthMultiplyTexture",
+                self.outline_width_multiply_texture.as_ref(),
+            ),
+            (
+                "uvAnimationMaskTexture",
+                self.uv_animation_mask_texture.as_ref(),
+            ),
+        ];
+        textures.into_iter().find_map(|(role, texture)| {
+            let tex_coord = texture?.effective_tex_coord();
+            (tex_coord > max_supported).then_some((role, tex_coord))
+        })
+    }
+
     pub fn to_pocket3d_descriptor(&self) -> render::MtoonMaterialDescriptor {
         let alpha_mode = match self.alpha_mode {
             Vrm1MtoonAlphaMode::Opaque => render::MaterialAlphaMode::Opaque,

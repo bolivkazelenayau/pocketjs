@@ -495,7 +495,45 @@ impl Vrm1Doc {
                 None
             }
         };
-        let mtoon_materials = parse_mtoon_materials(&glb.json)?;
+        let mtoon_required = extension_declaration_contains(
+            &glb.json,
+            "extensionsRequired",
+            "VRMC_materials_mtoon",
+        )?;
+        let mtoon_used =
+            extension_declaration_contains(&glb.json, "extensionsUsed", "VRMC_materials_mtoon")?;
+        ensure!(
+            !mtoon_required || mtoon_used,
+            "glTF extensionsRequired contains VRMC_materials_mtoon, but extensionsUsed does not"
+        );
+        let mtoon_materials = match parse_mtoon_materials(&glb.json).and_then(|materials| {
+            ensure!(
+                materials.is_empty() || mtoon_used,
+                "VRMC_materials_mtoon is present on a material but is missing from glTF extensionsUsed"
+            );
+            ensure!(
+                !mtoon_required || !materials.is_empty(),
+                "glTF extensionsRequired contains VRMC_materials_mtoon, but no material declares the extension"
+            );
+            for material in &materials {
+                if let Some((role, tex_coord)) = material.unsupported_texture_coordinate(1) {
+                    bail!(
+                        "material {} {role} selects TEXCOORD_{tex_coord}, but native MToon supports only TEXCOORD_0 and TEXCOORD_1",
+                        material.material_index
+                    );
+                }
+            }
+            Ok(materials)
+        }) {
+            Ok(materials) => materials,
+            Err(error) if mtoon_required => return Err(error),
+            Err(error) => {
+                log::warn!(
+                    "disabling malformed or unsupported optional VRMC_materials_mtoon extension: {error:#}"
+                );
+                Vec::new()
+            }
+        };
         let materials_mtoon = if mtoon_materials.is_empty() {
             Vrm1ExtensionInfo::default()
         } else {
@@ -1651,7 +1689,7 @@ mod tests {
             "specVersion":"1.0",
             "constraint":{"rotation":{"source":1}}
         }});
-        value["extensionsUsed"] = json!(["VRMC_node_constraint"]);
+        value["extensionsUsed"] = json!(["VRMC_materials_mtoon", "VRMC_node_constraint"]);
         value["extensions"]["VRMC_vrm"]["meta"]["version"] = json!("1.0");
         value["extensions"]["VRMC_vrm"]["expressions"] = json!({});
         value["extensions"]["VRMC_vrm"]["lookAt"] = look_at_json("bone");
@@ -2388,15 +2426,102 @@ mod tests {
     }
 
     #[test]
-    fn recognized_extension_versions_are_required_and_validated() {
+    fn optional_future_mtoon_falls_back_but_required_future_mtoon_is_rejected() {
         let mut mtoon = valid_document();
         mtoon["materials"][0]["extensions"]["VRMC_materials_mtoon"]["specVersion"] = json!("0.9");
+        let document = parse(mtoon.clone()).unwrap();
+        assert!(!document.materials_mtoon.present);
+        assert!(document.mtoon_materials.is_empty());
+
+        mtoon["extensionsRequired"] = json!(["VRMC_materials_mtoon"]);
         let error = parse(mtoon).unwrap_err().to_string();
         assert!(
             error.contains("VRMC_materials_mtoon") && error.contains("1.0"),
             "{error}"
         );
+    }
 
+    #[test]
+    fn required_mtoon_without_unlit_is_native_and_declaration_consistent() {
+        let mut value = valid_document();
+        value["extensionsRequired"] = json!(["VRMC_materials_mtoon"]);
+        assert!(
+            value["materials"][0]["extensions"]
+                .get("KHR_materials_unlit")
+                .is_none()
+        );
+        let document = parse(value).unwrap();
+        assert!(document.materials_mtoon.present);
+        assert_eq!(document.mtoon_materials.len(), 1);
+
+        let mut missing_used = valid_document();
+        missing_used["extensionsRequired"] = json!(["VRMC_materials_mtoon"]);
+        missing_used["extensionsUsed"] = json!(["VRMC_node_constraint"]);
+        let error = parse(missing_used).unwrap_err().to_string();
+        assert!(error.contains("extensionsUsed"), "{error}");
+
+        let mut missing_payload = valid_document();
+        missing_payload["extensionsRequired"] = json!(["VRMC_materials_mtoon"]);
+        missing_payload["materials"][0]["extensions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("VRMC_materials_mtoon");
+        let error = parse(missing_payload).unwrap_err().to_string();
+        assert!(error.contains("no material declares"), "{error}");
+    }
+
+    #[test]
+    fn optional_malformed_or_unsupported_mtoon_falls_back_but_required_rejects() {
+        let mut malformed = valid_document();
+        malformed["materials"][0]["extensions"]["VRMC_materials_mtoon"]["transparentWithZWrite"] =
+            json!("invalid");
+        let document = parse(malformed.clone()).unwrap();
+        assert!(document.mtoon_materials.is_empty());
+        malformed["extensionsRequired"] = json!(["VRMC_materials_mtoon"]);
+        let error = parse(malformed).unwrap_err().to_string();
+        assert!(error.contains("transparentWithZWrite"), "{error}");
+
+        let mut unsupported = valid_document();
+        unsupported["images"] = json!([{"uri":"unused.png"}]);
+        unsupported["textures"] = json!([{"source":0}]);
+        unsupported["materials"][0]["extensions"]["VRMC_materials_mtoon"]["shadeMultiplyTexture"] =
+            json!({"index":0,"texCoord":2});
+        let document = parse(unsupported.clone()).unwrap();
+        assert!(document.mtoon_materials.is_empty());
+        unsupported["extensionsRequired"] = json!(["VRMC_materials_mtoon"]);
+        let error = parse(unsupported).unwrap_err().to_string();
+        assert!(error.contains("TEXCOORD_2"), "{error}");
+    }
+
+    #[test]
+    fn supported_required_texture_transform_override_remains_native() {
+        let mut value = valid_document();
+        value["extensionsUsed"] = json!([
+            "VRMC_materials_mtoon",
+            "VRMC_node_constraint",
+            "KHR_texture_transform"
+        ]);
+        value["extensionsRequired"] = json!(["VRMC_materials_mtoon", "KHR_texture_transform"]);
+        value["images"] = json!([{"uri":"unused.png"}]);
+        value["textures"] = json!([{"source":0}]);
+        value["materials"][0]["extensions"]["VRMC_materials_mtoon"]["shadeMultiplyTexture"] = json!({
+            "index":0,
+            "texCoord":0,
+            "extensions":{"KHR_texture_transform":{"texCoord":1}}
+        });
+        let document = parse(value).unwrap();
+        assert_eq!(
+            document.mtoon_materials[0]
+                .shade_multiply_texture
+                .as_ref()
+                .unwrap()
+                .effective_tex_coord(),
+            1
+        );
+    }
+
+    #[test]
+    fn recognized_non_material_extension_versions_are_required_and_validated() {
         let mut node_constraint = valid_document();
         node_constraint["extensionsRequired"] = json!(["VRMC_node_constraint"]);
         node_constraint["nodes"][0]["extensions"]["VRMC_node_constraint"]
