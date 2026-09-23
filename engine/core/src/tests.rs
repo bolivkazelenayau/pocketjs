@@ -188,6 +188,184 @@ fn abgr(r: u8, g: u8, b: u8, a: u8) -> u32 {
     ((a as u32) << 24) | ((b as u32) << 16) | ((g as u32) << 8) | r as u32
 }
 
+#[test]
+fn scaled_baked_cells_and_font_replacement_at_both_densities() {
+    for density in [1, 2] {
+        let mut ui = Ui::new_with_raster_density(density);
+        let mut blob = encode_atlas_version_density(spec::font_atlas::VERSION, density as u8,
+            0, 8, 8, 7, 8, 1, &[('A' as u32, 0, 8)]);
+        blob[24..].fill(255);
+        assert!(ui.load_font_atlas(&blob));
+        let text = ui.create_node(spec::NodeType::Text as u8);
+        ui.set_text(text, "AA");
+        for (p, v) in [(spec::prop::WIDTH, 16.0), (spec::prop::HEIGHT, 8.0),
+            (spec::prop::SCALE_X, 0.5), (spec::prop::SCALE_Y, 0.75),
+            (spec::prop::ORIGIN_X, -0.5), (spec::prop::ORIGIN_Y, -0.5),
+            (spec::prop::TEXT_COLOR, abgr(60, 120, 180, 255) as f64)] {
+            ui.set_prop(text, p, v);
+        }
+        ui.insert_before(spec::ROOT_ID, text, 0);
+        ui.tick();
+        let words = ui.draw().words.clone();
+        assert_eq!(validate_drawlist(&words)[spec::draw_op::TEX_QUAD as usize], 2);
+        assert_eq!(validate_drawlist(&words)[spec::draw_op::GLYPH_RUN as usize], 0);
+        assert_eq!(decode_xy(words[2]), (0, 0));
+        assert_eq!(decode_xy(words[11]), (4, 0));
+        assert_eq!(decode_wh(words[3]), (4, 6));
+        assert_eq!(words[1], words[10]);
+        let old = words[1] as i32;
+        let mut frame = alloc::vec![0; spec::SCREEN_W as usize * spec::SCREEN_H as usize * 4];
+        crate::raster::render(&ui, &words, &mut frame);
+        let at = (2 * spec::SCREEN_W as usize + 2) * 4;
+        assert_eq!(&frame[at..at + 3], &[60, 120, 180]);
+
+        ui.set_prop(text, spec::prop::SCALE_X, 0.75);
+        assert_eq!(ui.draw().words[1] as i32, old, "scale reuses coverage page");
+        blob[24..].fill(0);
+        assert!(ui.load_font_atlas(&blob));
+        let new = ui.draw().words[1] as i32;
+        assert_ne!(old, new, "same-count replacement changes generation");
+        assert!(ui.texture(old).is_none());
+        assert!(ui.texture(new).unwrap().pixels.iter().all(|&b| b == 0));
+        assert_eq!(ui.texture_slot_count(), 1);
+    }
+}
+
+#[test]
+fn identity_baked_text_remains_a_glyph_run() {
+    let mut ui = Ui::new();
+    assert!(ui.load_font_atlas(&encode_atlas(0, 8, 8, 7, 8, 1, &[('A' as u32, 0, 8)])));
+    let text = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(text, "AA");
+    ui.insert_before(spec::ROOT_ID, text, 0);
+    ui.tick();
+    let counts = validate_drawlist(&ui.draw().words.clone());
+    assert_eq!(counts[spec::draw_op::GLYPH_RUN as usize], 1);
+    assert_eq!(counts[spec::draw_op::TEX_QUAD as usize], 0);
+    assert_eq!(ui.texture_slot_count(), 0);
+}
+
+#[test]
+fn scaled_glyph_pages_respect_partial_page_bounds() {
+    let mut ui = Ui::new();
+    // A 64 px cell plus gutter fits 7 x 7 cells per page.
+    let glyphs: Vec<_> = (0..50u16).map(|gid| ('A' as u32 + gid as u32, gid, 64)).collect();
+    assert!(ui.load_font_atlas(&encode_atlas(0, 64, 64, 60, 64, 50, &glyphs)));
+    let revision = ui.font_atlas_revision(0);
+    let atlas = ui.fonts.atlas(0).unwrap();
+    assert!(crate::draw::glyph_page(&mut ui.discs, &mut ui.textures, &mut ui.tex_free,
+        atlas, revision, 50).is_none());
+    let first = crate::draw::glyph_page(&mut ui.discs, &mut ui.textures, &mut ui.tex_free,
+        atlas, revision, 0).unwrap();
+    let last = crate::draw::glyph_page(&mut ui.discs, &mut ui.textures, &mut ui.tex_free,
+        atlas, revision, 49).unwrap();
+    assert!(first.contains(48) && !first.contains(49));
+    assert!(last.contains(49) && !last.contains(50) && !last.contains(48));
+    let text = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(text, "ArA");
+    for (p, v) in [(spec::prop::WIDTH, 192.0), (spec::prop::HEIGHT, 64.0),
+        (spec::prop::SCALE, 0.5), (spec::prop::ORIGIN_X, -0.5),
+        (spec::prop::ORIGIN_Y, -0.5)] { ui.set_prop(text, p, v); }
+    ui.insert_before(spec::ROOT_ID, text, 0);
+    ui.tick();
+    let words = ui.draw().words.clone();
+    assert_eq!(validate_drawlist(&words)[spec::draw_op::TEX_QUAD as usize], 3);
+    assert_ne!(words[1], words[10]);
+    assert_eq!(words[1], words[19]);
+    assert_eq!(ui.texture_slot_count(), 2);
+}
+
+#[test]
+fn moving_inner_clip_keeps_visible_scaled_ink() {
+    for density in [1, 2] { for scale in [0.585, 0.64, 0.75] {
+        let mut ui = Ui::new_with_raster_density(density);
+        let mut atlas = encode_atlas_version_density(spec::font_atlas::VERSION, density as u8,
+            0, 8, 8, 7, 8, 1, &[('A' as u32, 0, 8)]);
+        for (i, coverage) in atlas[24..].iter_mut().enumerate() {
+            *coverage = (i % 8 * 31) as u8;
+        }
+        assert!(ui.load_font_atlas(&atlas));
+        let parent = ui.create_node(0);
+        ui.set_prop(parent, spec::prop::WIDTH, 11.0);
+        ui.set_prop(parent, spec::prop::HEIGHT, 8.0);
+        let text = ui.create_node(spec::NodeType::Text as u8);
+        ui.set_text(text, "AA");
+        for (p, v) in [(spec::prop::WIDTH, 16.0), (spec::prop::HEIGHT, 8.0),
+            (spec::prop::SCALE, scale), (spec::prop::ORIGIN_X, -0.5),
+            (spec::prop::ORIGIN_Y, -0.5), (spec::prop::TRANSLATE_X, 7.37)] {
+            ui.set_prop(text, p, v);
+        }
+        ui.insert_before(parent, text, 0);
+        ui.insert_before(spec::ROOT_ID, parent, 0);
+        ui.tick();
+        let mut reference = alloc::vec![0; spec::SCREEN_W as usize * spec::SCREEN_H as usize * 4];
+        let full = ui.draw().words.clone();
+        crate::raster::render(&ui, &full, &mut reference);
+        assert!(reference.chunks_exact(4).any(|pixel| pixel != &reference[..4]));
+        ui.set_prop(parent, spec::prop::OVERFLOW, spec::Overflow::Hidden as u8 as f64);
+        for width in [8, 9, 10, 11, 12] {
+            ui.set_prop(parent, spec::prop::WIDTH, width as f64);
+            let clipped = ui.draw().words.clone();
+            validate_drawlist(&clipped);
+            let mut pixels = alloc::vec![0; reference.len()];
+            crate::raster::render(&ui, &clipped, &mut pixels);
+            for y in 0..8 { for x in 0..width {
+                let at = (y * spec::SCREEN_W as usize + x) * 4;
+                assert_eq!(&pixels[at..at + 4], &reference[at..at + 4],
+                    "density={density} scale={scale} clip={width} pixel={x},{y}");
+            }}
+            for y in 0..8 { for x in width..24 {
+                let at = (y * spec::SCREEN_W as usize + x) * 4;
+                assert_eq!(&pixels[at..at + 4], &reference[..4]);
+            }}
+        }
+    }}
+}
+
+#[test]
+fn scaled_glyph_crossing_viewport_keeps_uvs() {
+    let mut ui = Ui::new();
+    assert!(ui.load_font_atlas(&encode_atlas(0, 8, 8, 7, 8, 1,
+        &[('A' as u32, 0, 8)])));
+    let text = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_text(text, "A");
+    for (p, v) in [(spec::prop::WIDTH, 8.0), (spec::prop::HEIGHT, 8.0),
+        (spec::prop::SCALE, 0.5), (spec::prop::ORIGIN_X, -0.5),
+        (spec::prop::ORIGIN_Y, -0.5), (spec::prop::TRANSLATE_X, -2.0)] {
+        ui.set_prop(text, p, v);
+    }
+    ui.insert_before(spec::ROOT_ID, text, 0);
+    ui.tick();
+    let words = ui.draw().words.clone();
+    assert_eq!(validate_drawlist(&words)[spec::draw_op::TEX_QUAD as usize], 1);
+    assert_eq!(decode_xy(words[2]), (0, 0));
+    assert_eq!(decode_wh(words[3]), (2, 4));
+    let texture = ui.texture(words[1] as i32).unwrap();
+    let u0 = f32::from_bits(words[4]) * texture.w as f32;
+    let u1 = f32::from_bits(words[6]) * texture.w as f32;
+    assert_eq!((u0, u1), (5.0, 9.0));
+    ui.free_texture(words[1] as i32);
+    let rebaked = ui.draw().words.clone();
+    assert_ne!(rebaked[1], words[1]);
+}
+
+#[test]
+fn font_revision_changes_only_after_valid_slot_load() {
+    let mut ui = Ui::new();
+    let atlas = encode_atlas(3, 2, 2, 1, 2, 1, &[(65, 0, 2)]);
+    assert_eq!(ui.font_atlas_revision(3), 0);
+    assert!(ui.load_font_atlas(&atlas));
+    assert_eq!(ui.font_atlas_revision(3), 1);
+    assert!(!ui.load_font_atlas(&atlas[..10]));
+    assert_eq!(ui.font_atlas_revision(3), 1);
+    let mut replacement = atlas.clone();
+    *replacement.last_mut().unwrap() = 255;
+    assert!(ui.load_font_atlas(&replacement));
+    assert_eq!(ui.font_atlas_revision(3), 2);
+    assert_eq!(ui.font_atlas_revision(0), 0);
+    assert_eq!(ui.font_atlas_revision(255), 0);
+}
+
 // ---- DrawList decoding helpers ------------------------------------------------
 
 fn decode_xy(word: u32) -> (i32, i32) {
@@ -3718,9 +3896,8 @@ fn tracked_and_transformed_runs_use_the_baked_pair_on_both_sides() {
     ui.set_prop(rotated, spec::prop::ROTATE, 45.0);
     ui.set_text(rotated, "AB");
     ui.insert_before(spec::ROOT_ID, rotated, 0);
-    // Text under a transformed ANCESTOR takes the baked pair too. (Scale
-    // DOWN so the transformed glyph anchors stay on-screen — off-screen
-    // cells are dropped, which would empty the run.)
+    // Text under a transformed ANCESTOR takes the baked pair too. Scaled
+    // baked cells use a coverage-page TEX_QUAD.
     let wrap = ui.create_node(spec::NodeType::View as u8);
     ui.set_prop(wrap, spec::prop::SCALE, 0.5);
     let nested = ui.create_node(spec::NodeType::Text as u8);
@@ -3731,7 +3908,8 @@ fn tracked_and_transformed_runs_use_the_baked_pair_on_both_sides() {
     let words = ui.draw().words.clone();
     let counts = validate_drawlist(&words);
     assert_eq!(counts[spec::draw_op::TEXT_RUN as usize], 0);
-    assert_eq!(counts[spec::draw_op::GLYPH_RUN as usize], 3);
+    assert_eq!(counts[spec::draw_op::GLYPH_RUN as usize], 2);
+    assert_eq!(counts[spec::draw_op::TEX_QUAD as usize], 1);
     // Column layout: width cross-stretches, so the measurement provider is
     // observable through the main-axis HEIGHT. All three leaves measured
     // with the atlas (10 px line), matching their painted glyphs.

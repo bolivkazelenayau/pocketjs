@@ -31,6 +31,7 @@ struct FontTexture {
     tex_h: f32,
     cols: u32,
     glyph_count: u16,
+    revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -675,29 +676,27 @@ impl UiRenderer {
 
     // ---- texture sync ---------------------------------------------------------
 
-    /// Mirror the core's textures into GPU resources. Font atlases are
-    /// append-only; image slots are not — `freeTexture` empties a slot and
-    /// a later upload reuses it under a new generation-tagged handle, so
-    /// each slot re-uploads whenever its current handle or content revision
-    /// changes and drops its cache entry when the core frees it.
+    /// Mirror core textures into GPU resources. Font slots re-upload when
+    /// their atlas revision changes. Image slots re-upload when their handle
+    /// or content revision changes, including after `freeTexture` slot reuse.
     fn sync_textures(&mut self, gpu: &Gpu, ui: &Ui) {
-        // Font slots. A slot re-uploads when its glyph count moved — hosts
-        // may extend an atlas at runtime (IME input rasterizing new
-        // codepoints) and reload it via loadFontAtlas.
+        // Atlas contents can change while the slot and glyph count stay fixed.
         if self.fonts.len() < spec::MAX_FONT_SLOTS {
             self.fonts.resize_with(spec::MAX_FONT_SLOTS, || None);
         }
         for slot in 0..spec::MAX_FONT_SLOTS as u8 {
             let Some(atlas) = ui.font_atlas(slot) else {
+                self.fonts[slot as usize] = None;
                 continue;
             };
+            let revision = ui.font_atlas_revision(slot);
             if self.fonts[slot as usize]
                 .as_ref()
-                .is_some_and(|f| f.glyph_count == atlas.glyph_count)
+                .is_some_and(|f| f.revision == revision)
             {
                 continue;
             }
-            self.fonts[slot as usize] = Some(self.upload_font(gpu, atlas));
+            self.fonts[slot as usize] = Some(self.upload_font(gpu, atlas, revision));
         }
         // Image texture slots.
         let slots = ui.texture_slot_count();
@@ -724,7 +723,7 @@ impl UiRenderer {
         }
     }
 
-    fn upload_font(&self, gpu: &Gpu, atlas: &pocketjs_core::text::Atlas) -> FontTexture {
+    fn upload_font(&self, gpu: &Gpu, atlas: &pocketjs_core::text::Atlas, revision: u64) -> FontTexture {
         // Cells upload at coverage resolution (logical × raster density) —
         // a density-2 atlas keeps its full detail for scaled rendering.
         let (cov_w, cov_h) = (atlas.coverage_width(), atlas.coverage_height());
@@ -801,6 +800,7 @@ impl UiRenderer {
             tex_h: tex_h as f32,
             cols,
             glyph_count: atlas.glyph_count,
+            revision,
         }
     }
 
@@ -934,5 +934,48 @@ fn to_rgba8(view: &TexView) -> Option<Vec<u8>> {
             Some(out)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+    use pocket3d::gpu::{Gpu, OffscreenTarget};
+
+    fn font(coverage: u8) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(spec::font_atlas::MAGIC.to_le_bytes());
+        bytes.extend(spec::font_atlas::VERSION.to_le_bytes());
+        bytes.extend(1u16.to_le_bytes());
+        bytes.extend([2, 2, 1, 2, 3, 0, 1, 0]);
+        bytes.extend(65u32.to_le_bytes());
+        bytes.extend([0, 0, 2, 0]);
+        bytes.extend([coverage; 4]);
+        bytes
+    }
+
+    #[test]
+    fn same_count_font_replacement_reuploads_and_renders_new_coverage() {
+        let gpu = Gpu::new_headless().expect("headless GPU required for font cache regression");
+        let out = OffscreenTarget::new(&gpu, 16, 16);
+        let mut renderer = UiRenderer::new(&gpu, pocket3d::gpu::OFFSCREEN_FORMAT);
+        let mut ui = Ui::new();
+        ui.set_viewport(16.0, 16.0);
+        let packed = |x: u32, y: u32| x | (y << 16);
+        let words = [spec::draw_op::GLYPH_RUN, 3 | (1 << 16), 0xffff_ffff,
+            packed(2, 2), 0];
+        let mut samples = Vec::new();
+        for (revision, coverage) in [(1, 255), (2, 0), (3, 128)] {
+            assert!(ui.load_font_atlas(&font(coverage)));
+            assert_eq!(ui.font_atlas(3).unwrap().glyph_count, 1);
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            renderer.render_words(&gpu, &ui, &words, &mut encoder, &out.view, out.size,
+                wgpu::LoadOp::Clear(wgpu::Color::BLACK)).unwrap();
+            gpu.queue.submit([encoder.finish()]);
+            assert_eq!(renderer.fonts[3].as_ref().unwrap().revision, revision);
+            let pixels = out.read_rgba(&gpu).unwrap();
+            samples.push(pixels[((2 * 16 + 2) * 4) as usize]);
+        }
+        assert!(samples[0] > samples[2] && samples[2] > samples[1], "{samples:?}");
     }
 }

@@ -11,9 +11,9 @@
 //! boxes are corner-transformed, Sutherland-Hodgman-clipped and emitted as
 //! TRI ops. v1 degradations (documented):
 //!   - rotated IMAGE quads are conservatively culled (no textured-tri op);
-//!   - glyph cells position along the rotated/scaled frame but stay upright
-//!     and unscaled (bitmap cells); glyphs whose cell top-left leaves the
-//!     screen range or whose cell leaves the clip rect are dropped;
+//!   - rotated glyph cells stay upright and unscaled; axis-aligned scales
+//!     use clipped, tinted coverage TEX_QUADs. Unscaled cells whose top-left
+//!     leaves the screen range or whose cell leaves the clip rect are dropped;
 //!   - rounded corners and shadows are emitted for axis-aligned boxes as
 //!     deterministic alpha-covered RECT spans; rotated rounded boxes degrade
 //!     to square fills;
@@ -429,20 +429,143 @@ fn fill_color_at(fill: &Fill, x0: f32, y0: f32, x1: f32, y1: f32, sx0: i32, sy: 
 
 // ---- the walker ------------------------------------------------------------------
 
-/// Baked antialiased disc sprites keyed by integer radius — rounded corners
+/// Core-owned disc sprites and scaled-glyph coverage pages. Rounded corners
 /// render as four O(1) corner TEX_QUADs + three RECTs instead of per-row
-/// coverage spans (the spans measured ~7 ms/frame of CPU on real PSP
-/// hardware for rounded-heavy screens).
+/// coverage spans (the spans measured ~7 ms/frame of CPU on real PSP hardware).
 pub struct DiscCache {
     /// (logical radius px, generation-tagged texture handle). Handles re-validate
     /// through `tex_resolve` on every use: `free_texture` is allowed to free
     /// a disc slot (JS misuse), which simply goes stale here and re-bakes.
     entries: Vec<(u32, i32)>,
+    /// Shared pages; each use revalidates the font revision and texture handle.
+    glyphs: Vec<GlyphPage>,
+}
+
+struct GlyphPage {
+    slot: u8,
+    revision: u64,
+    page: u32,
+    handle: i32,
+    width: u32,
+    height: u32,
+}
+
+// A resolved page is local to a run. Font revisions and texture generations
+// are checked again when the next run requests a page.
+#[derive(Clone, Copy)]
+pub(crate) struct GlyphSampler {
+    pub(crate) handle: u32,
+    first: u32,
+    end: u32,
+    columns: u32,
+    stride_x: u32,
+    stride_y: u32,
+    width: u32,
+    height: u32,
+}
+
+impl GlyphSampler {
+    pub(crate) fn contains(&self, gid: u16) -> bool {
+        (gid as u32) >= self.first && (gid as u32) < self.end
+    }
+
+    fn uv(&self, gid: u16) -> [f32; 4] {
+        let n = gid as u32 - self.first;
+        let x = (n % self.columns) * self.stride_x + 1;
+        let y = (n / self.columns) * self.stride_y + 1;
+        [
+            x as f32 / self.width as f32,
+            y as f32 / self.height as f32,
+            (x + self.stride_x - 2) as f32 / self.width as f32,
+            (y + self.stride_y - 2) as f32 / self.height as f32,
+        ]
+    }
+}
+
+/// Share coverage pages among scaled glyphs. The T8 palette carries white RGB
+/// and coverage alpha, leaving the text color as a per-quad tint. One clear
+/// texel around each cell prevents sampling a neighboring glyph.
+pub(crate) fn glyph_page(
+    cache: &mut DiscCache,
+    textures: &mut Vec<crate::TexSlot>,
+    free: &mut Vec<u32>,
+    atlas: &crate::text::Atlas,
+    revision: u64,
+    gid: u16,
+) -> Option<GlyphSampler> {
+    if gid >= atlas.glyph_count {
+        return None;
+    }
+    let cw = atlas.coverage_width();
+    let ch = atlas.coverage_height();
+    let stride_x = cw + 2;
+    let stride_y = ch + 2;
+    let columns = spec::TEX_MAX_DIM / stride_x;
+    let rows = spec::TEX_MAX_DIM / stride_y;
+    if columns == 0 || rows == 0 {
+        return None;
+    }
+    let capacity = columns * rows;
+    let page = gid as u32 / capacity;
+    let first = page * capacity;
+    let count = (atlas.glyph_count as u32 - first).min(capacity);
+    let width = pow2_at_least(columns.min(count) * stride_x);
+    let height = pow2_at_least(count.div_ceil(columns) * stride_y);
+
+    // Retire old pages through the same generation-tagged lifetime rules as
+    // free_texture. Reusing a slot cannot make an old handle valid again.
+    cache.glyphs.retain(|entry| {
+        if entry.slot != atlas.slot || entry.revision == revision {
+            return true;
+        }
+        if let Some(index) = crate::tex_resolve(textures, entry.handle) {
+            let slot = &mut textures[index as usize];
+            slot.tex = None;
+            slot.gen = ((slot.gen as u32 + 1) & crate::TEX_GEN_MASK) as u16;
+            free.push(index);
+        }
+        false
+    });
+    let cached = cache.glyphs.iter().position(|e| e.slot == atlas.slot && e.page == page);
+    let entry = if let Some(i) = cached.filter(|&i| crate::tex_resolve(textures, cache.glyphs[i].handle).is_some()) {
+        &cache.glyphs[i]
+    } else {
+        if let Some(i) = cached { cache.glyphs.swap_remove(i); }
+        let byte_len = (width * height) as usize;
+        let mut data = alloc::vec![0u128; byte_len.div_ceil(16)];
+        let bytes = unsafe { core::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, byte_len) };
+        for n in 0..count {
+            let source = atlas.glyph_rows((first + n) as u16);
+            let x = (n % columns) * stride_x + 1;
+            let y = (n / columns) * stride_y + 1;
+            for row in 0..ch {
+                let from = (row * cw) as usize;
+                let to = ((y + row) * width + x) as usize;
+                bytes[to..to + cw as usize].copy_from_slice(&source[from..from + cw as usize]);
+            }
+        }
+        let mut palette = alloc::vec![0u128; 64];
+        let colors = unsafe { core::slice::from_raw_parts_mut(palette.as_mut_ptr() as *mut u32, 256) };
+        for (a, color) in colors.iter_mut().enumerate() {
+            *color = 0x00ff_ffff | ((a as u32) << 24);
+        }
+        let handle = crate::tex_alloc(textures, free, crate::Texture {
+            data, byte_len, w: width, h: height, psm: spec::psm::PSM_T8,
+            palette: Some(palette), linear: true, revision: 0,
+        });
+        if handle < 0 { return None; }
+        cache.glyphs.push(GlyphPage { slot: atlas.slot, revision, page, handle, width, height });
+        cache.glyphs.last()?
+    };
+    Some(GlyphSampler {
+        handle: entry.handle as u32, first, end: first + count,
+        columns, stride_x, stride_y, width: entry.width, height: entry.height,
+    })
 }
 
 impl DiscCache {
     pub const fn new() -> DiscCache {
-        DiscCache { entries: Vec::new() }
+        DiscCache { entries: Vec::new(), glyphs: Vec::new() }
     }
 }
 
@@ -848,6 +971,7 @@ struct Walker<'a> {
     tree: &'a Tree,
     styles: &'a StyleTable,
     fonts: &'a Fonts,
+    font_revisions: &'a [u64; spec::MAX_FONT_SLOTS],
     /// Global vblank counter — drives deterministic sprite frame selection.
     frame: u64,
     /// Viewport bounds in px — every emitted coordinate is clipped to
@@ -885,6 +1009,7 @@ pub fn build(
     tree: &Tree,
     styles: &StyleTable,
     fonts: &Fonts,
+    font_revisions: &[u64; spec::MAX_FONT_SLOTS],
     frame: u64,
     screen: (f32, f32),
     textures: &mut Vec<crate::TexSlot>,
@@ -900,6 +1025,7 @@ pub fn build(
         tree,
         styles,
         fonts,
+        font_revisions,
         frame,
         spec::ROOT_ID,
         screen,
@@ -921,6 +1047,7 @@ pub fn build_root(
     tree: &Tree,
     styles: &StyleTable,
     fonts: &Fonts,
+    font_revisions: &[u64; spec::MAX_FONT_SLOTS],
     frame: u64,
     root_id: i32,
     screen: (f32, f32),
@@ -946,6 +1073,7 @@ pub fn build_root(
         tree,
         styles,
         fonts,
+        font_revisions,
         frame,
         screen,
         glyph_scratch: Vec::new(),
@@ -2518,6 +2646,34 @@ impl<'a> Walker<'a> {
         scratch.clear();
         self.fonts
             .layout_run(&run, slot, r.tracking, r.line_height, r.text_align, box_w, &mut scratch);
+        if world.is_axis_aligned() && (world.a != 1.0 || world.d != 1.0) {
+            let mut page: Option<GlyphSampler> = None;
+            // The 2D overflow stack clips with SCISSOR. Clipping the quad at
+            // a moving inner edge changes its rounded UV sampling, so only
+            // clip its geometry at the viewport. Keep the 3D path separate.
+            let viewport = Clip::viewport(self.screen);
+            let glyph_clip = if self.in_3d { clip } else { &viewport };
+            for g in &scratch {
+                let (x, y) = world.apply(g.x, g.y);
+                if x + cell_w * world.a <= clip.x0 || x >= clip.x1 ||
+                    y + cell_h * world.d <= clip.y0 || y >= clip.y1 {
+                    continue;
+                }
+                if !page.as_ref().is_some_and(|page| page.contains(g.gid)) {
+                    page = glyph_page(self.discs, self.textures, self.tex_free,
+                        atlas, self.font_revisions[slot as usize], g.gid);
+                }
+                let Some(page) = page.as_ref() else { continue; };
+                let uv = page.uv(g.gid);
+                let glyph_world = world.then(&Affine::translate(g.x, g.y));
+                let before = dl.words.len();
+                self.emit_tex_quad(dl, &glyph_world, cell_w, cell_h, page.handle, 1.0,
+                    glyph_clip, uv[0], uv[1], uv[2], uv[3]);
+                if dl.words.len() > before { *dl.words.last_mut().unwrap() = color; }
+            }
+            self.glyph_scratch = scratch;
+            return;
+        }
         let start = dl.words.len();
         dl.words.push(spec::draw_op::GLYPH_RUN);
         dl.words.push(0); // patched below: slot | count << 16
