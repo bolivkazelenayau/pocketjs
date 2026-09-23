@@ -714,12 +714,22 @@ pub struct Primitive {
     material_buf: wgpu::Buffer,
 }
 
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MtoonRenderMode {
+    #[default]
+    Auto,
+    Native,
+    Fallback,
+}
+
 #[derive(Default, Clone, Copy)]
 pub struct ModelLoadOptions {
     /// Halve textures until no side exceeds this (mip-friendly box filter).
     /// Character/prop authoring resolutions routinely exceed what small
     /// windows can display; this is the biggest single memory lever.
     pub max_texture_dim: Option<u32>,
+    /// Rendering override only; required-extension validation is unchanged.
+    pub mtoon_render_mode: MtoonRenderMode,
 }
 
 /// One morph target of a primitive, stored sparse: only vertices the target
@@ -1143,6 +1153,7 @@ fn authored_materials(
     mtoon_descriptors: &[MtoonMaterialDescriptor],
     path: &Path,
     native_mtoon: bool,
+    mtoon_render_mode: MtoonRenderMode,
 ) -> Result<Vec<MaterialAsset>> {
     let material_count = doc.materials().count();
     let texture_count = doc.textures().count();
@@ -1203,13 +1214,20 @@ fn authored_materials(
                 .index()
                 .expect("document material iterator always has an index");
             let name = material.name().map(str::to_owned);
-            if let Some(descriptor) = mtoon_by_index.get(&index) {
+            if let Some(descriptor) = mtoon_by_index.get(&index)
+                && mtoon_render_mode != MtoonRenderMode::Fallback
+            {
                 let authored = MaterialAsset {
                     gltf_material_index: index,
                     name,
                     inputs: descriptor.inputs.clone(),
                     model: MaterialModel::Mtoon(Box::new(descriptor.mtoon.clone())),
                 };
+                if mtoon_render_mode == MtoonRenderMode::Native
+                    && !native_stage_f_capable(&authored)
+                {
+                    bail!("MToon material {index} cannot be represented by the native renderer in {}", path.display());
+                }
                 if let Some(base) = descriptor.inputs.base_color_texture.as_ref() {
                     let selected = base.effective_tex_coord();
                     if !base.current_base_color_fallback_uv_supported()
@@ -1874,16 +1892,29 @@ impl ModelAsset {
         S: AsRef<str>,
     {
         validate_load_options(opts)?;
+        if opts.mtoon_render_mode == MtoonRenderMode::Native
+            && mtoon_layout.is_none()
+            && !mtoon_descriptors.is_empty()
+        {
+            bail!(
+                "Native MToon requested but no native MToon material layout was provided for {label}"
+            );
+        }
         let allowed_required_extensions: Vec<String> = allowed_required_extensions
             .into_iter()
             .map(|extension| extension.as_ref().to_owned())
             .collect();
+        let native_layout = if opts.mtoon_render_mode == MtoonRenderMode::Fallback {
+            None
+        } else {
+            mtoon_layout
+        };
         let imported = import_glb_slice_with_mtoon_options(
             bytes,
             label,
             &allowed_required_extensions,
             opts.max_texture_dim,
-            if mtoon_layout.is_some() {
+            if native_layout.is_some() {
                 mtoon_descriptors
             } else {
                 &[]
@@ -1898,7 +1929,7 @@ impl ModelAsset {
             opts,
             &[],
             &mut cache,
-            mtoon_layout,
+            native_layout,
             mtoon_descriptors,
             imported,
         )
@@ -2054,7 +2085,13 @@ impl ModelAsset {
     ) -> Result<Arc<Self>> {
         let (doc, buffers, images) = imported;
         validate_model_input(&doc, &buffers, path)?;
-        let materials = authored_materials(&doc, mtoon_descriptors, path, mtoon_layout.is_some())?;
+        let materials = authored_materials(
+            &doc,
+            mtoon_descriptors,
+            path,
+            mtoon_layout.is_some(),
+            opts.mtoon_render_mode,
+        )?;
 
         // --- textures ------------------------------------------------------
         // Only upload images a material actually samples (some files carry
@@ -3824,9 +3861,9 @@ mod tests {
 
     use super::{
         ByteImageBudget, MAX_BYTE_IMAGE_BYTES, MAX_BYTE_IMAGE_COUNT, MaterialBaseColorMode,
-        MaterialRaw, ModelAsset, ModelLoadOptions, ModelTextureCacheKey, authored_materials,
-        authored_render_phase, authored_render_queue_offset, cap_texture_rgba, find_node_named,
-        import_glb_slice, import_glb_slice_with_options, mtoon_outline_enabled,
+        MaterialRaw, ModelAsset, ModelLoadOptions, ModelTextureCacheKey, MtoonRenderMode,
+        authored_materials, authored_render_phase, authored_render_queue_offset, cap_texture_rgba,
+        find_node_named, import_glb_slice, import_glb_slice_with_options, mtoon_outline_enabled,
         mtoon_texture_semantic, native_stage_f_capable, pocket3d_base_color_mode_from_extras,
         pocket3d_role_from_extras, sample_node_transform, semantic_material_matches, to_rgba8,
         validate_joint_palette_count, validate_model_input, validate_normalized_texcoord0,
@@ -4529,9 +4566,15 @@ mod tests {
             let doc = gltf::Gltf::from_slice_without_validation(&bytes)
                 .unwrap()
                 .document;
-            let error = authored_materials(&doc, &[], Path::new("uv1.glb"), false)
-                .unwrap_err()
-                .to_string();
+            let error = authored_materials(
+                &doc,
+                &[],
+                Path::new("uv1.glb"),
+                false,
+                MtoonRenderMode::Auto,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(
                 error.contains("material 0") && error.contains("TEXCOORD_1"),
                 "{error}"
@@ -6267,6 +6310,56 @@ mod tests {
         .unwrap();
         assert!(matches!(asset.materials[0].model, MaterialModel::Mtoon(_)));
         assert!(asset.primitives[0].mtoon_bind_group.is_some());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn stage_i_mtoon_render_modes_route_materials_without_changing_required_extensions() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for Stage I fixtures");
+        let renderer = crate::renderer::Renderer::new(&gpu, crate::gpu::OFFSCREEN_FORMAT).unwrap();
+        for (mode, unlit, expected_native) in [
+            (MtoonRenderMode::Auto, false, true),
+            (MtoonRenderMode::Native, false, true),
+            (MtoonRenderMode::Fallback, false, false),
+            (MtoonRenderMode::Fallback, true, false),
+        ] {
+            let bytes = if unlit {
+                mtoon_quad(false, "OPAQUE", true)
+            } else {
+                mtoon_quad_without_unlit()
+            };
+            let asset = ModelAsset::load_glb_bytes_opts_with_native_mtoon(
+                &gpu,
+                &renderer.model_material_layout,
+                &renderer.mtoon_material_layout,
+                &renderer.samplers,
+                &bytes,
+                "stage-i-mtoon-mode.glb",
+                &ModelLoadOptions {
+                    mtoon_render_mode: mode,
+                    ..Default::default()
+                },
+                ["VRMC_materials_mtoon"],
+                &[stage_c_descriptor()],
+            )
+            .unwrap();
+            let material = &asset.materials[0];
+            assert_eq!(
+                matches!(material.model, MaterialModel::Mtoon(_)),
+                expected_native
+            );
+            assert_eq!(
+                asset.primitives[0].mtoon_bind_group.is_some(),
+                expected_native
+            );
+            if mode == MtoonRenderMode::Fallback {
+                assert_eq!(matches!(material.model, MaterialModel::Unlit(_)), unlit);
+                assert_eq!(
+                    matches!(material.model, MaterialModel::PocketLit(_)),
+                    !unlit
+                );
+            }
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]

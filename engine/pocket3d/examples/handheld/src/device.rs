@@ -394,6 +394,7 @@ pub fn build(
         // More than enough for a 480 logical pixel widget, and a hard guard
         // against an authored model accidentally uploading 4K utility maps.
         max_texture_dim: Some(1024),
+        ..Default::default()
     };
     // Some authored assets put a strongly tinted glass sheet in front of the
     // LCD. Profiles can suppress such cosmetic layers with a transparent
