@@ -2,6 +2,7 @@
 //! (headless tests drive the same struct).
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use glam::Vec2;
 use winit::event::{
@@ -66,6 +67,8 @@ pub struct Input {
     /// One-turn cancellation edge raised by focus loss or an explicit input
     /// reset. This is distinct from a normal button release.
     interaction_cancelled: bool,
+    dropped_files: Vec<PathBuf>,
+    file_hovered: bool,
     /// A super/command chord is held — edit consumers usually skip
     /// `Char` events while true (they are shortcuts, not typing).
     super_down: bool,
@@ -168,6 +171,12 @@ impl Input {
                 self.cursor = Some(Vec2::new(position.x as f32, position.y as f32));
             }
             WindowEvent::CursorLeft { .. } => self.cursor = None,
+            WindowEvent::HoveredFile(_) => self.file_hovered = true,
+            WindowEvent::HoveredFileCancelled => self.file_hovered = false,
+            WindowEvent::DroppedFile(path) => {
+                self.file_hovered = false;
+                self.dropped_files.push(path.clone());
+            }
             WindowEvent::Focused(false) => self.clear(),
             _ => {}
         }
@@ -197,6 +206,8 @@ impl Input {
         self.scroll_started = false;
         self.scroll_ended = true;
         self.interaction_cancelled = true;
+        self.dropped_files.clear();
+        self.file_hovered = false;
         self.super_down = false;
     }
 
@@ -211,6 +222,7 @@ impl Input {
         self.scroll_started = false;
         self.scroll_ended = false;
         self.interaction_cancelled = false;
+        self.dropped_files.clear();
     }
 
     /// This frame's text-editing keystrokes, in press order (repeats
@@ -247,6 +259,16 @@ impl Input {
     /// reset for an intentional button release.
     pub fn interaction_cancelled(&self) -> bool {
         self.interaction_cancelled
+    }
+
+    /// Files dropped since the previous frame, in arrival order.
+    pub fn dropped_files(&self) -> &[PathBuf] {
+        &self.dropped_files
+    }
+
+    /// Whether a file drag is currently over the window.
+    pub fn file_hovered(&self) -> bool {
+        self.file_hovered
     }
 
     /// A super/command key is currently held.
@@ -321,6 +343,29 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_hover_and_drop_edges_follow_window_events() {
+        let mut input = Input::default();
+        let first = PathBuf::from(r"C:\avatars\First Avatar.VRM");
+        let second = PathBuf::from(r"C:\avatars\猫 avatar.vrm");
+
+        input.on_window_event(&WindowEvent::HoveredFile(first.clone()));
+        assert!(input.file_hovered());
+        input.end_frame();
+        assert!(input.file_hovered());
+
+        input.on_window_event(&WindowEvent::HoveredFileCancelled);
+        assert!(!input.file_hovered());
+        input.on_window_event(&WindowEvent::HoveredFile(first.clone()));
+        input.on_window_event(&WindowEvent::DroppedFile(first.clone()));
+        input.on_window_event(&WindowEvent::DroppedFile(second.clone()));
+        assert!(!input.file_hovered());
+        assert_eq!(input.dropped_files(), &[first, second]);
+
+        input.end_frame();
+        assert!(input.dropped_files().is_empty());
+    }
 
     #[test]
     fn end_frame_consumes_edges_but_preserves_held_state() {
