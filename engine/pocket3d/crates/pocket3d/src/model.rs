@@ -143,6 +143,14 @@ struct ModelTextureCacheKey {
     rgba: Box<[u8]>,
     color_space: TextureColorSpace,
     mip_semantic: MipSemantic,
+    mips: bool,
+}
+
+#[derive(Clone, Copy)]
+struct TextureUpload {
+    mip_semantic: MipSemantic,
+    mips: bool,
+    allow_core_lod0_reuse: bool,
 }
 
 /// Explicit content-addressed cache for textures shared by multiple models.
@@ -188,11 +196,14 @@ impl ModelTextureCache {
         self.get_or_upload_semantic(
             gpu,
             label,
-            width,
-            height,
+            (width, height),
             rgba,
             color_space,
-            MipSemantic::Legacy,
+            TextureUpload {
+                mip_semantic: MipSemantic::Legacy,
+                mips: true,
+                allow_core_lod0_reuse: false,
+            },
         )
     }
 
@@ -200,19 +211,32 @@ impl ModelTextureCache {
         &mut self,
         gpu: &Gpu,
         label: &str,
-        width: u32,
-        height: u32,
+        (width, height): (u32, u32),
         rgba: Vec<u8>,
         color_space: TextureColorSpace,
-        mip_semantic: MipSemantic,
+        upload: TextureUpload,
     ) -> Arc<GpuTexture> {
-        let key = ModelTextureCacheKey {
+        let mut key = ModelTextureCacheKey {
             width,
             height,
             rgba: rgba.into_boxed_slice(),
             color_space,
-            mip_semantic,
+            mip_semantic: upload.mip_semantic,
+            mips: upload.mips,
         };
+        // The core glTF chain uses legacy filtering. Its level zero is safe
+        // for a Native base/shade binding only when the effective sampler
+        // clamps LOD to zero and the capped pixels and format match exactly.
+        if upload.allow_core_lod0_reuse && !upload.mips {
+            key.mip_semantic = MipSemantic::Legacy;
+            key.mips = true;
+            if let Some(texture) = self.entries.get(&key) {
+                self.hits += 1;
+                return texture.clone();
+            }
+            key.mip_semantic = upload.mip_semantic;
+            key.mips = false;
+        }
         match self.entries.entry(key) {
             Entry::Occupied(entry) => {
                 self.hits += 1;
@@ -227,7 +251,7 @@ impl ModelTextureCache {
                     key.height,
                     &key.rgba,
                     key.color_space == TextureColorSpace::Srgb,
-                    true,
+                    key.mips,
                     key.mip_semantic,
                 ));
                 entry.insert(texture.clone());
@@ -1011,6 +1035,45 @@ fn mtoon_texture_semantic(texture: &TextureInfo) -> MipSemantic {
     }
 }
 
+fn native_texture_infos(material: &MaterialAsset) -> [Option<&TextureInfo>; 9] {
+    let MaterialModel::Mtoon(mtoon) = &material.model else {
+        unreachable!("Native MToon capability requires an MToon material")
+    };
+    [
+        material.inputs.base_color_texture.as_ref(),
+        material
+            .inputs
+            .normal_texture
+            .as_ref()
+            .map(|normal| &normal.texture),
+        mtoon.shade_multiply_texture.as_ref(),
+        mtoon
+            .shading_shift_texture
+            .as_ref()
+            .map(|shift| &shift.texture),
+        material.inputs.emissive_texture.as_ref(),
+        mtoon.matcap_texture.as_ref(),
+        mtoon.rim_multiply_texture.as_ref(),
+        mtoon.outline_width_multiply_texture.as_ref(),
+        mtoon.uv_animation_mask_texture.as_ref(),
+    ]
+}
+
+fn native_texture_mips_and_core_reuse(
+    texture: &TextureInfo,
+    native_mip_images: &HashSet<usize>,
+) -> (bool, bool) {
+    let sampler_reaches_mips = texture.sampler.to_wgpu_descriptor().lod_max_clamp > 0.0;
+    let mips = sampler_reaches_mips || native_mip_images.contains(&texture.image_index);
+    let reuse_core = !mips
+        && texture.color_space == TextureColorSpace::Srgb
+        && matches!(
+            texture.role,
+            TextureRole::BaseColor | TextureRole::ShadeMultiply
+        );
+    (mips, reuse_core)
+}
+
 fn mtoon_texture(
     gpu: &Gpu,
     cache: &mut ModelTextureCache,
@@ -1018,12 +1081,14 @@ fn mtoon_texture(
     opts: &ModelLoadOptions,
     texture: Option<&TextureInfo>,
     dummy: &Arc<GpuTexture>,
+    native_mip_images: &HashSet<usize>,
 ) -> Arc<GpuTexture> {
     let Some(texture) = texture else {
         return dummy.clone();
     };
     let image = &images[texture.image_index];
     let semantic = mtoon_texture_semantic(texture);
+    let (mips, reuse_core) = native_texture_mips_and_core_reuse(texture, native_mip_images);
     let (rgba, width, height) = cap_texture_rgba_semantic(
         to_rgba8(image),
         image.width,
@@ -1034,11 +1099,14 @@ fn mtoon_texture(
     cache.get_or_upload_semantic(
         gpu,
         &format!("MToon image {} {:?}", texture.image_index, texture.role),
-        width,
-        height,
+        (width, height),
         rgba,
         texture.color_space,
-        semantic,
+        TextureUpload {
+            mip_semantic: semantic,
+            mips,
+            allow_core_lod0_reuse: reuse_core,
+        },
     )
 }
 
@@ -2185,6 +2253,17 @@ impl ModelAsset {
         let mut mtoon_material_buffers = Vec::new();
         let mut mtoon_textures = Vec::new();
         if let Some(mtoon_layout) = mtoon_layout {
+            // Scan every effective Native binding before uploading. A shared
+            // image keeps its full semantic chain if any material can sample
+            // beyond level zero, independent of material iteration order.
+            let native_mip_images: HashSet<usize> = materials
+                .iter()
+                .filter(|material| native_stage_f_capable(material))
+                .flat_map(native_texture_infos)
+                .flatten()
+                .filter(|texture| texture.sampler.to_wgpu_descriptor().lod_max_clamp > 0.0)
+                .map(|texture| texture.image_index)
+                .collect();
             let black = Arc::new(create_rgba_texture(
                 gpu,
                 "MToon black MatCap",
@@ -2232,53 +2311,89 @@ impl ModelAsset {
                     }
                     continue;
                 }
-                let MaterialModel::Mtoon(mtoon) = &material.model else {
-                    unreachable!()
-                };
-                let base_info = material.inputs.base_color_texture.as_ref();
-                let normal_info = material
-                    .inputs
-                    .normal_texture
-                    .as_ref()
-                    .map(|normal| &normal.texture);
-                let shade_info = mtoon.shade_multiply_texture.as_ref();
-                let shift_info = mtoon
-                    .shading_shift_texture
-                    .as_ref()
-                    .map(|shift| &shift.texture);
-                let emissive_info = material.inputs.emissive_texture.as_ref();
-                let matcap_info = mtoon.matcap_texture.as_ref();
-                let rim_info = mtoon.rim_multiply_texture.as_ref();
-                let outline_info = mtoon.outline_width_multiply_texture.as_ref();
-                let uv_animation_mask_info = mtoon.uv_animation_mask_texture.as_ref();
-                let infos = [
-                    base_info,
-                    normal_info,
-                    shade_info,
-                    shift_info,
-                    emissive_info,
-                    matcap_info,
-                    rim_info,
-                    outline_info,
-                    uv_animation_mask_info,
-                ];
+                let infos = native_texture_infos(material);
                 let resources = [
-                    mtoon_texture(gpu, cache, &images, opts, base_info, &white),
-                    mtoon_texture(gpu, cache, &images, opts, normal_info, &flat_normal),
-                    mtoon_texture(gpu, cache, &images, opts, shade_info, &white),
-                    mtoon_texture(gpu, cache, &images, opts, shift_info, &zero_shift),
-                    // Core glTF emissiveFactor works without an emissiveTexture.
-                    mtoon_texture(gpu, cache, &images, opts, emissive_info, &white),
-                    mtoon_texture(gpu, cache, &images, opts, matcap_info, &black),
-                    mtoon_texture(gpu, cache, &images, opts, rim_info, &white),
-                    mtoon_texture(gpu, cache, &images, opts, outline_info, &white_data),
                     mtoon_texture(
                         gpu,
                         cache,
                         &images,
                         opts,
-                        uv_animation_mask_info,
+                        infos[0],
+                        &white,
+                        &native_mip_images,
+                    ),
+                    mtoon_texture(
+                        gpu,
+                        cache,
+                        &images,
+                        opts,
+                        infos[1],
+                        &flat_normal,
+                        &native_mip_images,
+                    ),
+                    mtoon_texture(
+                        gpu,
+                        cache,
+                        &images,
+                        opts,
+                        infos[2],
+                        &white,
+                        &native_mip_images,
+                    ),
+                    mtoon_texture(
+                        gpu,
+                        cache,
+                        &images,
+                        opts,
+                        infos[3],
+                        &zero_shift,
+                        &native_mip_images,
+                    ),
+                    // Core glTF emissiveFactor works without an emissiveTexture.
+                    mtoon_texture(
+                        gpu,
+                        cache,
+                        &images,
+                        opts,
+                        infos[4],
+                        &white,
+                        &native_mip_images,
+                    ),
+                    mtoon_texture(
+                        gpu,
+                        cache,
+                        &images,
+                        opts,
+                        infos[5],
+                        &black,
+                        &native_mip_images,
+                    ),
+                    mtoon_texture(
+                        gpu,
+                        cache,
+                        &images,
+                        opts,
+                        infos[6],
+                        &white,
+                        &native_mip_images,
+                    ),
+                    mtoon_texture(
+                        gpu,
+                        cache,
+                        &images,
+                        opts,
+                        infos[7],
                         &white_data,
+                        &native_mip_images,
+                    ),
+                    mtoon_texture(
+                        gpu,
+                        cache,
+                        &images,
+                        opts,
+                        infos[8],
+                        &white_data,
+                        &native_mip_images,
                     ),
                 ];
                 let samplers: Vec<wgpu::Sampler> = infos
@@ -3881,7 +3996,9 @@ fn import_glb_slice_with_mtoon_options(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::Path;
+    use std::sync::Arc;
 
     use base64::Engine as _;
     use glam::{Mat4, Quat, Vec3};
@@ -3890,8 +4007,8 @@ mod tests {
     use crate::anim::{AnimState, Channel, ChannelPath, Clip, Interpolation, NodeTrs, Skeleton};
     use crate::gpu::Gpu;
     use crate::material::{
-        GltfMagFilter, GltfMinFilter, GltfSampler, MaterialAlphaMode, MaterialAsset,
-        MaterialInputs, MaterialModel, MtoonMaterial, MtoonMaterialDescriptor,
+        GltfMagFilter, GltfMinFilter, GltfSampler, GltfSamplerCache, MaterialAlphaMode,
+        MaterialAsset, MaterialInputs, MaterialModel, MtoonMaterial, MtoonMaterialDescriptor,
         MtoonOutlineWidthMode, RenderPhase, ScaledTextureInfo, TextureColorSpace, TextureInfo,
         TextureRole, TextureTransform,
     };
@@ -3899,12 +4016,14 @@ mod tests {
 
     use super::{
         ByteImageBudget, MAX_BYTE_IMAGE_BYTES, MAX_BYTE_IMAGE_COUNT, MaterialBaseColorMode,
-        MaterialRaw, ModelAsset, ModelLoadOptions, ModelTextureCacheKey, MtoonRenderMode,
-        authored_materials, authored_render_phase, authored_render_queue_offset, cap_texture_rgba,
-        find_node_named, import_glb_slice, import_glb_slice_with_options, mtoon_outline_enabled,
-        mtoon_texture_semantic, native_stage_f_capable, pocket3d_base_color_mode_from_extras,
-        pocket3d_role_from_extras, sample_node_transform, semantic_material_matches, to_rgba8,
-        validate_joint_palette_count, validate_model_input, validate_normalized_texcoord0,
+        MaterialRaw, ModelAsset, ModelLoadOptions, ModelTextureCache, ModelTextureCacheKey,
+        MtoonRenderMode, TextureUpload, authored_materials, authored_render_phase,
+        authored_render_queue_offset, cap_texture_rgba, find_node_named, import_glb_slice,
+        import_glb_slice_with_options, mtoon_outline_enabled, mtoon_texture_semantic,
+        native_stage_f_capable, native_texture_mips_and_core_reuse,
+        pocket3d_base_color_mode_from_extras, pocket3d_role_from_extras, sample_node_transform,
+        semantic_material_matches, to_rgba8, validate_joint_palette_count, validate_model_input,
+        validate_normalized_texcoord0,
     };
 
     fn glb_from_json(value: Value, bin: &[u8]) -> Vec<u8> {
@@ -5120,6 +5239,7 @@ mod tests {
             rgba: rgba.into(),
             color_space,
             mip_semantic: MipSemantic::Legacy,
+            mips: true,
         };
         let reference = key(2, 1, &[1, 2, 3, 4, 5, 6, 7, 8], TextureColorSpace::Srgb);
         assert!(reference == key(2, 1, &[1, 2, 3, 4, 5, 6, 7, 8], TextureColorSpace::Srgb));
@@ -5133,6 +5253,7 @@ mod tests {
             rgba: pixels.clone(),
             color_space: TextureColorSpace::Srgb,
             mip_semantic: MipSemantic::SrgbColor,
+            mips: true,
         };
         let normal = ModelTextureCacheKey {
             width: 2,
@@ -5140,6 +5261,7 @@ mod tests {
             rgba: pixels.clone(),
             color_space: TextureColorSpace::Linear,
             mip_semantic: MipSemantic::TangentNormal,
+            mips: true,
         };
         let shift = ModelTextureCacheKey {
             width: 2,
@@ -5147,9 +5269,165 @@ mod tests {
             rgba: pixels,
             color_space: TextureColorSpace::Linear,
             mip_semantic: MipSemantic::LinearData,
+            mips: true,
         };
         assert!(color != normal);
         assert!(normal != shift);
+        let level_zero = ModelTextureCacheKey {
+            width: color.width,
+            height: color.height,
+            rgba: color.rgba.clone(),
+            color_space: color.color_space,
+            mip_semantic: color.mip_semantic,
+            mips: false,
+        };
+        assert!(color != level_zero);
+    }
+
+    #[test]
+    fn native_lod0_base_and_shade_reuse_exact_core_pixels_with_independent_state() {
+        let gpu = Gpu::new_headless().unwrap();
+        let mut cache = ModelTextureCache::new();
+        let pixels = vec![17; 4 * 4 * 4];
+        let core = cache.get_or_upload(&gpu, "core", 4, 4, pixels.clone(), TextureColorSpace::Srgb);
+        let mut base = stage_c_texture(TextureRole::BaseColor, 0);
+        base.transform.offset = [0.25, 0.5];
+        let mut shade = stage_c_texture(TextureRole::ShadeMultiply, 0);
+        shade.transform.scale = [0.5, 0.75];
+        shade.sampler.min_filter = Some(GltfMinFilter::Linear);
+        let no_mips = HashSet::new();
+        for info in [&base, &shade] {
+            let (mips, reuse_core) = native_texture_mips_and_core_reuse(info, &no_mips);
+            assert_eq!((mips, reuse_core), (false, true));
+            let native = cache.get_or_upload_semantic(
+                &gpu,
+                "native",
+                (4, 4),
+                pixels.clone(),
+                info.color_space,
+                TextureUpload {
+                    mip_semantic: mtoon_texture_semantic(info),
+                    mips,
+                    allow_core_lod0_reuse: reuse_core,
+                },
+            );
+            assert!(Arc::ptr_eq(&core, &native));
+        }
+        assert_eq!(cache.len(), 1);
+        assert_eq!(core.texture.mip_level_count(), 3);
+        assert_ne!(base.transform, shade.transform);
+
+        let core_sampler = Samplers::new(&gpu);
+        let mut native_samplers = GltfSamplerCache::new();
+        let authored = native_samplers.get_or_create(&gpu.device, shade.sampler);
+        assert!(!std::ptr::eq(&core_sampler.aniso_repeat, authored));
+        assert_eq!(shade.sampler.to_wgpu_descriptor().lod_max_clamp, 0.0);
+
+        let mut mismatched_format = base.clone();
+        mismatched_format.color_space = TextureColorSpace::Linear;
+        assert_eq!(
+            native_texture_mips_and_core_reuse(&mismatched_format, &no_mips),
+            (false, false)
+        );
+
+        let different_format = cache.get_or_upload_semantic(
+            &gpu,
+            "linear",
+            (4, 4),
+            pixels.clone(),
+            TextureColorSpace::Linear,
+            TextureUpload {
+                mip_semantic: MipSemantic::LinearData,
+                mips: false,
+                allow_core_lod0_reuse: true,
+            },
+        );
+        assert!(!Arc::ptr_eq(&core, &different_format));
+        let different_pixels = cache.get_or_upload_semantic(
+            &gpu,
+            "pixels",
+            (4, 4),
+            vec![18; 4 * 4 * 4],
+            TextureColorSpace::Srgb,
+            TextureUpload {
+                mip_semantic: MipSemantic::SrgbColor,
+                mips: false,
+                allow_core_lod0_reuse: true,
+            },
+        );
+        assert!(!Arc::ptr_eq(&core, &different_pixels));
+    }
+
+    #[test]
+    fn native_mipmapped_texture_keeps_semantic_chain_separate_from_core() {
+        let gpu = Gpu::new_headless().unwrap();
+        let mut cache = ModelTextureCache::new();
+        let pixels = vec![127; 8 * 4 * 4];
+        let core = cache.get_or_upload(&gpu, "core", 8, 4, pixels.clone(), TextureColorSpace::Srgb);
+        let mut base = stage_c_texture(TextureRole::BaseColor, 0);
+        base.sampler.min_filter = Some(GltfMinFilter::LinearMipmapLinear);
+        let required = HashSet::from([base.image_index]);
+        let (mips, reuse_core) = native_texture_mips_and_core_reuse(&base, &required);
+        assert_eq!((mips, reuse_core), (true, false));
+        let native = cache.get_or_upload_semantic(
+            &gpu,
+            "native",
+            (8, 4),
+            pixels,
+            base.color_space,
+            TextureUpload {
+                mip_semantic: mtoon_texture_semantic(&base),
+                mips,
+                allow_core_lod0_reuse: reuse_core,
+            },
+        );
+        assert!(!Arc::ptr_eq(&core, &native));
+        assert_eq!(native.texture.mip_level_count(), 4);
+    }
+
+    #[test]
+    fn native_only_no_mip_uses_one_level_and_mixed_samplers_keep_mips() {
+        let gpu = Gpu::new_headless().unwrap();
+        let mut cache = ModelTextureCache::new();
+        let pixels = vec![64; 8 * 8 * 4];
+        let no_mip = stage_c_texture(TextureRole::Normal, 1);
+        let (mips, reuse_core) = native_texture_mips_and_core_reuse(&no_mip, &HashSet::new());
+        assert_eq!((mips, reuse_core), (false, false));
+        let level_zero = cache.get_or_upload_semantic(
+            &gpu,
+            "level zero",
+            (8, 8),
+            pixels.clone(),
+            no_mip.color_space,
+            TextureUpload {
+                mip_semantic: mtoon_texture_semantic(&no_mip),
+                mips,
+                allow_core_lod0_reuse: reuse_core,
+            },
+        );
+        assert_eq!(level_zero.texture.mip_level_count(), 1);
+
+        let mut mipmapped = no_mip.clone();
+        mipmapped.sampler.min_filter = Some(GltfMinFilter::NearestMipmapNearest);
+        let required = HashSet::from([no_mip.image_index]);
+        for info in [&no_mip, &mipmapped] {
+            let (mips, reuse_core) = native_texture_mips_and_core_reuse(info, &required);
+            assert_eq!((mips, reuse_core), (true, false));
+            let full = cache.get_or_upload_semantic(
+                &gpu,
+                "mixed",
+                (8, 8),
+                pixels.clone(),
+                info.color_space,
+                TextureUpload {
+                    mip_semantic: mtoon_texture_semantic(info),
+                    mips,
+                    allow_core_lod0_reuse: reuse_core,
+                },
+            );
+            assert_eq!(full.texture.mip_level_count(), 4);
+            assert!(!Arc::ptr_eq(&level_zero, &full));
+        }
     }
 
     #[test]
