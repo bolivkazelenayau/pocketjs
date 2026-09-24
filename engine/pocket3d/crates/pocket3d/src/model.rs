@@ -714,6 +714,31 @@ pub struct Primitive {
     material_buf: wgpu::Buffer,
 }
 
+impl Primitive {
+    /// Resolve all route-dependent submission metadata from the same choice.
+    pub fn draw_route(&self, mode: MtoonRenderMode) -> PrimitiveDrawRoute {
+        let native = mode != MtoonRenderMode::Fallback && self.mtoon_bind_group.is_some();
+        PrimitiveDrawRoute {
+            native,
+            phase: if native {
+                self.render_phase
+            } else {
+                RenderPhase::fallback(self.alpha_mode)
+            },
+            queue_offset: if native { self.render_queue_offset } else { 0 },
+            outline: native && self.mtoon_outline,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrimitiveDrawRoute {
+    pub native: bool,
+    pub phase: RenderPhase,
+    pub queue_offset: i32,
+    pub outline: bool,
+}
+
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MtoonRenderMode {
     #[default]
@@ -850,6 +875,10 @@ pub struct ModelAsset {
     pub vbuf: wgpu::Buffer,
     pub ibuf: wgpu::Buffer,
     pub primitives: Vec<Primitive>,
+    /// Number of authored materials with a prepared native MToon bind group.
+    pub native_mtoon_material_count: usize,
+    /// Native-capable descriptors, including those omitted by a Fallback load.
+    pub native_mtoon_eligible_count: usize,
     /// Immutable authored materials, indexed exactly by glTF material index.
     materials: Vec<MaterialAsset>,
     pub skeleton: Skeleton,
@@ -1636,6 +1665,8 @@ impl ModelAsset {
                 material_buf,
             }],
             materials: vec![MaterialAsset::pocket_lit(0, Some(label.to_owned()))],
+            native_mtoon_material_count: 0,
+            native_mtoon_eligible_count: 0,
             skeleton: Skeleton {
                 parents: Vec::new(),
                 rest: Vec::new(),
@@ -1718,6 +1749,8 @@ impl ModelAsset {
                 material_buf,
             }],
             materials: vec![MaterialAsset::pocket_lit(0, Some(label.to_owned()))],
+            native_mtoon_material_count: 0,
+            native_mtoon_eligible_count: 0,
             skeleton: Skeleton {
                 parents: Vec::new(),
                 rest: Vec::new(),
@@ -2927,6 +2960,8 @@ impl ModelAsset {
             vbuf,
             ibuf,
             primitives,
+            native_mtoon_material_count: mtoon_groups.len(),
+            native_mtoon_eligible_count: mtoon_descriptors.len(),
             materials,
             skeleton,
             node_names,
@@ -3093,6 +3128,8 @@ fn to_rgba8(img: &gltf::image::Data) -> Vec<u8> {
 /// A model placed in the scene.
 pub struct ModelInstance {
     pub asset: Arc<ModelAsset>,
+    /// Selected draw route for this instance; never changes shared asset data.
+    pub mtoon_draw_route: MtoonRenderMode,
     /// Mutable material values owned by this instance and indexed by authored
     /// glTF material index. Stage G can upload these lazily without mutating
     /// the shared asset.
@@ -3117,6 +3154,7 @@ impl ModelInstance {
         let materials = MaterialStateSet::from_assets(&asset.materials);
         Self {
             asset,
+            mtoon_draw_route: MtoonRenderMode::Auto,
             materials,
             transform: Mat4::IDENTITY,
             tint: [1.0; 4],
@@ -6344,6 +6382,7 @@ mod tests {
             )
             .unwrap();
             let material = &asset.materials[0];
+            assert_eq!(asset.native_mtoon_eligible_count, 1);
             assert_eq!(
                 matches!(material.model, MaterialModel::Mtoon(_)),
                 expected_native
@@ -6360,6 +6399,141 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn dual_route_instance_switch_preserves_state_and_route_metadata() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for route tests");
+        let renderer = crate::renderer::Renderer::new(&gpu, crate::gpu::OFFSCREEN_FORMAT).unwrap();
+        let mut descriptor = stage_d_descriptor(
+            [1.0, 1.0, 1.0],
+            MaterialAlphaMode::Blend,
+            0.5,
+            true,
+            7,
+            false,
+        );
+        descriptor.mtoon.outline_width_mode = MtoonOutlineWidthMode::WorldCoordinates;
+        descriptor.mtoon.outline_width_factor = 0.03;
+        descriptor.mtoon.uv_animation_scroll_x_speed_factor = 0.5;
+        let asset = ModelAsset::load_glb_bytes_opts_with_native_mtoon(
+            &gpu,
+            &renderer.model_material_layout,
+            &renderer.mtoon_material_layout,
+            &renderer.samplers,
+            &mtoon_quad(true, "BLEND", true),
+            "dual-route.glb",
+            &ModelLoadOptions::default(),
+            std::iter::empty::<&str>(),
+            &[descriptor],
+        )
+        .unwrap();
+        assert_eq!(asset.native_mtoon_material_count, 1);
+        let primitive = &asset.primitives[0];
+        assert!(primitive.mtoon_bind_group.is_some());
+        let mut left = super::ModelInstance::new(asset.clone());
+        let right = super::ModelInstance::new(asset.clone());
+        left.pose = Some(vec![Mat4::from_translation(Vec3::X)]);
+        left.materials.get_mut(0).unwrap().base_color_factor = [0.2, 0.3, 0.4, 0.5];
+        left.materials
+            .get_mut(0)
+            .unwrap()
+            .mtoon
+            .as_mut()
+            .unwrap()
+            .shade_color_factor = [0.7, 0.2, 0.1];
+        left.materials
+            .get_mut(0)
+            .unwrap()
+            .texture_transforms
+            .insert(
+                TextureRole::BaseColor,
+                TextureTransform {
+                    offset: [0.25, -0.5],
+                    ..Default::default()
+                },
+            );
+        let material_before = left.materials.get(0).unwrap().clone();
+        let pose_before = left.pose.clone();
+        let native_raw = asset.instance_material_raw(0, &left.materials);
+        assert_eq!(native_raw.uv_animation[0], 0.5);
+        let identity = std::sync::Arc::as_ptr(&left.asset);
+        for (mode, expected_native) in [
+            (MtoonRenderMode::Native, true),
+            (MtoonRenderMode::Fallback, false),
+            (MtoonRenderMode::Native, true),
+            (MtoonRenderMode::Fallback, false),
+        ] {
+            left.mtoon_draw_route = mode;
+            let route = primitive.draw_route(left.mtoon_draw_route);
+            assert_eq!(route.native, expected_native);
+            assert_eq!(route.outline, expected_native);
+            assert_eq!(
+                route.phase,
+                if expected_native {
+                    RenderPhase::MtoonBlendZWrite
+                } else {
+                    RenderPhase::Blend
+                }
+            );
+            assert_eq!(route.queue_offset, if expected_native { 7 } else { 0 });
+            assert_eq!(left.pose, pose_before);
+            assert_eq!(left.materials.get(0).unwrap(), &material_before);
+            assert_eq!(
+                asset.instance_material_raw(0, &left.materials).uv_animation,
+                native_raw.uv_animation
+            );
+            assert_eq!(std::sync::Arc::as_ptr(&left.asset), identity);
+            assert!(std::sync::Arc::ptr_eq(&left.asset, &right.asset));
+            assert_ne!(left.materials.get(0), right.materials.get(0));
+            assert!(primitive.draw_route(right.mtoon_draw_route).native);
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn auto_keeps_mixed_native_and_core_material_routes() {
+        let gpu = Gpu::new_headless().expect("headless GPU is required for route tests");
+        let renderer = crate::renderer::Renderer::new(&gpu, crate::gpu::OFFSCREEN_FORMAT).unwrap();
+        let bytes = mtoon_quad(true, "OPAQUE", true);
+        let glb = gltf::binary::Glb::from_slice(&bytes).unwrap();
+        let mut json: serde_json::Value = serde_json::from_slice(&glb.json).unwrap();
+        let mut fallback_material = json["materials"][0].clone();
+        fallback_material["extensions"]["VRMC_materials_mtoon"] =
+            serde_json::json!({"specVersion": "future"});
+        json["materials"]
+            .as_array_mut()
+            .unwrap()
+            .push(fallback_material);
+        let mut fallback_primitive = json["meshes"][0]["primitives"][0].clone();
+        fallback_primitive["material"] = serde_json::json!(1);
+        json["meshes"][0]["primitives"]
+            .as_array_mut()
+            .unwrap()
+            .push(fallback_primitive);
+        let bytes = glb_from_json(json, glb.bin.as_deref().unwrap());
+        let asset = ModelAsset::load_glb_bytes_opts_with_native_mtoon(
+            &gpu,
+            &renderer.model_material_layout,
+            &renderer.mtoon_material_layout,
+            &renderer.samplers,
+            &bytes,
+            "mixed-auto.glb",
+            &ModelLoadOptions::default(),
+            std::iter::empty::<&str>(),
+            &[stage_c_descriptor()],
+        )
+        .unwrap();
+        assert_eq!(asset.native_mtoon_material_count, 1);
+        assert_eq!(asset.primitives.len(), 2);
+        assert!(asset.primitives[0].draw_route(MtoonRenderMode::Auto).native);
+        assert!(!asset.primitives[1].draw_route(MtoonRenderMode::Auto).native);
+        assert!(
+            !asset.primitives[0]
+                .draw_route(MtoonRenderMode::Fallback)
+                .native
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]

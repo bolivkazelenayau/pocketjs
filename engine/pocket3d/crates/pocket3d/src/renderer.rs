@@ -9,7 +9,7 @@ use crate::camera::Camera;
 use crate::gpu::{DEPTH_FORMAT, DepthTarget, Gpu};
 use crate::hud::{ATLAS_H, ATLAS_W, Hud, HudVertex, build_font_atlas};
 use crate::material::{MaterialPipelineKey, PipelineShadingModel, RenderPhase, RenderSortKey};
-use crate::model::{MaterialInstanceRaw, ModelAsset, ModelInstance, ModelVertex};
+use crate::model::{MaterialInstanceRaw, ModelAsset, ModelInstance, ModelVertex, MtoonRenderMode};
 use crate::scene::Scene;
 use crate::texture::{GpuTexture, Samplers, create_rgba_texture};
 use crate::world::{WorldBatchKind, WorldVertex};
@@ -937,6 +937,7 @@ fn camera_relative_depth(camera: &Camera, model: Mat4, rest_bounds_center: Vec3)
 
 pub(crate) struct ModelDraw {
     asset: std::sync::Arc<ModelAsset>,
+    mtoon_draw_route: MtoonRenderMode,
     inst_offset: u32,
     joints_offset: u32,
     model: Mat4,
@@ -1593,6 +1594,7 @@ impl ModelPass {
 
             draws.push(ModelDraw {
                 asset: inst.asset.clone(),
+                mtoon_draw_route: inst.mtoon_draw_route,
                 inst_offset: off as u32,
                 joints_offset,
                 model: inst.transform,
@@ -1672,9 +1674,8 @@ impl ModelPass {
                 continue;
             }
             for (primitive_index, primitive) in draw.asset.primitives.iter().enumerate() {
-                let phase = primitive
-                    .render_phase
-                    .with_presentation_alpha(draw.presentation_alpha);
+                let route = primitive.draw_route(draw.mtoon_draw_route);
+                let phase = route.phase.with_presentation_alpha(draw.presentation_alpha);
                 let camera_depth = if phase.pass_class() == crate::material::RenderPassClass::Blend
                 {
                     camera_relative_depth(camera, draw.model, primitive.rest_bounds_center)
@@ -1686,7 +1687,7 @@ impl ModelPass {
                     primitive_index,
                     sort_key: RenderSortKey {
                         phase,
-                        queue_offset: primitive.render_queue_offset,
+                        queue_offset: route.queue_offset,
                         camera_depth,
                         author_draw_order,
                     },
@@ -1725,7 +1726,8 @@ impl ModelPass {
             );
             pass.set_index_buffer(d.asset.ibuf.slice(..), wgpu::IndexFormat::Uint32);
             let phase = submission.sort_key.phase;
-            let pipeline_key = if prim.mtoon_bind_group.is_some() {
+            let route = prim.draw_route(d.mtoon_draw_route);
+            let pipeline_key = if route.native {
                 MaterialPipelineKey::native_stage_d(phase, prim.double_sided, self.sample_count)
             } else {
                 MaterialPipelineKey::current_fallback(
@@ -1759,7 +1761,13 @@ impl ModelPass {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(
                 1,
-                prim.mtoon_bind_group.as_deref().unwrap_or(&prim.bind_group),
+                if route.native {
+                    prim.mtoon_bind_group
+                        .as_deref()
+                        .expect("native route has bind group")
+                } else {
+                    &prim.bind_group
+                },
                 &[],
             );
             // Morphing primitives read vertices from the instance's overlay
@@ -1786,7 +1794,7 @@ impl ModelPass {
             // reuses the exact index/vertex or morph-overlay binding and the
             // same instance/joint dynamic offsets, so no other transparent
             // primitive can interleave between the pair.
-            if prim.mtoon_outline {
+            if route.outline {
                 debug_assert!(prim.mtoon_bind_group.is_some());
                 let outline_pipeline = match phase {
                     RenderPhase::Opaque => &self.mtoon_outline_opaque,
