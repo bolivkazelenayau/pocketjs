@@ -149,6 +149,9 @@ pub struct WindowRuntimeState {
 
 /// What the app loop needs from a game.
 pub trait Game {
+    /// The owning native window is available before `init`. Games that open
+    /// native dialogs can retain this handle to parent them to the app window.
+    fn window_ready(&mut self, _window: Arc<Window>) {}
     /// Called once after the GPU exists — load assets here.
     fn init(&mut self, gpu: &Gpu, renderer: &mut Renderer) -> Result<()>;
     /// Called before [`Game::init`] and before each rendered frame with the
@@ -726,6 +729,7 @@ impl<G: Game> WinitApp<G> {
         self.game.window_runtime_state(runtime.state);
         self.game
             .window_metrics((px.width, px.height), window.scale_factor());
+        self.game.window_ready(window.clone());
         self.game.init(&gpu, &mut renderer)?;
 
         #[cfg(target_os = "windows")]
