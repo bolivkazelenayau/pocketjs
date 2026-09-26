@@ -91,6 +91,8 @@ impl HumanoidView<'_> {
 /// Parse a `.vrma` GLB: glTF animation 0 plus `VRMC_vrm_animation`.
 /// Sampler interpolation LINEAR/STEP is kept; CUBICSPLINE keeps the middle
 /// values and degrades to LINEAR. Sparse accessors are rejected.
+/// Missing specVersion is accepted with a legacy-compatibility warning; an
+/// explicitly present version must still be the string "1.0".
 pub fn load_vrma_bytes(bytes: &[u8]) -> Result<VrmaDoc> {
     let glb = glb::parse_glb(bytes)?;
     let ext = glb
@@ -98,14 +100,20 @@ pub fn load_vrma_bytes(bytes: &[u8]) -> Result<VrmaDoc> {
         .get("extensions")
         .and_then(|e| e.get("VRMC_vrm_animation"))
         .context("not a .vrma: missing extensions.VRMC_vrm_animation")?;
-    let spec_version = ext
-        .get("specVersion")
-        .and_then(Value::as_str)
-        .context("VRMC_vrm_animation.specVersion must be a string")?;
-    ensure!(
-        spec_version == "1.0",
-        "VRMC_vrm_animation.specVersion must be \"1.0\", got \"{spec_version}\""
-    );
+    match ext.get("specVersion") {
+        None => log::warn!(
+            "VRMC_vrm_animation.specVersion is missing; assuming 1.0 for legacy/buggy VRMA compatibility (input is not schema-conformant)"
+        ),
+        Some(value) => {
+            let spec_version = value
+                .as_str()
+                .context("VRMC_vrm_animation.specVersion must be a string")?;
+            ensure!(
+                spec_version == "1.0",
+                "VRMC_vrm_animation.specVersion must be \"1.0\", got \"{spec_version}\""
+            );
+        }
+    }
 
     // humanoid.humanBones is an object: { boneName: { node } }. serde_json
     // objects iterate in sorted key order, so this Vec is deterministic.
@@ -1352,6 +1360,33 @@ mod tests {
         let humanoid = vrm1_humanoid(&[(Vrm1HumanBone::Spine, 0)]);
         let model = skeleton(vec![NodeTrs::IDENTITY], vec![usize::MAX]);
         assert!(retarget_with_humanoid(&vrma, HumanoidView::Vrm1(&humanoid), &model).is_ok());
+    }
+
+    #[test]
+    fn vrma_accepts_1_0_and_missing_legacy_version_but_rejects_invalid_values() {
+        for version in [None, Some(serde_json::json!("1.0"))] {
+            let mut json = serde_json::json!({
+                "extensions": {"VRMC_vrm_animation": {}},
+                "animations": [{"samplers": [], "channels": []}]
+            });
+            if let Some(version) = version {
+                json["extensions"]["VRMC_vrm_animation"]["specVersion"] = version;
+            }
+            assert!(load_vrma_bytes(&json_glb(&json.to_string())).is_ok());
+        }
+        for version in [
+            serde_json::json!(null),
+            serde_json::json!(1.0),
+            serde_json::json!(""),
+            serde_json::json!("2.0"),
+        ] {
+            let json = serde_json::json!({
+                "extensions": {"VRMC_vrm_animation": {"specVersion": version}},
+                "animations": [{"samplers": [], "channels": []}]
+            });
+            let error = load_vrma_bytes(&json_glb(&json.to_string())).err().unwrap();
+            assert!(error.to_string().contains("specVersion"), "{error:#}");
+        }
     }
 
     #[test]
