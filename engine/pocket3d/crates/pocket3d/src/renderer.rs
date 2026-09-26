@@ -1,7 +1,7 @@
 //! Forward renderer. One `Renderer` owns all pipelines; each frame it draws
 //! a `Scene` (3D) then a `Hud` (2D overlay) into any color view.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 
@@ -638,6 +638,8 @@ impl Renderer {
         }
     }
 
+    /// If a frame's combined joint data exceeds one device buffer, logs the
+    /// preparation error and renders the rest of the frame without models.
     pub fn render(
         &mut self,
         gpu: &Gpu,
@@ -715,7 +717,13 @@ impl Renderer {
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         // Upload per-instance data (joint palettes etc.) before recording.
-        let (model_draws, viewmodel_draw) = self.models.prepare(gpu, scene, camera);
+        let (model_draws, viewmodel_draw) = match self.models.prepare(gpu, scene, camera) {
+            Ok(draws) => draws,
+            Err(error) => {
+                log::error!("model frame preparation failed: {error:#}");
+                (Vec::new(), None)
+            }
+        };
         let sprite_verts = self.sprites.prepare(gpu, scene, camera);
 
         let mut encoder = gpu
@@ -900,10 +908,59 @@ impl Renderer {
 // ---------------------------------------------------------------------------
 
 const INSTANCE_STRIDE: u64 = 256;
-const JOINT_ALIGN: u64 = 256;
-/// Fixed window each draw binds from the joints buffer: 512 mat4s (32 KB),
-/// sized for typical articulated character skins.
-const JOINT_WINDOW: u64 = 512 * 64;
+const JOINT_MATRIX_BYTES: u64 = std::mem::size_of::<Mat4>() as u64;
+
+fn joint_palette_bytes(count: usize, binding_limit: u64) -> Result<u64> {
+    let bytes = u64::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_mul(JOINT_MATRIX_BYTES))
+        .ok_or_else(|| anyhow!("joint palette byte size overflows"))?;
+    if bytes > binding_limit {
+        bail!(
+            "joint palette requires {count} joints ({bytes} bytes), but the device storage binding supports {binding_limit} bytes ({} joints)",
+            binding_limit / JOINT_MATRIX_BYTES
+        );
+    }
+    Ok(bytes)
+}
+
+fn joint_palette_offset(
+    end: u64,
+    alignment: u64,
+    palette_bytes: u64,
+    buffer_limit: u64,
+) -> Result<(u32, u64)> {
+    let padding = (alignment - end % alignment) % alignment;
+    let offset = end
+        .checked_add(padding)
+        .ok_or_else(|| anyhow!("joint buffer offset overflows"))?;
+    let offset_u32 = u32::try_from(offset)
+        .map_err(|_| anyhow!("joint dynamic offset {offset} exceeds u32 range"))?;
+    let next_end = offset
+        .checked_add(palette_bytes)
+        .ok_or_else(|| anyhow!("joint buffer size overflows"))?;
+    if next_end > buffer_limit {
+        bail!(
+            "frame joint palettes require {next_end} bytes, but the device max_buffer_size is {buffer_limit} bytes"
+        );
+    }
+    Ok((offset_u32, next_end))
+}
+
+fn joint_buffer_capacity(required: u64, current: u64, limit: u64) -> Result<u64> {
+    if required > limit {
+        bail!(
+            "frame joint palettes require {required} bytes, but the device max_buffer_size is {limit} bytes"
+        );
+    }
+    if required <= current {
+        return Ok(current);
+    }
+    Ok(required
+        .checked_next_power_of_two()
+        .unwrap_or(limit)
+        .min(limit))
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -987,6 +1044,7 @@ struct ModelPass {
     material_instance_buf: wgpu::Buffer,
     instance_capacity: u64,
     joints_capacity: u64,
+    joint_binding_size: u64,
     material_instance_capacity: u64,
     material_instance_stride: u64,
     scene_submissions: Vec<ModelSubmission>,
@@ -1098,7 +1156,8 @@ impl ModelPass {
         ) = Self::create_pipelines(device, color_format, &shader, &layout, sample_count);
 
         let instance_capacity = 64 * INSTANCE_STRIDE;
-        let joints_capacity = 256 * 1024;
+        let joints_capacity = (256 * 1024).min(device.limits().max_buffer_size);
+        let joint_binding_size = JOINT_MATRIX_BYTES;
         let material_instance_stride = aligned_size(
             std::mem::size_of::<MaterialInstanceRaw>() as u64,
             device.limits().min_uniform_buffer_offset_alignment as u64,
@@ -1114,6 +1173,7 @@ impl ModelPass {
             &instance_buf,
             &joints_buf,
             &material_instance_buf,
+            joint_binding_size,
         );
 
         Self {
@@ -1149,6 +1209,7 @@ impl ModelPass {
             material_instance_buf,
             instance_capacity,
             joints_capacity,
+            joint_binding_size,
             material_instance_capacity,
             material_instance_stride,
             scene_submissions: Vec::new(),
@@ -1487,6 +1548,7 @@ impl ModelPass {
         instances: &wgpu::Buffer,
         joints: &wgpu::Buffer,
         materials: &wgpu::Buffer,
+        joint_binding_size: u64,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("model object bg"),
@@ -1505,7 +1567,7 @@ impl ModelPass {
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: joints,
                         offset: 0,
-                        size: wgpu::BufferSize::new(JOINT_WINDOW),
+                        size: wgpu::BufferSize::new(joint_binding_size),
                     }),
                 },
                 wgpu::BindGroupEntry {
@@ -1529,14 +1591,21 @@ impl ModelPass {
         gpu: &Gpu,
         scene: &Scene,
         camera: &Camera,
-    ) -> (Vec<ModelDraw>, Option<ModelDraw>) {
+    ) -> Result<(Vec<ModelDraw>, Option<ModelDraw>)> {
+        self.scene_submissions.clear();
+        self.viewmodel_submissions.clear();
         let all: Vec<&ModelInstance> = scene.models.iter().chain(scene.viewmodel.iter()).collect();
         if all.is_empty() {
-            return (Vec::new(), None);
+            return Ok((Vec::new(), None));
         }
 
+        let limits = gpu.device.limits();
+        let binding_limit = limits.max_storage_buffer_binding_size as u64;
+        let buffer_limit = limits.max_buffer_size;
+        let joint_alignment = limits.min_storage_buffer_offset_alignment as u64;
         let mut inst_bytes = vec![0u8; all.len() * INSTANCE_STRIDE as usize];
-        let mut joint_bytes: Vec<u8> = Vec::with_capacity(all.len() * 64 * 4);
+        let mut joint_bytes: Vec<u8> = Vec::new();
+        let mut joint_binding_size = JOINT_MATRIX_BYTES;
         let mut material_bytes = Vec::new();
         let mut draws = Vec::with_capacity(all.len());
         let mut palette: Vec<Mat4> = Vec::new();
@@ -1562,22 +1631,21 @@ impl ModelPass {
                 Some(globals) => inst.asset.palette_from_globals(globals, &mut palette),
                 None => inst.asset.joint_palette(&inst.anim, &mut palette),
             }
-            if palette.len() as u64 * 64 > JOINT_WINDOW {
-                log::warn!(
-                    "model has {} joints; truncating to {}",
-                    palette.len(),
-                    JOINT_WINDOW / 64
-                );
-                palette.truncate((JOINT_WINDOW / 64) as usize);
-            }
-            let joints_offset = joint_bytes.len() as u32;
+            let palette_bytes = joint_palette_bytes(palette.len(), binding_limit)?;
+            joint_binding_size = joint_binding_size.max(palette_bytes);
+            let (joints_offset, end) = joint_palette_offset(
+                joint_bytes.len() as u64,
+                joint_alignment,
+                palette_bytes,
+                buffer_limit,
+            )?;
+            let end = usize::try_from(end)
+                .map_err(|_| anyhow!("joint buffer size exceeds addressable memory"))?;
+            joint_bytes.resize(joints_offset as usize, 0);
             for m in &palette {
                 joint_bytes.extend_from_slice(bytemuck::cast_slice(&m.to_cols_array()));
             }
-            // Align the next palette.
-            let pad = (JOINT_ALIGN as usize - joint_bytes.len() % JOINT_ALIGN as usize)
-                % JOINT_ALIGN as usize;
-            joint_bytes.extend(std::iter::repeat_n(0u8, pad));
+            debug_assert_eq!(joint_bytes.len(), end);
 
             let material_offsets = (0..inst.asset.primitives.len())
                 .map(|primitive_index| {
@@ -1604,9 +1672,19 @@ impl ModelPass {
             });
         }
 
-        // Every dynamic offset must leave a full JOINT_WINDOW in range.
+        // A dynamic offset moves the start, while the bind group's range is
+        // shared by every draw. Only the last palette may need tail padding.
         if let Some(last) = draws.last() {
-            let need = last.joints_offset as usize + JOINT_WINDOW as usize;
+            let need = (last.joints_offset as u64)
+                .checked_add(joint_binding_size)
+                .ok_or_else(|| anyhow!("joint binding end overflows"))?;
+            if need > buffer_limit {
+                bail!(
+                    "frame joint palettes require {need} bytes including the shared binding range, but the device max_buffer_size is {buffer_limit} bytes"
+                );
+            }
+            let need = usize::try_from(need)
+                .map_err(|_| anyhow!("joint buffer size exceeds addressable memory"))?;
             if joint_bytes.len() < need {
                 joint_bytes.resize(need, 0);
             }
@@ -1621,8 +1699,16 @@ impl ModelPass {
             recreate = true;
         }
         if joint_bytes.len() as u64 > self.joints_capacity {
-            self.joints_capacity = (joint_bytes.len() as u64).next_power_of_two();
+            self.joints_capacity = joint_buffer_capacity(
+                joint_bytes.len() as u64,
+                self.joints_capacity,
+                buffer_limit,
+            )?;
             self.joints_buf = Self::make_joints_buf(device, self.joints_capacity);
+            recreate = true;
+        }
+        if joint_binding_size != self.joint_binding_size {
+            self.joint_binding_size = joint_binding_size;
             recreate = true;
         }
         if material_bytes.len() as u64 > self.material_instance_capacity {
@@ -1638,6 +1724,7 @@ impl ModelPass {
                 &self.instance_buf,
                 &self.joints_buf,
                 &self.material_instance_buf,
+                self.joint_binding_size,
             );
         }
         gpu.queue.write_buffer(&self.instance_buf, 0, &inst_bytes);
@@ -1656,7 +1743,7 @@ impl ModelPass {
             camera,
             &mut self.viewmodel_submissions,
         );
-        (draws, viewmodel)
+        Ok((draws, viewmodel))
     }
 
     fn collect_submissions(
@@ -2283,9 +2370,37 @@ mod tests {
 
     use super::{
         GlobalsRaw, InstanceRaw, RendererConfig, TargetResizePlan, camera_relative_depth,
-        model_normal_matrix, presentation_alpha, sample_count_transition,
-        select_effective_sample_count,
+        joint_buffer_capacity, joint_palette_bytes, joint_palette_offset, model_normal_matrix,
+        presentation_alpha, sample_count_transition, select_effective_sample_count,
     };
+
+    #[test]
+    fn joint_binding_and_packing_follow_injected_device_limits() {
+        assert_eq!(joint_palette_bytes(512, 512 * 64).unwrap(), 32768);
+        assert_eq!(joint_palette_bytes(513, 513 * 64).unwrap(), 32832);
+        assert!(joint_palette_bytes(514, 513 * 64).is_err());
+        assert!(joint_palette_bytes(usize::MAX, u64::MAX).is_err());
+        assert_eq!(
+            joint_palette_offset(32832, 256, 64, 65536).unwrap(),
+            (33024, 33088)
+        );
+        assert!(joint_palette_offset(u64::MAX, 256, 64, u64::MAX).is_err());
+        assert!(joint_palette_offset(65536, 256, 64, 65536).is_err());
+        assert_eq!(joint_buffer_capacity(900, 512, 1000).unwrap(), 1000);
+        assert_eq!(joint_buffer_capacity(1000, 512, 1000).unwrap(), 1000);
+        assert!(joint_buffer_capacity(1001, 512, 1000).is_err());
+    }
+
+    #[test]
+    fn aggregate_joint_frame_overflow_is_reported_as_frame_capacity() {
+        let error = joint_palette_offset(900, 256, 128, 1024).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("frame joint palettes require 1152 bytes")
+        );
+        assert!(error.to_string().contains("max_buffer_size is 1024 bytes"));
+    }
 
     #[test]
     fn presentation_alpha_is_bounded_and_non_finite_is_opaque() {

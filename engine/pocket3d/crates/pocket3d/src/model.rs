@@ -2186,6 +2186,19 @@ impl ModelAsset {
     ) -> Result<Arc<Self>> {
         let (doc, buffers, images) = imported;
         validate_model_input(&doc, &buffers, path)?;
+        let combined_joint_count = doc
+            .skins()
+            .try_fold(0usize, |count, skin| {
+                count.checked_add(skin.joints().count())
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("combined skin joint count overflows in {}", path.display())
+            })?;
+        validate_joint_palette_count(
+            combined_joint_count,
+            gpu.device.limits().max_storage_buffer_binding_size as u64,
+            path,
+        )?;
         let materials = authored_materials(
             &doc,
             mtoon_descriptors,
@@ -2515,14 +2528,26 @@ impl ModelAsset {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut next_skin_base = 0u32;
         let skin_base: Vec<u32> = skins
             .iter()
-            .scan(0u32, |acc, s| {
-                let base = *acc;
-                *acc += s.joints.len() as u32;
-                Some(base)
+            .map(|skin| {
+                let base = next_skin_base;
+                let count = u32::try_from(skin.joints.len()).map_err(|_| {
+                    anyhow::anyhow!(
+                        "skin joint count exceeds u32 index range in {}",
+                        path.display()
+                    )
+                })?;
+                next_skin_base = base.checked_add(count).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "combined skin joint indices overflow u32 in {}",
+                        path.display()
+                    )
+                })?;
+                Ok(base)
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         // --- meshes ----------------------------------------------------------
         // Global transforms of the rest pose, to bake node placement into
@@ -2655,15 +2680,17 @@ impl ModelAsset {
                             primitive_aabb.0 = primitive_aabb.0.min(rest);
                             primitive_aabb.1 = primitive_aabb.1.max(rest);
                             let base = skin_base[si];
-                            (
-                                [
-                                    base + joints[i][0] as u32,
-                                    base + joints[i][1] as u32,
-                                    base + joints[i][2] as u32,
-                                    base + joints[i][3] as u32,
-                                ],
-                                weights[i],
-                            )
+                            let mut remapped = [0u32; 4];
+                            for (slot, joint) in joints[i].iter().enumerate() {
+                                remapped[slot] =
+                                    base.checked_add(u32::from(*joint)).ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "skin joint remapping overflows u32 in {}",
+                                            path.display()
+                                        )
+                                    })?;
+                            }
+                            (remapped, weights[i])
                         }
                         None => {
                             aabb.0 = aabb.0.min(p);
@@ -3303,12 +3330,17 @@ fn validate_attribute_count(
     Ok(())
 }
 
-const MAX_RENDERER_JOINTS: usize = 512;
-
-fn validate_joint_palette_count(joint_count: usize, path: &Path) -> Result<()> {
-    if joint_count > MAX_RENDERER_JOINTS {
+fn validate_joint_palette_count(joint_count: usize, binding_limit: u64, path: &Path) -> Result<()> {
+    let required_bytes = u64::try_from(joint_count)
+        .ok()
+        .and_then(|count| count.checked_mul(std::mem::size_of::<Mat4>() as u64))
+        .ok_or_else(|| {
+            anyhow::anyhow!("joint palette byte size overflows in {}", path.display())
+        })?;
+    if required_bytes > binding_limit {
         bail!(
-            "combined skin joint count {joint_count} exceeds renderer joint palette limit {MAX_RENDERER_JOINTS} in {}",
+            "combined skin joint palette requires {joint_count} joints ({required_bytes} bytes), but the device storage binding supports {binding_limit} bytes ({} joints) in {}",
+            binding_limit / std::mem::size_of::<Mat4>() as u64,
             path.display()
         );
     }
@@ -3325,8 +3357,6 @@ fn validate_model_input(
         .skins()
         .map(|skin| skin.joints().map(|joint| joint.index()).collect())
         .collect();
-    let combined_joint_count = skin_joint_counts.iter().map(Vec::len).sum();
-    validate_joint_palette_count(combined_joint_count, path)?;
 
     for (skin_index, skin) in doc.skins().enumerate() {
         let joint_count = skin_joint_counts[skin_index].len();
@@ -4569,6 +4599,7 @@ mod tests {
         }
         let weight_offset = bin.len();
         let weights = append_f32_accessor(&mut bin, &mut views, &mut accessors, 3, 4);
+        bin[weight_offset..weight_offset + 3 * 16].fill(0);
         for vertex in 0..3 {
             let offset = weight_offset + vertex * 16;
             bin[offset..offset + 4].copy_from_slice(&1.0_f32.to_le_bytes());
@@ -4608,6 +4639,91 @@ mod tests {
                 "buffers": [{"byteLength": bin.len()}],
                 "bufferViews": views,
                 "accessors": accessors
+            }),
+            &bin,
+        )
+    }
+
+    fn large_skin_fixture(skin_sizes: &[usize], mtoon: bool) -> Vec<u8> {
+        let mut bin = Vec::new();
+        let mut views = Vec::new();
+        let mut accessors = Vec::new();
+        let corners = [
+            [-0.12_f32, -0.12, 0.0],
+            [0.12, -0.12, 0.0],
+            [0.12, 0.12, 0.0],
+            [-0.12, 0.12, 0.0],
+        ];
+        for position in [0, 2, 1, 0, 3, 2].map(|index| corners[index]) {
+            for component in position {
+                bin.extend_from_slice(&component.to_le_bytes());
+            }
+        }
+        views.push(json!({"buffer":0,"byteOffset":0,"byteLength":bin.len(),"target":34962}));
+        accessors.push(json!({
+            "bufferView":0,"componentType":5126,"count":6,"type":"VEC3",
+            "min":[-0.12,-0.12,0.0],"max":[0.12,0.12,0.0]
+        }));
+        let normal_offset = bin.len();
+        let normal = append_f32_accessor(&mut bin, &mut views, &mut accessors, 6, 3);
+        bin[normal_offset..normal_offset + 6 * 12].fill(0);
+        for vertex in 0..6 {
+            bin[normal_offset + vertex * 12..normal_offset + vertex * 12 + 4]
+                .copy_from_slice(&1.0_f32.to_le_bytes());
+        }
+        let weight_offset = bin.len();
+        let weights = append_f32_accessor(&mut bin, &mut views, &mut accessors, 6, 4);
+        bin[weight_offset..weight_offset + 6 * 16].fill(0);
+        for vertex in 0..6 {
+            bin[weight_offset + vertex * 16..weight_offset + vertex * 16 + 4]
+                .copy_from_slice(&1.0_f32.to_le_bytes());
+        }
+        let mut nodes: Vec<Value> = (0..skin_sizes.len())
+            .map(|skin| json!({"mesh":skin,"skin":skin}))
+            .collect();
+        let mut skins = Vec::new();
+        let mut meshes = Vec::new();
+        for (skin, &count) in skin_sizes.iter().enumerate() {
+            let first_joint = nodes.len();
+            let joint_nodes: Vec<usize> = (first_joint..first_joint + count).collect();
+            let selected_joint = if skin == 0 && skin_sizes.len() > 1 {
+                0
+            } else {
+                count - 1
+            };
+            nodes.extend((0..count).map(|joint| {
+                if joint == selected_joint {
+                    json!({"translation":[if skin == 0 {-0.4} else {0.4},0.0,0.0]})
+                } else {
+                    json!({})
+                }
+            }));
+            skins.push(json!({"joints":joint_nodes}));
+            let joint_offset = bin.len();
+            let joints = append_u16_vec4_accessor(&mut bin, &mut views, &mut accessors, 6);
+            for vertex in 0..6 {
+                let offset = joint_offset + vertex * 8;
+                bin[offset..offset + 2].copy_from_slice(&(selected_joint as u16).to_le_bytes());
+            }
+            meshes.push(json!({"primitives":[{"attributes":{
+                "POSITION":0,"NORMAL":normal,"JOINTS_0":joints,"WEIGHTS_0":weights
+            },"material":0}]}));
+        }
+        let material = if mtoon {
+            json!({"doubleSided":true,"extensions":{
+                "KHR_materials_unlit":{},"VRMC_materials_mtoon":{"specVersion":"1.0"}
+            }})
+        } else {
+            json!({"doubleSided":true,"extensions":{"KHR_materials_unlit":{}}})
+        };
+        glb_from_json(
+            json!({
+                "asset":{"version":"2.0"},"scene":0,
+                "scenes":[{"nodes":(0..nodes.len()).collect::<Vec<_>>()}],
+                "nodes":nodes,"skins":skins,"meshes":meshes,
+                "materials":[material],
+                "extensionsUsed":if mtoon {vec!["KHR_materials_unlit","VRMC_materials_mtoon"]} else {vec!["KHR_materials_unlit"]},
+                "buffers":[{"byteLength":bin.len()}],"bufferViews":views,"accessors":accessors
             }),
             &bin,
         )
@@ -4850,10 +4966,15 @@ mod tests {
     }
 
     #[test]
-    fn oversized_joint_palette_returns_loader_error() {
-        let err = validate_joint_palette_count(513, Path::new("oversized-rig.glb")).unwrap_err();
-        assert!(format!("{err:#}").contains("combined skin joint count 513"));
-        assert!(format!("{err:#}").contains("limit 512"));
+    fn joint_palette_uses_device_binding_capacity() {
+        let path = Path::new("rig.glb");
+        let limit = 513 * 64;
+        validate_joint_palette_count(512, limit, path).unwrap();
+        validate_joint_palette_count(513, limit, path).unwrap();
+        let error = validate_joint_palette_count(514, limit, path).unwrap_err();
+        assert!(format!("{error:#}").contains("514 joints (32896 bytes)"));
+        assert!(format!("{error:#}").contains("32832 bytes (513 joints)"));
+        assert!(validate_joint_palette_count(usize::MAX, u64::MAX, path).is_err());
     }
 
     #[test]
@@ -4937,6 +5058,247 @@ mod tests {
             right > 0,
             "second skin's remapped joint must draw in the right half"
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn large_single_and_multi_skin_palettes_render_remapped_joints() {
+        use crate::camera::Camera;
+        use crate::gpu::{OFFSCREEN_FORMAT, OffscreenTarget};
+        use crate::hud::Hud;
+        use crate::renderer::Renderer;
+        use crate::scene::Scene;
+
+        let gpu = Gpu::new_headless().expect("headless GPU required for joint palette regression");
+        let mut renderer = Renderer::new(&gpu, OFFSCREEN_FORMAT).unwrap();
+        let target = OffscreenTarget::new(&gpu, 128, 96);
+        let camera = Camera {
+            pos: Vec3::new(0.0, 0.0, 2.0),
+            znear: 0.01,
+            ..Camera::default()
+        };
+        for (skin_sizes, expected_halves) in [
+            (vec![512], [true, false]),
+            (vec![513], [true, false]),
+            (vec![257, 257], [true, true]),
+        ] {
+            let fixture = large_skin_fixture(&skin_sizes, false);
+            let (doc, buffers, _) = import_glb_slice(&fixture, "large-skin.glb", &[]).unwrap();
+            let mesh = doc.meshes().last().unwrap();
+            let primitive = mesh.primitives().next().unwrap();
+            let vertex_joint = primitive
+                .reader(|buffer| Some(buffers[buffer.index()].0.as_slice()))
+                .read_joints(0)
+                .unwrap()
+                .into_u16()
+                .next()
+                .unwrap()[0] as usize;
+            let remapped_joint =
+                skin_sizes[..skin_sizes.len() - 1].iter().sum::<usize>() + vertex_joint;
+            let joint_count: usize = skin_sizes.iter().sum();
+            assert_eq!(remapped_joint, joint_count - 1);
+            if joint_count > 512 {
+                assert!(remapped_joint > 511);
+            }
+            let asset = ModelAsset::load_glb_bytes(
+                &gpu,
+                &renderer.model_material_layout,
+                &renderer.samplers,
+                &fixture,
+                "large-skin.glb",
+            )
+            .unwrap();
+            let mut palette = Vec::new();
+            asset.joint_palette(&super::AnimState::default(), &mut palette);
+            assert_eq!(palette.len(), joint_count);
+            let scene = Scene {
+                transparent_clear: true,
+                models: vec![super::ModelInstance::new(asset)],
+                ..Scene::default()
+            };
+            renderer.render(
+                &gpu,
+                &target.view,
+                target.size,
+                &scene,
+                &camera,
+                &Hud::default(),
+            );
+            let rgba = target.read_rgba(&gpu).unwrap();
+            let mut halves = [0usize; 2];
+            for (index, pixel) in rgba.as_chunks::<4>().0.iter().enumerate() {
+                if pixel[3] != 0 {
+                    halves[(index % 128 >= 64) as usize] += 1;
+                }
+            }
+            assert_eq!(
+                halves.map(|count| count > 0),
+                expected_halves,
+                "skin sizes {skin_sizes:?}: {halves:?}"
+            );
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn large_shared_asset_keeps_instance_palettes_separate() {
+        use crate::camera::Camera;
+        use crate::gpu::{OFFSCREEN_FORMAT, OffscreenTarget};
+        use crate::hud::Hud;
+        use crate::renderer::Renderer;
+        use crate::scene::Scene;
+
+        let gpu = Gpu::new_headless().unwrap();
+        let mut renderer = Renderer::new(&gpu, OFFSCREEN_FORMAT).unwrap();
+        let asset = ModelAsset::load_glb_bytes(
+            &gpu,
+            &renderer.model_material_layout,
+            &renderer.samplers,
+            &large_skin_fixture(&[513], false),
+            "shared-large-skin.glb",
+        )
+        .unwrap();
+        let target_joint = asset.skins[0].joints[512];
+        let mut globals = Vec::new();
+        asset
+            .skeleton
+            .global_transforms(None, 0.0, false, &mut globals);
+        let mut left = super::ModelInstance::new(asset.clone());
+        let mut right = super::ModelInstance::new(asset.clone());
+        let mut left_pose = globals.clone();
+        left_pose[target_joint] = Mat4::from_translation(Vec3::new(-0.4, 0.0, 0.0));
+        globals[target_joint] = Mat4::from_translation(Vec3::new(0.4, 0.0, 0.0));
+        left.pose = Some(left_pose);
+        right.pose = Some(globals);
+        let mut left_palette = Vec::new();
+        let mut right_palette = Vec::new();
+        asset.palette_from_globals(left.pose.as_ref().unwrap(), &mut left_palette);
+        asset.palette_from_globals(right.pose.as_ref().unwrap(), &mut right_palette);
+        assert_eq!(left_palette[512].w_axis.x, -0.4);
+        assert_eq!(right_palette[512].w_axis.x, 0.4);
+        assert!(std::sync::Arc::ptr_eq(&left.asset, &right.asset));
+        let scene = Scene {
+            transparent_clear: true,
+            models: vec![left, right],
+            ..Scene::default()
+        };
+        let target = OffscreenTarget::new(&gpu, 128, 96);
+        let camera = Camera {
+            pos: Vec3::new(0.0, 0.0, 2.0),
+            znear: 0.01,
+            ..Camera::default()
+        };
+        renderer.render(
+            &gpu,
+            &target.view,
+            target.size,
+            &scene,
+            &camera,
+            &Hud::default(),
+        );
+        let rgba = target.read_rgba(&gpu).unwrap();
+        let mut halves = [0usize; 2];
+        for (index, pixel) in rgba.as_chunks::<4>().0.iter().enumerate() {
+            if pixel[3] != 0 {
+                halves[(index % 128 >= 64) as usize] += 1;
+            }
+        }
+        assert!(
+            halves[0] > 0 && halves[1] > 0,
+            "distinct poses must render in both halves: {halves:?}"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn large_native_mtoon_outline_and_live_fallback_use_full_palette() {
+        use crate::camera::Camera;
+        use crate::gpu::{OFFSCREEN_FORMAT, OffscreenTarget};
+        use crate::hud::Hud;
+        use crate::renderer::Renderer;
+        use crate::scene::Scene;
+
+        let gpu = Gpu::new_headless().unwrap();
+        let mut renderer = Renderer::new(&gpu, OFFSCREEN_FORMAT).unwrap();
+        let descriptor = stage_e_descriptor(MtoonOutlineWidthMode::ScreenCoordinates, 0.12);
+        let asset = ModelAsset::load_glb_bytes_opts_with_native_mtoon(
+            &gpu,
+            &renderer.model_material_layout,
+            &renderer.mtoon_material_layout,
+            &renderer.samplers,
+            &large_skin_fixture(&[513], true),
+            "large-mtoon.glb",
+            &ModelLoadOptions::default(),
+            std::iter::empty::<&str>(),
+            &[descriptor],
+        )
+        .unwrap();
+        assert!(
+            asset.primitives[0]
+                .draw_route(MtoonRenderMode::Native)
+                .native
+        );
+        assert!(
+            asset.primitives[0]
+                .draw_route(MtoonRenderMode::Native)
+                .outline
+        );
+        let mut scene = Scene {
+            transparent_clear: true,
+            models: vec![super::ModelInstance::new(asset)],
+            ..Scene::default()
+        };
+        let identity = std::sync::Arc::as_ptr(&scene.models[0].asset);
+        let target = OffscreenTarget::new(&gpu, 128, 96);
+        let camera = Camera {
+            pos: Vec3::new(0.0, 0.0, 2.0),
+            znear: 0.01,
+            ..Camera::default()
+        };
+        for route in [
+            MtoonRenderMode::Native,
+            MtoonRenderMode::Fallback,
+            MtoonRenderMode::Native,
+        ] {
+            scene.models[0].mtoon_draw_route = route;
+            renderer.render(
+                &gpu,
+                &target.view,
+                target.size,
+                &scene,
+                &camera,
+                &Hud::default(),
+            );
+            let rgba = target.read_rgba(&gpu).unwrap();
+            let mut left = 0usize;
+            let mut right = 0usize;
+            let mut red_outline = 0usize;
+            for (index, pixel) in rgba.as_chunks::<4>().0.iter().enumerate() {
+                if pixel[3] == 0 {
+                    continue;
+                }
+                if index % 128 < 64 {
+                    left += 1;
+                } else {
+                    right += 1;
+                }
+                if index % 128 < 64 && pixel[0] > 80 && pixel[0] > pixel[1].saturating_mul(2) {
+                    red_outline += 1;
+                }
+            }
+            if route == MtoonRenderMode::Native {
+                assert!(
+                    left > right && red_outline > 0,
+                    "Native surface and outline must follow joint 512: {left}, {right}, {red_outline}"
+                );
+            } else {
+                assert!(
+                    left > 0 && right == 0,
+                    "fallback must skin joint 512: {left}, {right}"
+                );
+            }
+            assert_eq!(std::sync::Arc::as_ptr(&scene.models[0].asset), identity);
+        }
     }
 
     #[test]
