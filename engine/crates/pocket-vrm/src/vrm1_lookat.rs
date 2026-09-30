@@ -380,6 +380,7 @@ mod tests {
             mtoon_materials: Vec::new(),
             spring_bone: crate::Vrm1ExtensionInfo::default(),
             spring_bone_semantics: None,
+            spring_bone_limit_supported: false,
             node_constraint: crate::Vrm1ExtensionInfo::default(),
             node_constraint_semantics: None,
             expressions: Vec::new(),

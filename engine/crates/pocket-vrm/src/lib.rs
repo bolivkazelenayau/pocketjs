@@ -53,7 +53,8 @@ pub use vrm1::{
     Vrm1Humanoid, Vrm1LookAt, Vrm1LookAtRangeMap, Vrm1LookAtType, Vrm1MaterialColorBind,
     Vrm1MaterialColorBindType, Vrm1Meta, Vrm1MorphTargetBind, Vrm1NodeConstraint,
     Vrm1NodeConstraintKind, Vrm1NodeConstraintSet, Vrm1RollAxis, Vrm1SphereCollider, Vrm1Spring,
-    Vrm1SpringBone, Vrm1SpringJoint, Vrm1TextureTransformBind,
+    Vrm1SpringBone, Vrm1SpringJoint, Vrm1SpringLimit, Vrm1SpringLimitKind,
+    Vrm1TextureTransformBind,
 };
 pub use vrm1_lookat::{
     Vrm1ExpressionLookAt, Vrm1EyeBoneOutput, Vrm1LookAtAngles, Vrm1LookAtOutput, Vrm1LookAtRuntime,

@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, Result, bail, ensure};
-use glam::Vec3;
+use glam::{Quat, Vec3};
 use serde_json::{Map, Value};
 
 use crate::glb;
@@ -393,8 +393,22 @@ pub struct Vrm1ColliderGroup {
     pub name: Option<String>,
     pub colliders: Vec<usize>,
 }
+/// VRMC_springBone_limit 1.0-draft, lowered from a joint's extension.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Vrm1SpringLimit {
+    /// Normalized XYZW quaternion relative to the default limit frame.
+    pub rotation: Quat,
+    pub kind: Vrm1SpringLimitKind,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Vrm1SpringLimitKind {
+    Cone { angle: f32 },
+    Hinge { angle: f32 },
+    Spherical { pitch: f32, yaw: f32 },
+}
 #[derive(Clone, Debug, PartialEq)]
 pub struct Vrm1SpringJoint {
+    pub limit: Option<Vrm1SpringLimit>,
     pub node: usize,
     pub hit_radius: f32,
     pub stiffness: f32,
@@ -424,6 +438,9 @@ pub struct Vrm1Doc {
     pub mtoon_materials: Vec<Vrm1MtoonMaterial>,
     pub spring_bone: Vrm1ExtensionInfo,
     pub spring_bone_semantics: Option<Vrm1SpringBone>,
+    /// All declared joint limits validated, or were ignored on tail-only joints.
+    /// False when absent or when any optional payload was downgraded.
+    pub spring_bone_limit_supported: bool,
     pub node_constraint: Vrm1ExtensionInfo,
     pub node_constraint_semantics: Option<Vrm1NodeConstraintSet>,
     pub expressions: Vec<Vrm1Expression>,
@@ -468,10 +485,32 @@ impl Vrm1Doc {
         );
         let (children, node_meshes, mesh_primitive_counts, parents) = validate_nodes(&glb.json)?;
         let spring_bone = extension_info(ex, "VRMC_springBone")?;
-        let spring_bone_semantics = ex
+        let mut spring_bone_semantics = ex
             .get("VRMC_springBone")
             .map(|v| parse_spring_bone(v, children.len(), &parents))
             .transpose()?;
+        let limit_required = extension_declaration_contains(
+            &glb.json,
+            "extensionsRequired",
+            "VRMC_springBone_limit",
+        )?;
+        ensure!(
+            !limit_required
+                || extension_declaration_contains(
+                    &glb.json,
+                    "extensionsUsed",
+                    "VRMC_springBone_limit",
+                )?,
+            "glTF extensionsRequired contains VRMC_springBone_limit, but extensionsUsed does not"
+        );
+        let spring_bone_limit_supported = match &mut spring_bone_semantics {
+            Some(bone) => parse_spring_limits(&ex["VRMC_springBone"], bone, limit_required)?,
+            None => false,
+        };
+        ensure!(
+            !limit_required || spring_bone_limit_supported,
+            "required VRMC_springBone_limit has no joint payload in VRMC_springBone"
+        );
         let node_constraint_required = extension_declaration_contains(
             &glb.json,
             "extensionsRequired",
@@ -549,6 +588,7 @@ impl Vrm1Doc {
             mtoon_materials,
             spring_bone,
             spring_bone_semantics,
+            spring_bone_limit_supported,
             node_constraint,
             node_constraint_semantics,
             expressions: parse_expressions(
@@ -660,6 +700,125 @@ fn parse_spring_bone(
         springs,
     })
 }
+// Squared length tolerance accepts six-decimal serialization rounding while
+// rejecting materially non-unit rotations. Validate in f64, normalize once.
+const LIMIT_ROTATION_LENGTH_SQUARED_TOLERANCE: f64 = 1.0e-4;
+
+fn parse_spring_limits(value: &Value, bone: &mut Vrm1SpringBone, required: bool) -> Result<bool> {
+    let mut present = false;
+    let mut valid = true;
+    for (si, spring) in bone.springs.iter_mut().enumerate() {
+        let count = spring.joints.len();
+        for (ji, joint) in spring.joints.iter_mut().enumerate() {
+            let Some(payload) = value["springs"][si]["joints"][ji]
+                .get("extensions")
+                .and_then(|v| v.get("VRMC_springBone_limit"))
+            else {
+                continue;
+            };
+            present = true;
+            // The terminal joint is only a tail. Never inspect its payload,
+            // including when the extension is required or the spring has one joint.
+            if ji + 1 == count {
+                continue;
+            }
+            match parse_spring_limit(payload)
+                .with_context(|| format!("springs[{si}].joints[{ji}].VRMC_springBone_limit"))
+            {
+                Ok(limit) => joint.limit = Some(limit),
+                Err(error) if required => return Err(error),
+                Err(error) => {
+                    log::warn!("ignoring malformed or unsupported optional joint limit: {error:#}");
+                    valid = false;
+                }
+            }
+        }
+    }
+    Ok(present && valid)
+}
+
+fn parse_spring_limit(value: &Value) -> Result<Vrm1SpringLimit> {
+    let extension = value
+        .as_object()
+        .context("VRMC_springBone_limit must be an object")?;
+    ensure!(
+        required_string(extension, "specVersion", "VRMC_springBone_limit")? == "1.0-draft",
+        "VRMC_springBone_limit.specVersion must be \"1.0-draft\""
+    );
+    let variants = extension
+        .get("limit")
+        .and_then(Value::as_object)
+        .context("VRMC_springBone_limit.limit must be an object")?;
+    ensure!(
+        ["cone", "hinge", "spherical"]
+            .iter()
+            .filter(|key| variants.contains_key(**key))
+            .count()
+            == 1,
+        "VRMC_springBone_limit.limit must contain exactly one cone, hinge or spherical"
+    );
+    let (name, body) = ["cone", "hinge", "spherical"]
+        .iter()
+        .find_map(|&key| variants.get(key).map(|body| (key, body)))
+        .unwrap();
+    let body = body.as_object().context("limit shape must be an object")?;
+    let angle = |key: &str, maximum: f64| -> Result<f32> {
+        let value = body
+            .get(key)
+            .and_then(Value::as_f64)
+            .with_context(|| format!("{name}.{key} must be a number"))?;
+        ensure!(
+            value.is_finite() && value >= 0.0,
+            "{name}.{key} must be finite and nonnegative"
+        );
+        // Saturate BEFORE narrowing: huge finite JSON numbers are valid angles.
+        Ok(value.min(maximum) as f32)
+    };
+    let kind = match name {
+        "cone" => Vrm1SpringLimitKind::Cone {
+            angle: angle("angle", core::f64::consts::PI)?,
+        },
+        "hinge" => Vrm1SpringLimitKind::Hinge {
+            angle: angle("angle", core::f64::consts::PI)?,
+        },
+        _ => Vrm1SpringLimitKind::Spherical {
+            pitch: angle("pitch", core::f64::consts::PI)?,
+            yaw: angle("yaw", core::f64::consts::FRAC_PI_2)?,
+        },
+    };
+    let rotation = match body.get("rotation") {
+        None => Quat::IDENTITY,
+        Some(value) => {
+            let components = value
+                .as_array()
+                .context("limit rotation must be an XYZW array")?;
+            ensure!(
+                components.len() == 4,
+                "limit rotation must have four components"
+            );
+            let mut xyzw = [0.0; 4];
+            let mut length_squared = 0.0;
+            for (i, component) in components.iter().enumerate() {
+                let v = component
+                    .as_f64()
+                    .context("limit rotation components must be numbers")?;
+                ensure!(
+                    v.is_finite() && (-1.0..=1.0).contains(&v),
+                    "limit rotation component must be finite and within [-1, 1]"
+                );
+                xyzw[i] = v as f32;
+                length_squared += v * v;
+            }
+            ensure!(
+                (length_squared - 1.0).abs() <= LIMIT_ROTATION_LENGTH_SQUARED_TOLERANCE,
+                "limit rotation must be approximately unit length"
+            );
+            Quat::from_array(xyzw).normalize()
+        }
+    };
+    Ok(Vrm1SpringLimit { rotation, kind })
+}
+
 fn parse_collider(value: &Value, index: usize, node_count: usize) -> Result<Vrm1Collider> {
     let o = value
         .as_object()
@@ -745,6 +904,7 @@ fn parse_spring(
             )?;
             ensure!(node < node_count, "{c}.node {node} is out of range");
             Ok(Vrm1SpringJoint {
+                limit: None,
                 node,
                 hit_radius: nonnegative(
                     optional_f32(x, "hitRadius", &c)?.unwrap_or(0.0),
@@ -1993,6 +2153,230 @@ mod tests {
         value["extensionsRequired"] = json!(["VRMC_node_constraint"]);
         let error = parse(value).unwrap_err().to_string();
         assert!(error.contains("no node declares"), "{error}");
+    }
+
+    fn limit_document(payload: Value, required: bool) -> Value {
+        let mut value = base();
+        value["extensionsUsed"] = json!(["VRMC_vrm", "VRMC_springBone", "VRMC_springBone_limit"]);
+        if required {
+            value["extensionsRequired"] = json!(["VRMC_springBone_limit"]);
+        }
+        value["extensions"]["VRMC_springBone"] = json!({
+            "specVersion":"1.0", "springs":[{"joints":[
+                {"node":1, "extensions":{"VRMC_springBone_limit":payload}}, {"node":3}
+            ]}]
+        });
+        value
+    }
+    fn limit_payload(shape: Value) -> Value {
+        json!({"specVersion":"1.0-draft", "limit":shape})
+    }
+    #[test]
+    fn spring_limit_variants_defaults_rotation_and_absence() {
+        assert!(!parse(base()).unwrap().spring_bone_limit_supported);
+        for (shape, kind) in [
+            (
+                json!({"cone":{"angle":0.4}}),
+                Vrm1SpringLimitKind::Cone { angle: 0.4 },
+            ),
+            (
+                json!({"hinge":{"angle":0.5}}),
+                Vrm1SpringLimitKind::Hinge { angle: 0.5 },
+            ),
+            (
+                json!({"spherical":{"pitch":0.6,"yaw":0.7}}),
+                Vrm1SpringLimitKind::Spherical {
+                    pitch: 0.6,
+                    yaw: 0.7,
+                },
+            ),
+        ] {
+            let doc = parse(limit_document(limit_payload(shape), true)).unwrap();
+            assert!(doc.spring_bone_limit_supported);
+            let limit = doc.spring_bone_semantics.unwrap().springs[0].joints[0]
+                .limit
+                .unwrap();
+            assert_eq!(limit.kind, kind);
+            assert_eq!(limit.rotation, Quat::IDENTITY);
+        }
+        let doc = parse(limit_document(
+            limit_payload(json!({"cone":{
+            "angle":0.4,"rotation":[0.0,0.0,0.6,0.8],"unknown":true},"extra":{}})),
+            true,
+        ))
+        .unwrap();
+        assert_eq!(
+            doc.spring_bone_semantics.unwrap().springs[0].joints[0]
+                .limit
+                .unwrap()
+                .rotation,
+            Quat::from_xyzw(0.0, 0.0, 0.6, 0.8).normalize()
+        );
+        let mut absent = limit_document(Value::Null, false);
+        absent["extensions"]["VRMC_springBone"]["springs"][0]["joints"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("extensions");
+        let doc = parse(absent).unwrap();
+        assert!(!doc.spring_bone_limit_supported);
+        assert!(
+            doc.spring_bone_semantics.unwrap().springs[0].joints[0]
+                .limit
+                .is_none()
+        );
+    }
+    #[test]
+    fn spring_limit_invalid_optional_is_local_but_required_fails() {
+        let invalid = [
+            Value::Null,
+            json!(7),
+            json!({}),
+            json!({"specVersion":"1.0","limit":{"cone":{"angle":0.5}}}),
+            json!({"specVersion":"other","limit":{"cone":{"angle":0.5}}}),
+            json!({"specVersion":"1.0-draft"}),
+            limit_payload(json!({})),
+            limit_payload(json!({"cone":{"angle":0},"hinge":{"angle":0}})),
+            limit_payload(json!({"cone":null})),
+            limit_payload(json!({"cone":{}})),
+            limit_payload(json!({"hinge":{}})),
+            limit_payload(json!({"spherical":{"pitch":0}})),
+            limit_payload(json!({"spherical":{"yaw":0}})),
+            limit_payload(json!({"cone":{"angle":-0.1}})),
+            limit_payload(json!({"hinge":{"angle":-0.1}})),
+            limit_payload(json!({"spherical":{"pitch":-0.1,"yaw":0}})),
+            limit_payload(json!({"spherical":{"pitch":0,"yaw":-0.1}})),
+            limit_payload(json!({"cone":{"angle":"one"}})),
+        ];
+        for payload in invalid {
+            let doc = parse(limit_document(payload.clone(), false)).unwrap();
+            assert!(!doc.spring_bone_limit_supported, "{payload}");
+            let joint = &doc.spring_bone_semantics.as_ref().unwrap().springs[0].joints[0];
+            assert!(joint.limit.is_none(), "{payload}");
+            assert_eq!(joint.node, 1);
+            assert_eq!(joint.stiffness, 1.0);
+            assert!(
+                parse(limit_document(payload.clone(), true)).is_err(),
+                "{payload}"
+            );
+        }
+        let mut mixed = limit_document(Value::Null, false);
+        mixed["extensions"]["VRMC_springBone"]["springs"][0]["joints"] = json!([
+            {"node":1,"extensions":{"VRMC_springBone_limit":null}},
+            {"node":2,"extensions":{"VRMC_springBone_limit":limit_payload(json!({"cone":{"angle":0.2}}))}},
+            {"node":3}
+        ]);
+        let doc = parse(mixed).unwrap();
+        let joints = &doc.spring_bone_semantics.unwrap().springs[0].joints;
+        assert!(joints[0].limit.is_none());
+        assert!(joints[1].limit.is_some());
+    }
+    #[test]
+    fn spring_limit_finite_huge_angles_saturate_before_narrowing() {
+        for huge in [core::f64::consts::PI, 3.5e38, 1.0e300, f64::MAX] {
+            for shape in [
+                json!({"cone":{"angle":huge}}),
+                json!({"hinge":{"angle":huge}}),
+                json!({"spherical":{"pitch":huge,"yaw":huge}}),
+            ] {
+                let limit = parse_spring_limit(&limit_payload(shape)).unwrap();
+                match limit.kind {
+                    Vrm1SpringLimitKind::Cone { angle } | Vrm1SpringLimitKind::Hinge { angle } => {
+                        assert_eq!(angle, core::f32::consts::PI)
+                    }
+                    Vrm1SpringLimitKind::Spherical { pitch, yaw } => {
+                        assert_eq!(pitch, core::f32::consts::PI);
+                        assert_eq!(yaw, core::f32::consts::FRAC_PI_2);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn spring_limit_rotation_bounds_rounding_and_tolerance() {
+        for rotation in [
+            json!([0, 0, 0, 0]),
+            json!([0, 0, 0, 0.5]),
+            json!([1, 1, 0, 0]),
+            json!([0, 0, 0, 1.000001]),
+            json!([0, 0, 0]),
+            json!([0, 0, 0, 1, 0]),
+            json!([0, 0, 0, "one"]),
+            Value::Null,
+        ] {
+            let payload = limit_payload(json!({"cone":{"angle":1,"rotation":rotation}}));
+            assert!(parse_spring_limit(&payload).is_err(), "{rotation}");
+            assert!(parse(limit_document(payload.clone(), true)).is_err());
+            assert!(
+                parse(limit_document(payload, false))
+                    .unwrap()
+                    .spring_bone_semantics
+                    .unwrap()
+                    .springs[0]
+                    .joints[0]
+                    .limit
+                    .is_none()
+            );
+        }
+        // Round exactly as a six-decimal exporter would, rather than using
+        // the full-precision constant that would bypass this regression.
+        let component = (core::f64::consts::FRAC_1_SQRT_2 * 1_000_000.0).round() / 1_000_000.0;
+        let rounded = parse_spring_limit(&limit_payload(
+            json!({"hinge":{"angle":1,"rotation":[component,0,0,component]}}),
+        ))
+        .unwrap();
+        assert!((rounded.rotation.length_squared() - 1.0).abs() < 2.0e-7);
+        for (delta, accepted) in [(0.5e-4, true), (2.0e-4, false)] {
+            let component = ((1.0 + delta) / 2.0_f64).sqrt();
+            let result = parse_spring_limit(&limit_payload(
+                json!({"cone":{"angle":1,"rotation":[component,0,0,component]}}),
+            ));
+            assert_eq!(result.is_ok(), accepted);
+        }
+    }
+    #[test]
+    fn spring_limit_terminal_payloads_are_never_validated() {
+        for payload in [
+            Value::Null,
+            json!("malformed"),
+            json!({"specVersion":"future"}),
+            limit_payload(json!({"spherical":{"pitch":-1}})),
+            limit_payload(json!({"hinge":{"angle":0}})),
+        ] {
+            for required in [false, true] {
+                let mut value =
+                    limit_document(limit_payload(json!({"cone":{"angle":0.4}})), required);
+                value["extensions"]["VRMC_springBone"]["springs"][0]["joints"][1]["extensions"] =
+                    json!({"VRMC_springBone_limit":payload});
+                let doc = parse(value.clone()).unwrap();
+                assert!(doc.spring_bone_limit_supported);
+                assert!(
+                    doc.spring_bone_semantics.unwrap().springs[0].joints[1]
+                        .limit
+                        .is_none()
+                );
+                value["extensions"]["VRMC_springBone"]["springs"][0]["joints"] = json!([
+                    {"node":1,"extensions":{"VRMC_springBone_limit":payload}}
+                ]);
+                let doc = parse(value).unwrap();
+                assert!(doc.spring_bone_limit_supported);
+                assert!(
+                    doc.spring_bone_semantics.unwrap().springs[0].joints[0]
+                        .limit
+                        .is_none()
+                );
+            }
+        }
+    }
+    #[test]
+    fn spring_limit_required_declarations_need_payload_and_used() {
+        let mut value = base();
+        value["extensionsRequired"] = json!(["VRMC_springBone_limit"]);
+        assert!(parse(value.clone()).is_err());
+        value["extensionsUsed"] = json!(["VRMC_springBone_limit"]);
+        assert!(parse(value).is_err());
+        let mut value = limit_document(limit_payload(json!({"cone":{"angle":0}})), true);
+        value.as_object_mut().unwrap().remove("extensionsUsed");
+        assert!(parse(value).is_err());
     }
 
     #[test]
