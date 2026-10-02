@@ -717,6 +717,13 @@ fn is_positive_uniform_scale(scale: Vec3) -> bool {
     if !scale.is_finite() || scale.min_element() <= 0.0 {
         return false;
     }
+    // VRM exporters can introduce a few ppm of float32 noise around identity.
+    // Only this small neighborhood is relaxed; real non-uniform transforms
+    // elsewhere retain the original strict validation.
+    const UNIT_EXPORT_NOISE: f32 = 1.0e-5;
+    if (scale - Vec3::ONE).abs().max_element() <= UNIT_EXPORT_NOISE {
+        return true;
+    }
     let tolerance = 8.0 * f32::EPSILON * scale.abs().max_element();
     (scale.x - scale.y).abs() <= tolerance && (scale.y - scale.z).abs() <= tolerance
 }
@@ -1234,6 +1241,45 @@ mod vrm1_tests {
         let (mut skeleton, config) = sparse_chain();
         skeleton.rest[0].scale = Vec3::new(1.0, 1.0 + 4.0e-7, 1.0);
         assert!(SpringSolver::new_vrm1(&config, &skeleton, &skeleton.rest).is_some());
+    }
+
+    #[test]
+    fn riko_hair_chain_28_identity_export_noise_remains_simulated() {
+        let (mut skeleton, mut config) = sparse_chain();
+        // Exact float32 scale of Riko1.vrm node 57, J_Sec_Hair4_11.
+        // Place it on an ancestor of the explicit head/tail pair.
+        let exported_scale = Vec3::new(0.9999992, 0.9999989, 1.0);
+        skeleton.rest[2].scale = exported_scale;
+        config.springs[0].name = Some("Riko Hair chain 28".into());
+        let mut solver = SpringSolver::new_vrm1(&config, &skeleton, &skeleton.rest)
+            .expect("identity export noise must not downgrade the hair chain");
+        assert_eq!(solver.joint_count(), 1);
+        let mut locals = skeleton.rest.clone();
+        for _ in 0..60 {
+            solver.step(1.0 / 60.0, &skeleton, &mut locals, Mat4::IDENTITY);
+            assert!(locals.iter().all(|node| node.matrix().is_finite()));
+        }
+        // Validation permits the noise without altering the authored skeleton.
+        assert_eq!(skeleton.rest[2].scale, exported_scale);
+    }
+
+    #[test]
+    fn identity_export_noise_does_not_allow_real_nonuniform_scale() {
+        for scale in [
+            Vec3::new(1.0, 1.001, 1.0),
+            Vec3::new(2.0, 2.000005, 2.0),
+            Vec3::new(0.0, 1.0, 1.0),
+            Vec3::new(-1.0, -1.0, -1.0),
+            Vec3::new(f32::NAN, 1.0, 1.0),
+        ] {
+            let (mut skeleton, config) = sparse_chain();
+            skeleton.rest[2].scale = scale;
+            assert!(
+                SpringSolver::new_vrm1(&config, &skeleton, &skeleton.rest).is_none(),
+                "unsupported scale {scale:?} must still downgrade the spring"
+            );
+        }
+        assert!(is_positive_uniform_scale(Vec3::splat(2.0)));
     }
 
     #[test]

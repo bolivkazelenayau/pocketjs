@@ -235,8 +235,70 @@ impl OffscreenTarget {
     }
 
     pub fn save_png(&self, gpu: &Gpu, path: &Path) -> Result<()> {
-        let rgba = self.read_rgba(gpu)?;
+        let mut rgba = self.read_rgba(gpu)?;
+        unpremultiply_srgb_rgba(&mut rgba);
         save_png(path, self.size.0, self.size.1, &rgba)
+    }
+}
+
+/// Convert an sRGB render-target readback to the straight-alpha RGB PNG uses.
+/// Blending premultiplied RGB in linear light precedes the target's sRGB
+/// encoding, so RGB must be decoded before division by the unencoded alpha.
+fn unpremultiply_srgb_rgba(rgba: &mut [u8]) {
+    for pixel in rgba.chunks_exact_mut(4) {
+        match pixel[3] {
+            0 => pixel[..3].fill(0),
+            255 => {}
+            alpha => {
+                let alpha = f32::from(alpha) / 255.0;
+                for channel in &mut pixel[..3] {
+                    let encoded = f32::from(*channel) / 255.0;
+                    let linear = if encoded <= 0.04045 {
+                        encoded / 12.92
+                    } else {
+                        ((encoded + 0.055) / 1.055).powf(2.4)
+                    };
+                    let straight = (linear / alpha).clamp(0.0, 1.0);
+                    let encoded_straight = if straight <= 0.0031308 {
+                        12.92 * straight
+                    } else {
+                        1.055 * straight.powf(1.0 / 2.4) - 0.055
+                    };
+                    *channel = (encoded_straight * 255.0).round() as u8;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unpremultiply_srgb_rgba;
+
+    #[test]
+    fn png_alpha_conversion_decodes_srgb_before_unpremultiplying() {
+        // Linear-premultiplied RGB encoded by an sRGB target, alpha ~0.5.
+        let mut rgba = [93, 137, 188, 128];
+        unpremultiply_srgb_rgba(&mut rgba);
+        assert_eq!(rgba, [129, 187, 255, 128]);
+        // Dividing the encoded bytes would produce [185, 255, 255], not this.
+    }
+
+    #[test]
+    fn png_alpha_conversion_preserves_opaque_and_clears_zero_alpha() {
+        let mut rgba = [17, 93, 241, 255, 99, 88, 77, 0];
+        unpremultiply_srgb_rgba(&mut rgba);
+        assert_eq!(rgba, [17, 93, 241, 255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn png_alpha_conversion_handles_low_alpha_and_saturated_channels() {
+        let mut rgba = [13, 0, 255, 1, 0, 0, 0, 128];
+        unpremultiply_srgb_rgba(&mut rgba);
+        assert_eq!(rgba[3], 1);
+        assert!(rgba[0] >= 254);
+        assert_eq!(rgba[1..4], [0, 255, 1]);
+        assert_eq!(rgba[4..], [0, 0, 0, 128]);
     }
 }
 

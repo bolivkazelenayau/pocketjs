@@ -115,6 +115,22 @@ pub fn load_vrma_bytes(bytes: &[u8]) -> Result<VrmaDoc> {
         }
     }
 
+    if let Some(expressions) = ext.get("expressions") {
+        let count = ["preset", "custom"]
+            .iter()
+            .filter_map(|kind| expressions.get(kind).and_then(Value::as_object))
+            .map(serde_json::Map::len)
+            .sum::<usize>();
+        if count > 0 {
+            log::warn!(
+                "VRMA: {count} expression mappings are not supported; their channels will not be retargeted"
+            );
+        }
+    }
+    if ext.get("lookAt").is_some() {
+        log::warn!("VRMA: lookAt is not supported; its animation channel will not be retargeted");
+    }
+
     // humanoid.humanBones is an object: { boneName: { node } }. serde_json
     // objects iterate in sorted key order, so this Vec is deterministic.
     let mut humanoid = Vec::new();
@@ -180,9 +196,25 @@ pub fn load_vrma_bytes(bytes: &[u8]) -> Result<VrmaDoc> {
             .and_then(Value::as_str)
             .unwrap_or("LINEAR");
 
-        let (times, tc) = glb::read_f32_accessor(&glb.json, glb.bin, input as usize)?;
+        let read_accessor = |index: usize| {
+            if glb
+                .json
+                .get("accessors")
+                .and_then(Value::as_array)
+                .and_then(|accessors| accessors.get(index))
+                .and_then(|accessor| accessor.get("sparse"))
+                .is_some()
+            {
+                log::warn!(
+                    "VRMA: sampler {si} accessor {index} uses unsupported sparse data; load will be rejected"
+                );
+            }
+            glb::read_f32_accessor(&glb.json, glb.bin, index)
+                .with_context(|| format!("VRMA sampler {si} accessor {index}"))
+        };
+        let (times, tc) = read_accessor(input as usize)?;
         ensure!(tc == 1, "sampler input must be SCALAR");
-        let (mut values, comps) = glb::read_f32_accessor(&glb.json, glb.bin, output as usize)?;
+        let (mut values, comps) = read_accessor(output as usize)?;
         let expected = match path {
             ChannelPath::Translation => 3,
             ChannelPath::Rotation => 4,
@@ -195,6 +227,9 @@ pub fn load_vrma_bytes(bytes: &[u8]) -> Result<VrmaDoc> {
         let interpolation = match interp {
             "STEP" => Interpolation::Step,
             "CUBICSPLINE" => {
+                log::warn!(
+                    "VRMA: sampler {si} uses CUBICSPLINE; tangents are discarded and interpolation degrades to LINEAR"
+                );
                 // Keys are (in-tangent, value, out-tangent); keep the values.
                 ensure!(
                     values.len() == times.len() * comps * 3,
