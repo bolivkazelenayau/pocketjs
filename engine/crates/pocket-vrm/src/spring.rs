@@ -1245,22 +1245,92 @@ mod vrm1_tests {
 
     #[test]
     fn riko_hair_chain_28_identity_export_noise_remains_simulated() {
-        let (mut skeleton, mut config) = sparse_chain();
-        // Exact float32 scale of Riko1.vrm node 57, J_Sec_Hair4_11.
-        // Place it on an ancestor of the explicit head/tail pair.
-        let exported_scale = Vec3::new(0.9999992, 0.9999989, 1.0);
-        skeleton.rest[2].scale = exported_scale;
-        config.springs[0].name = Some("Riko Hair chain 28".into());
+        // Actual Riko chain 28, including every authored ancestor and explicit
+        // tail. Only colliders are omitted to isolate scale validation.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/riko_chain_28.json")).unwrap();
+        let vec3 = |value: Option<&serde_json::Value>, default: Vec3| {
+            value.map_or(default, |v| {
+                Vec3::new(
+                    v[0].as_f64().unwrap() as f32,
+                    v[1].as_f64().unwrap() as f32,
+                    v[2].as_f64().unwrap() as f32,
+                )
+            })
+        };
+        let rest: Vec<NodeTrs> = fixture["rest"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| NodeTrs {
+                translation: vec3(node.get("translation"), Vec3::ZERO),
+                rotation: node.get("rotation").map_or(Quat::IDENTITY, |q| {
+                    Quat::from_xyzw(
+                        q[0].as_f64().unwrap() as f32,
+                        q[1].as_f64().unwrap() as f32,
+                        q[2].as_f64().unwrap() as f32,
+                        q[3].as_f64().unwrap() as f32,
+                    )
+                }),
+                scale: vec3(node.get("scale"), Vec3::ONE),
+            })
+            .collect();
+        let skeleton = Skeleton {
+            parents: fixture["parents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_u64().map_or(usize::MAX, |p| p as usize))
+                .collect(),
+            order: (0..rest.len()).collect(),
+            rest: rest.clone(),
+        };
+        let scalar = |j: &serde_json::Value, name: &str, default: f32| {
+            j.get(name)
+                .and_then(|v| v.as_f64())
+                .map_or(default, |v| v as f32)
+        };
+        let config = Vrm1SpringBone {
+            colliders: vec![],
+            collider_groups: vec![],
+            springs: vec![Vrm1Spring {
+                name: Some("Riko Hair chain 28".into()),
+                center: Some(0),
+                collider_groups: vec![],
+                joints: fixture["joints"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|j| Vrm1SpringJoint {
+                        limit: None,
+                        node: j["node"].as_u64().unwrap() as usize,
+                        hit_radius: scalar(j, "hitRadius", 0.0),
+                        stiffness: scalar(j, "stiffness", 1.0),
+                        gravity_power: scalar(j, "gravityPower", 0.0),
+                        gravity_dir: vec3(j.get("gravityDir"), -Vec3::Y),
+                        drag_force: scalar(j, "dragForce", 0.5),
+                    })
+                    .collect(),
+            }],
+        };
+        assert_eq!(
+            skeleton.rest[10].scale,
+            Vec3::new(0.9999992, 0.9999989, 1.0)
+        );
         let mut solver = SpringSolver::new_vrm1(&config, &skeleton, &skeleton.rest)
-            .expect("identity export noise must not downgrade the hair chain");
-        assert_eq!(solver.joint_count(), 1);
-        let mut locals = skeleton.rest.clone();
+            .expect("Riko identity export noise must not downgrade chain 28");
+        assert_eq!(solver.joint_count(), 5);
+        let mut locals = rest.clone();
         for _ in 0..60 {
             solver.step(1.0 / 60.0, &skeleton, &mut locals, Mat4::IDENTITY);
             assert!(locals.iter().all(|node| node.matrix().is_finite()));
         }
-        // Validation permits the noise without altering the authored skeleton.
-        assert_eq!(skeleton.rest[2].scale, exported_scale);
+        for (actual, authored) in skeleton.rest.iter().zip(&rest) {
+            assert_eq!(
+                actual.matrix().to_cols_array(),
+                authored.matrix().to_cols_array()
+            );
+        }
     }
 
     #[test]
